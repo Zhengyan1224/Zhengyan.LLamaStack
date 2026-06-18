@@ -1,0 +1,10 @@
+bin/
+obj/
+temp/
+models/
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
