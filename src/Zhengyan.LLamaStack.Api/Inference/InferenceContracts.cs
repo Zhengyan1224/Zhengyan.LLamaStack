@@ -18,6 +18,10 @@ public sealed class InferenceRequest
 
     public string? ToolChoiceDescription { get; init; }
 
+    public int? N { get; init; }
+
+    public int? MaxToolCalls { get; init; }
+
     public int? MaxTokens { get; init; }
 
     public float? Temperature { get; init; }
@@ -52,7 +56,40 @@ public sealed class InferenceRequest
 
     public IReadOnlyDictionary<string, string>? Metadata { get; init; }
 
+    public int ChoiceIndex { get; init; }
+
     public IReadOnlyList<string> CompatibilityWarnings { get; init; } = [];
+
+    public InferenceRequest WithChoiceIndex(int choiceIndex)
+    {
+        return new InferenceRequest
+        {
+            RequestedModel = RequestedModel,
+            Messages = Messages,
+            Tools = Tools,
+            ToolChoiceDescription = ToolChoiceDescription,
+            N = N,
+            ChoiceIndex = choiceIndex,
+            MaxTokens = MaxTokens,
+            Temperature = Temperature,
+            TopP = TopP,
+            TopK = TopK,
+            PresencePenalty = PresencePenalty,
+            FrequencyPenalty = FrequencyPenalty,
+            Seed = Seed,
+            Stop = Stop,
+            ForceJson = ForceJson,
+            StreamIncludeUsage = StreamIncludeUsage,
+            Store = Store,
+            User = User,
+            ServiceTier = ServiceTier,
+            ParallelToolCalls = ParallelToolCalls,
+            PreviousResponseId = PreviousResponseId,
+            Truncation = Truncation,
+            Metadata = Metadata,
+            CompatibilityWarnings = CompatibilityWarnings
+        };
+    }
 
     public InferenceRequest WithMessages(
         IReadOnlyList<InferenceMessage> messages,
@@ -64,6 +101,8 @@ public sealed class InferenceRequest
             Messages = messages,
             Tools = Tools,
             ToolChoiceDescription = ToolChoiceDescription,
+            N = N,
+            MaxToolCalls = MaxToolCalls,
             MaxTokens = MaxTokens,
             Temperature = Temperature,
             TopP = TopP,
@@ -101,6 +140,8 @@ public sealed class InferenceMessage
 
     public string? ToolCallId { get; init; }
 
+    public IReadOnlyList<OpenAiToolCall> ToolCalls { get; init; } = [];
+
     public IReadOnlyList<InferenceMedia> Media { get; init; } = [];
 }
 
@@ -123,6 +164,12 @@ public sealed class InferenceCompletion
 
     public IReadOnlyList<OpenAiToolCall> ToolCalls { get; init; } = [];
 
+    public IReadOnlyList<ToolRound> ToolRounds { get; init; } = [];
+
+    public IReadOnlyList<InferenceChoice> Choices { get; init; } = [];
+
+    public string FinishReason { get; init; } = "stop";
+
     public int PromptTokens { get; init; }
 
     public int CompletionTokens { get; init; }
@@ -138,6 +185,42 @@ public sealed class InferenceCompletion
     public bool? Store { get; init; }
 
     public IReadOnlyList<string> CompatibilityWarnings { get; init; } = [];
+}
+
+public sealed class InferenceChoice
+{
+    public int Index { get; init; }
+
+    public string Text { get; init; } = string.Empty;
+
+    public IReadOnlyList<OpenAiToolCall> ToolCalls { get; init; } = [];
+
+    public string FinishReason { get; init; } = "stop";
+
+    public int CompletionTokens { get; init; }
+}
+
+public sealed class ToolRound
+{
+    public IReadOnlyList<OpenAiToolCall> ToolCalls { get; init; } = [];
+
+    public IReadOnlyList<ToolResult> Results { get; init; } = [];
+}
+
+public sealed class EmbeddingResult
+{
+    public IReadOnlyList<EmbeddingData> Data { get; init; } = [];
+
+    public int TotalTokens { get; init; }
+}
+
+public sealed class EmbeddingData
+{
+    public int Index { get; init; }
+
+    public float[] Embedding { get; init; } = [];
+
+    public string Object { get; init; } = "embedding";
 }
 
 public sealed class ModelDescriptor

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Zhengyan.LLamaStack.Api.Inference;
 using Zhengyan.LLamaStack.Api.Infrastructure;
@@ -29,6 +30,8 @@ public static class OpenAiCompatibleEndpoints
             })
         }));
 
+        app.MapPost("/v1/embeddings", HandleEmbeddingsAsync);
+
         app.MapGet("/v1/models", (LLamaInferenceService inference) => Results.Json(new
         {
             @object = "list",
@@ -56,6 +59,7 @@ public static class OpenAiCompatibleEndpoints
         app.MapPost("/responses", HandleResponsesAsync);
         app.MapGet("/v1/responses", ListResponses);
         app.MapGet("/v1/responses/{responseId}", GetResponse);
+        app.MapPost("/v1/responses/{responseId}", UpdateResponse);
         app.MapDelete("/v1/responses/{responseId}", DeleteResponse);
         app.MapPost("/v1/responses/{responseId}/cancel", CancelResponse);
         app.MapGet("/v1/responses/{responseId}/input_items", ListResponseInputItems);
@@ -64,6 +68,82 @@ public static class OpenAiCompatibleEndpoints
         app.MapPost("/v1/responses/compact", CompactResponseAsync);
 
         return app;
+    }
+
+    private static async Task<IResult> HandleEmbeddingsAsync(
+        EmbeddingRequest request,
+        LLamaInferenceService inference,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (request.Input is null || request.Input.Value.ValueKind == JsonValueKind.Null)
+            {
+                throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "`input` is required.", param: "input");
+            }
+
+            var inputs = ParseEmbeddingInputs(request.Input.Value);
+            if (inputs.Count == 0)
+            {
+                throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "`input` must contain at least one string.", param: "input");
+            }
+
+            var result = await inference.EmbeddingsAsync(inputs, request.Model, cancellationToken);
+            return Results.Json(new
+            {
+                @object = "list",
+                data = result.Data.Select(d => new
+                {
+                    @object = d.Object,
+                    index = d.Index,
+                    embedding = d.Embedding
+                }).ToArray(),
+                model = inference.DefaultModelId,
+                usage = new
+                {
+                    prompt_tokens = result.TotalTokens,
+                    total_tokens = result.TotalTokens
+                }
+            });
+        }
+        catch (OpenAiProtocolException exception)
+        {
+            return ToError(exception);
+        }
+    }
+
+    private static IReadOnlyList<string> ParseEmbeddingInputs(JsonElement input)
+    {
+        if (input.ValueKind == JsonValueKind.String)
+        {
+            return [input.GetString() ?? string.Empty];
+        }
+
+        if (input.ValueKind == JsonValueKind.Array)
+        {
+            var result = new List<string>();
+            foreach (var item in input.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                {
+                    result.Add(item.GetString() ?? string.Empty);
+                }
+                else if (item.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var inner in item.EnumerateArray())
+                    {
+                        if (inner.ValueKind == JsonValueKind.Number)
+                        {
+                            result.Add(inner.GetRawText());
+                        }
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "`input` must be a string or an array.", param: "input");
     }
 
     private static async Task<IResult> HandleChatCompletionsAsync(
@@ -88,15 +168,18 @@ public static class OpenAiCompatibleEndpoints
                 httpContext.Response.Headers.CacheControl = "no-cache";
                 httpContext.Response.Headers.Connection = "keep-alive";
                 httpContext.Response.ContentType = "text/event-stream; charset=utf-8";
+                var outputText = new StringBuilder();
                 await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, cancellationToken))
                 {
                     await httpContext.Response.WriteAsync(evt, cancellationToken);
                     await httpContext.Response.Body.FlushAsync(cancellationToken);
+                    outputText.Append(evt);
                 }
 
                 if (request.StreamOptions?.IncludeUsage == true)
                 {
-                    await httpContext.Response.WriteAsync(ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens)), cancellationToken);
+                    var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
+                    await httpContext.Response.WriteAsync(ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens, outputTokens)), cancellationToken);
                     await httpContext.Response.Body.FlushAsync(cancellationToken);
                 }
 
@@ -144,14 +227,17 @@ public static class OpenAiCompatibleEndpoints
                 httpContext.Response.Headers.CacheControl = "no-cache";
                 httpContext.Response.Headers.Connection = "keep-alive";
                 httpContext.Response.ContentType = "text/event-stream; charset=utf-8";
+                var outputText = new StringBuilder();
                 await foreach (var evt in inference.StreamResponsesEventsAsync(inferenceRequest, responseId, cancellationToken))
                 {
                     await httpContext.Response.WriteAsync(evt, cancellationToken);
                     await httpContext.Response.Body.FlushAsync(cancellationToken);
+                    outputText.Append(evt);
                 }
 
                 if (request.StreamOptions?.IncludeUsage == true)
                 {
+                    var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
                     await httpContext.Response.WriteAsync(ToSse(new
                     {
                         type = "response.usage.delta",
@@ -159,8 +245,8 @@ public static class OpenAiCompatibleEndpoints
                         usage = new
                         {
                             input_tokens = promptUsage.PromptTokens,
-                            output_tokens = 0,
-                            total_tokens = promptUsage.PromptTokens
+                            output_tokens = outputTokens,
+                            total_tokens = promptUsage.PromptTokens + outputTokens
                         }
                     }), cancellationToken);
                     await httpContext.Response.Body.FlushAsync(cancellationToken);
@@ -275,6 +361,26 @@ public static class OpenAiCompatibleEndpoints
         return response is not null
             ? Results.Json(OpenAiResponseFactory.ToResponsesResponse(response))
             : ToNotFound(responseId, "response_not_found");
+    }
+
+    private static async Task<IResult> UpdateResponse(
+        string responseId,
+        JsonElement body,
+        IOpenAiStore store,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var metadata = ParseOptionalMetadata(body, required: true);
+            var response = await store.UpdateResponseMetadataAsync(responseId, metadata, cancellationToken);
+            return response is not null
+                ? Results.Json(OpenAiResponseFactory.ToResponsesResponse(response))
+                : ToNotFound(responseId, "response_not_found");
+        }
+        catch (OpenAiProtocolException exception)
+        {
+            return ToError(exception);
+        }
     }
 
     private static async Task<IResult> DeleteResponse(
@@ -442,9 +548,9 @@ public static class OpenAiCompatibleEndpoints
 
     private static long UnixNow() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-    private static object ToChatUsageChunk(string responseId, string model, int promptTokens)
+    private static object ToChatUsageChunk(string responseId, string model, int promptTokens, int outputTokens = 0)
     {
-        return OpenAiResponseFactory.ToChatUsageChunk(responseId, model, promptTokens, UnixNow());
+        return OpenAiResponseFactory.ToChatUsageChunk(responseId, model, promptTokens, outputTokens, UnixNow());
     }
 
     private static string ToSse(object payload)

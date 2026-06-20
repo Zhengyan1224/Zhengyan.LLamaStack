@@ -56,8 +56,8 @@ public sealed class OpenAiRequestMapper
         }
 
         var tools = MergeChatTools(request.Tools, request.Functions);
-        ValidateUnsupportedChatFields(request);
         var warnings = new List<string>();
+        AddChatCompatibilityWarnings(request, warnings);
         AddWarningIf(request.ParallelToolCalls == true, warnings, "`parallel_tool_calls` is accepted but tool execution is not implemented yet.");
         AddWarningIf(!string.IsNullOrWhiteSpace(request.ServiceTier), warnings, "`service_tier` is accepted for compatibility and does not affect local inference.");
         return new InferenceRequest
@@ -66,6 +66,7 @@ public sealed class OpenAiRequestMapper
             Messages = messages,
             Tools = tools,
             ToolChoiceDescription = DescribeToolChoice(request.ToolChoice ?? request.FunctionCall),
+            N = Math.Max(1, request.N ?? 1),
             MaxTokens = request.MaxCompletionTokens ?? request.MaxTokens,
             Temperature = ToSingle(request.Temperature),
             TopP = ToSingle(request.TopP),
@@ -118,6 +119,7 @@ public sealed class OpenAiRequestMapper
             Messages = messages,
             Tools = request.Tools ?? [],
             ToolChoiceDescription = DescribeToolChoice(request.ToolChoice),
+            MaxToolCalls = request.MaxToolCalls,
             MaxTokens = request.MaxOutputTokens,
             Temperature = ToSingle(request.Temperature),
             TopP = ToSingle(request.TopP),
@@ -520,22 +522,18 @@ public sealed class OpenAiRequestMapper
 
     private static void ValidateUnsupportedChatFields(ChatCompletionRequest request)
     {
+    }
+
+    public static void AddChatCompatibilityWarnings(ChatCompletionRequest request, List<string> warnings)
+    {
         if (request.Logprobs == true || request.TopLogprobs is not null)
         {
-            throw new OpenAiProtocolException(
-                StatusCodes.Status400BadRequest,
-                "`logprobs` and `top_logprobs` are not supported by this LLamaSharp service yet.",
-                code: "unsupported_parameter",
-                param: request.TopLogprobs is null ? "logprobs" : "top_logprobs");
+            warnings.Add("`logprobs` and `top_logprobs` are accepted but not supported by this LLamaSharp service yet.");
         }
 
         if (request.LogitBias is not null && request.LogitBias.Value.ValueKind != JsonValueKind.Null)
         {
-            throw new OpenAiProtocolException(
-                StatusCodes.Status400BadRequest,
-                "`logit_bias` is not supported by this LLamaSharp service yet.",
-                code: "unsupported_parameter",
-                param: "logit_bias");
+            warnings.Add("`logit_bias` is accepted but not supported by this LLamaSharp service yet.");
         }
     }
 

@@ -17,11 +17,13 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     private readonly LLamaStackOptions _options;
     private readonly ILogger<LLamaInferenceService> _logger;
     private readonly Dictionary<string, ModelRuntime> _models;
+    private readonly ToolExecutor? _toolExecutor;
 
-    public LLamaInferenceService(IOptions<LLamaStackOptions> options, ILogger<LLamaInferenceService> logger)
+    public LLamaInferenceService(IOptions<LLamaStackOptions> options, ILogger<LLamaInferenceService> logger, ToolExecutor? toolExecutor = null)
     {
         _options = options.Value;
         _logger = logger;
+        _toolExecutor = toolExecutor;
         _models = _options.GetModelRegistrations()
             .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => new ModelRuntime(x.First()), StringComparer.OrdinalIgnoreCase);
@@ -127,7 +129,118 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     public async Task<InferenceCompletion> CompleteAsync(InferenceRequest request, CancellationToken cancellationToken)
     {
-        var id = CreateCompletionId("chatcmpl");
+        var n = Math.Max(1, request.N ?? 1);
+        if (n > 1)
+        {
+            return await MultiChoiceCompleteAsync(request, n, cancellationToken);
+        }
+
+        return await CompleteWithToolLoopAsync(request, cancellationToken);
+    }
+
+    private async Task<InferenceCompletion> MultiChoiceCompleteAsync(InferenceRequest request, int n, CancellationToken cancellationToken)
+    {
+        var first = await CompleteWithToolLoopAsync(request, cancellationToken);
+        var choices = new List<InferenceChoice>
+        {
+            new()
+            {
+                Index = 0,
+                Text = first.Text,
+                ToolCalls = first.ToolCalls,
+                CompletionTokens = first.CompletionTokens
+            }
+        };
+
+        for (var i = 1; i < n; i++)
+        {
+            var choice = await CompleteWithToolLoopAsync(request.WithChoiceIndex(i), cancellationToken);
+            choices.Add(new InferenceChoice
+            {
+                Index = i,
+                Text = choice.Text,
+                ToolCalls = choice.ToolCalls,
+                CompletionTokens = choice.CompletionTokens
+            });
+        }
+
+        return new InferenceCompletion
+        {
+            Id = first.Id,
+            Model = first.Model,
+            Text = choices[0].Text,
+            ToolCalls = choices[0].ToolCalls,
+            Choices = choices,
+            PromptTokens = first.PromptTokens,
+            CompletionTokens = choices.Sum(x => x.CompletionTokens),
+            Metadata = request.Metadata,
+            User = request.User,
+            ServiceTier = request.ServiceTier,
+            Store = request.Store,
+            CompatibilityWarnings = request.CompatibilityWarnings
+        };
+    }
+
+    private async Task<InferenceCompletion> CompleteWithToolLoopAsync(InferenceRequest request, CancellationToken cancellationToken)
+    {
+        var maxRounds = Math.Max(1, request.MaxToolCalls ?? 10);
+        var currentMessages = request.Messages.ToList();
+        var toolRounds = new List<ToolRound>();
+
+        InferenceCompletion? completion = null;
+        var currentRequest = request;
+
+        for (var round = 0; round < maxRounds; round++)
+        {
+            completion = await SingleCompleteAsync(currentRequest, cancellationToken);
+
+            if (completion.ToolCalls.Count == 0)
+            {
+                break;
+            }
+
+            if (_toolExecutor is null || !_toolExecutor.CanExecute(completion.ToolCalls))
+            {
+                break;
+            }
+
+            var results = await _toolExecutor.ExecuteAsync(completion.ToolCalls, cancellationToken);
+            toolRounds.Add(new ToolRound
+            {
+                ToolCalls = completion.ToolCalls,
+                Results = results
+            });
+
+            currentMessages = _toolExecutor.BuildToolResultMessages(
+                completion.ToolCalls, results, currentMessages).ToList();
+
+            var warnings = currentRequest.CompatibilityWarnings
+                .Concat([$"Tool call round {round + 1}: `{string.Join(", ", completion.ToolCalls.Select(x => x.Function.Name))}` executed."])
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+
+            currentRequest = currentRequest.WithMessages(currentMessages, warnings);
+        }
+
+        return new InferenceCompletion
+        {
+            Id = completion?.Id ?? CreateCompletionId("chatcmpl"),
+            Model = completion?.Model ?? ResolveRuntime(request.RequestedModel).Options.Id,
+            Text = completion?.Text ?? string.Empty,
+            ToolCalls = toolRounds.Count > 0 ? toolRounds.Last().ToolCalls : (completion?.ToolCalls ?? []),
+            ToolRounds = toolRounds,
+            PromptTokens = completion?.PromptTokens ?? 0,
+            CompletionTokens = completion?.CompletionTokens ?? 0,
+            Metadata = request.Metadata,
+            User = request.User,
+            ServiceTier = request.ServiceTier,
+            Store = request.Store,
+            CompatibilityWarnings = currentRequest.CompatibilityWarnings
+        };
+    }
+
+    private async Task<InferenceCompletion> SingleCompleteAsync(InferenceRequest request, CancellationToken cancellationToken)
+    {
         var createdText = new StringBuilder();
         await foreach (var token in StreamTextAsync(request, cancellationToken))
         {
@@ -139,14 +252,17 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         var text = createdText.ToString();
         var toolCalls = TryExtractToolCalls(text, request.Tools, out var cleanText);
         var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out _, out _);
+        var completionTokens = CountTokens(loaded, cleanText);
+        var finishReason = DetermineFinishReason(toolCalls.Count > 0, completionTokens, request.MaxTokens, model.Options.DefaultMaxTokens);
         return new InferenceCompletion
         {
-            Id = id,
+            Id = CreateCompletionId("chatcmpl"),
             Model = model.Options.Id,
             Text = cleanText,
             ToolCalls = toolCalls,
+            FinishReason = finishReason,
             PromptTokens = CountTokens(loaded, prompt),
-            CompletionTokens = CountTokens(loaded, cleanText),
+            CompletionTokens = completionTokens,
             Metadata = request.Metadata,
             User = request.User,
             ServiceTier = request.ServiceTier,
@@ -155,12 +271,88 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         };
     }
 
+    private static string DetermineFinishReason(bool hasToolCalls, int completionTokens, int? requestMaxTokens, int defaultMaxTokens)
+    {
+        if (hasToolCalls)
+        {
+            return "tool_calls";
+        }
+
+        var effectiveMax = requestMaxTokens ?? defaultMaxTokens;
+        if (completionTokens >= effectiveMax)
+        {
+            return "length";
+        }
+
+        return "stop";
+    }
+
     public async Task<(string Model, int PromptTokens)> EstimatePromptUsageAsync(InferenceRequest request, CancellationToken cancellationToken)
     {
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await EnsureLoadedAsync(model, cancellationToken);
         var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out _, out _);
         return (model.Options.Id, CountTokens(loaded, prompt));
+    }
+
+    public async Task<int> CountTokensAsync(string text, string? requestedModel, CancellationToken cancellationToken)
+    {
+        var model = ResolveRuntime(requestedModel);
+        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+        return CountTokens(loaded, text);
+    }
+
+    public async Task<EmbeddingResult> EmbeddingsAsync(
+        IReadOnlyList<string> inputs,
+        string? requestedModel,
+        CancellationToken cancellationToken)
+    {
+        var model = ResolveRuntime(requestedModel);
+        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+
+        var embedderParams = new ModelParams(model.Options.ModelPath!)
+        {
+            ContextSize = model.Options.ContextSize,
+            GpuLayerCount = model.Options.GpuLayerCount,
+            Threads = model.Options.Threads,
+            BatchThreads = model.Options.BatchThreads,
+            UseMemorymap = model.Options.UseMemoryMap,
+            UseMemoryLock = model.Options.UseMemoryLock,
+            BatchSize = model.Options.BatchSize ?? 512,
+            Embeddings = true
+        };
+
+        var data = new List<EmbeddingData>();
+        var totalTokens = 0;
+        var embedder = new LLamaEmbedder(loaded.Weights, embedderParams, _logger);
+        try
+        {
+            foreach (var input in inputs)
+            {
+                var tokens = loaded.Context.Tokenize(input, addBos: true, special: true);
+                totalTokens += tokens.Count();
+                var vectors = await embedder.GetEmbeddings(input, cancellationToken);
+                if (vectors is { Count: > 0 })
+                {
+                    data.Add(new EmbeddingData
+                    {
+                        Index = data.Count,
+                        Embedding = vectors[0],
+                        Object = "embedding"
+                    });
+                }
+            }
+        }
+        finally
+        {
+            embedder.Dispose();
+        }
+
+        return new EmbeddingResult
+        {
+            Data = data,
+            TotalTokens = totalTokens
+        };
     }
 
     public async IAsyncEnumerable<string> StreamTextAsync(

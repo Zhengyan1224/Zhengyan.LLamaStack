@@ -29,6 +29,8 @@ public sealed record StoredChatCompletion
 
     public int CompletionTokens { get; init; }
 
+    public string FinishReason { get; init; } = "stop";
+
     public IReadOnlyList<string> CompatibilityWarnings { get; init; } = [];
 }
 

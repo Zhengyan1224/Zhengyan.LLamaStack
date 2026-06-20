@@ -28,6 +28,7 @@ public sealed class OpenAiMemoryStore : IOpenAiStore
             Messages = request.Messages,
             OutputText = completion.Text,
             ToolCalls = completion.ToolCalls,
+            FinishReason = completion.FinishReason,
             PromptTokens = completion.PromptTokens,
             CompletionTokens = completion.CompletionTokens,
             CompatibilityWarnings = completion.CompatibilityWarnings
@@ -140,6 +141,21 @@ public sealed class OpenAiMemoryStore : IOpenAiStore
         {
             cancellationToken.ThrowIfCancellationRequested();
             var updated = current with { Status = "cancelled" };
+            if (_responses.TryUpdate(id, updated, current))
+            {
+                return Task.FromResult<StoredResponse?>(updated);
+            }
+        }
+
+        return Task.FromResult<StoredResponse?>(null);
+    }
+
+    public Task<StoredResponse?> UpdateResponseMetadataAsync(string id, IReadOnlyDictionary<string, string>? metadata, CancellationToken cancellationToken)
+    {
+        while (_responses.TryGetValue(id, out var current))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var updated = current with { Metadata = metadata };
             if (_responses.TryUpdate(id, updated, current))
             {
                 return Task.FromResult<StoredResponse?>(updated);

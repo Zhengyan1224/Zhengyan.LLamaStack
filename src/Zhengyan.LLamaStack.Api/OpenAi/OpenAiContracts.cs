@@ -178,6 +178,19 @@ public sealed class OpenAiFunctionCall
     public string Arguments { get; set; } = "{}";
 }
 
+public sealed class EmbeddingRequest
+{
+    public string? Model { get; set; }
+
+    public JsonElement? Input { get; set; }
+
+    public string? EncodingFormat { get; set; }
+
+    public string? User { get; set; }
+
+    public int? Dimensions { get; set; }
+}
+
 public sealed class OpenAiErrorEnvelope
 {
     public OpenAiError Error { get; set; } = new();

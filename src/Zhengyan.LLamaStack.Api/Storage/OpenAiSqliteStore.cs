@@ -33,10 +33,10 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             """
             INSERT OR REPLACE INTO chat_completions
                 (id, created, model, metadata_json, user, service_tier, store, messages_json, output_text,
-                 tool_calls_json, prompt_tokens, completion_tokens, compatibility_warnings_json)
+                 tool_calls_json, finish_reason, prompt_tokens, completion_tokens, compatibility_warnings_json)
             VALUES
                 ($id, $created, $model, $metadata_json, $user, $service_tier, $store, $messages_json, $output_text,
-                 $tool_calls_json, $prompt_tokens, $completion_tokens, $compatibility_warnings_json);
+                 $tool_calls_json, $finish_reason, $prompt_tokens, $completion_tokens, $compatibility_warnings_json);
             """;
 
         AddParameter(command, "$id", id);
@@ -49,6 +49,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         AddParameter(command, "$messages_json", Serialize(request.Messages));
         AddParameter(command, "$output_text", completion.Text);
         AddParameter(command, "$tool_calls_json", Serialize(completion.ToolCalls));
+        AddParameter(command, "$finish_reason", completion.FinishReason);
         AddParameter(command, "$prompt_tokens", completion.PromptTokens);
         AddParameter(command, "$completion_tokens", completion.CompletionTokens);
         AddParameter(command, "$compatibility_warnings_json", Serialize(completion.CompatibilityWarnings));
@@ -68,7 +69,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         command.CommandText =
             """
             SELECT id, created, model, metadata_json, user, service_tier, store, messages_json, output_text,
-                   tool_calls_json, prompt_tokens, completion_tokens, compatibility_warnings_json
+                   tool_calls_json, finish_reason, prompt_tokens, completion_tokens, compatibility_warnings_json
             FROM chat_completions
             ORDER BY created DESC, id ASC;
             """;
@@ -90,7 +91,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         command.CommandText =
             """
             SELECT id, created, model, metadata_json, user, service_tier, store, messages_json, output_text,
-                   tool_calls_json, prompt_tokens, completion_tokens, compatibility_warnings_json
+                   tool_calls_json, finish_reason, prompt_tokens, completion_tokens, compatibility_warnings_json
             FROM chat_completions
             WHERE id = $id;
             """;
@@ -249,6 +250,18 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         return affected == 0 ? null : await GetResponseAsync(id, cancellationToken);
     }
 
+    public async Task<StoredResponse?> UpdateResponseMetadataAsync(string id, IReadOnlyDictionary<string, string>? metadata, CancellationToken cancellationToken)
+    {
+        await EnsureSchemaAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE responses SET metadata_json = $metadata_json WHERE id = $id;";
+        AddParameter(command, "$id", id);
+        AddParameter(command, "$metadata_json", SerializeNullable(metadata));
+        var affected = await command.ExecuteNonQueryAsync(cancellationToken);
+        return affected == 0 ? null : await GetResponseAsync(id, cancellationToken);
+    }
+
     private async Task EnsureSchemaAsync(CancellationToken cancellationToken)
     {
         if (_schemaReady)
@@ -280,6 +293,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
                     messages_json TEXT NOT NULL,
                     output_text TEXT NOT NULL,
                     tool_calls_json TEXT NOT NULL,
+                    finish_reason TEXT NOT NULL DEFAULT 'stop',
                     prompt_tokens INTEGER NOT NULL,
                     completion_tokens INTEGER NOT NULL,
                     compatibility_warnings_json TEXT NOT NULL
@@ -362,9 +376,10 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             Messages = Deserialize<IReadOnlyList<InferenceMessage>>(reader.GetString(7)),
             OutputText = reader.GetString(8),
             ToolCalls = Deserialize<IReadOnlyList<OpenAiToolCall>>(reader.GetString(9)),
-            PromptTokens = reader.GetInt32(10),
-            CompletionTokens = reader.GetInt32(11),
-            CompatibilityWarnings = Deserialize<IReadOnlyList<string>>(reader.GetString(12))
+            FinishReason = reader.GetString(10),
+            PromptTokens = reader.GetInt32(11),
+            CompletionTokens = reader.GetInt32(12),
+            CompatibilityWarnings = Deserialize<IReadOnlyList<string>>(reader.GetString(13))
         };
     }
 

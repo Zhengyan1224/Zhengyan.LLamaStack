@@ -25,4 +25,6 @@ public interface IOpenAiStore
     Task<bool> DeleteResponseAsync(string id, CancellationToken cancellationToken);
 
     Task<StoredResponse?> CancelResponseAsync(string id, CancellationToken cancellationToken);
+
+    Task<StoredResponse?> UpdateResponseMetadataAsync(string id, IReadOnlyDictionary<string, string>? metadata, CancellationToken cancellationToken);
 }

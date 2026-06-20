@@ -56,6 +56,10 @@ public sealed class LLamaStackOptions
 
     public List<LLamaModelOptions> Models { get; set; } = [];
 
+    public LLamaAuthOptions Auth { get; set; } = new();
+
+    public LLamaCorsOptions Cors { get; set; } = new();
+
     public IReadOnlyList<LLamaModelRuntimeOptions> GetModelRegistrations()
     {
         var result = new List<LLamaModelRuntimeOptions>();
@@ -300,4 +304,24 @@ public sealed class LLamaModelRuntimeOptions
     public IReadOnlyList<string> AntiPrompts { get; init; } = ["<|im_end|>", "</s>"];
 
     public LLamaModelCapabilities Capabilities { get; init; } = new();
+}
+
+public sealed class LLamaAuthOptions
+{
+    public bool Enabled { get; set; }
+
+    public string? ApiKey { get; set; }
+
+    public string? ApiKeyHeader { get; set; } = "Authorization";
+}
+
+public sealed class LLamaCorsOptions
+{
+    public bool Enabled { get; set; }
+
+    public IReadOnlyList<string> AllowedOrigins { get; set; } = [];
+
+    public IReadOnlyList<string> AllowedHeaders { get; set; } = [];
+
+    public IReadOnlyList<string> AllowedMethods { get; set; } = [];
 }

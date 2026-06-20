@@ -7,9 +7,7 @@ public static class OpenAiResponseFactory
 {
     public static object ToChatCompletionResponse(InferenceCompletion completion, string responseId, long created)
     {
-        var message = completion.ToolCalls.Count > 0
-            ? new ChatChoiceMessage("assistant", null, completion.ToolCalls)
-            : new ChatChoiceMessage("assistant", completion.Text, null);
+        var choices = BuildChoices(completion);
 
         return new
         {
@@ -22,18 +20,43 @@ public static class OpenAiResponseFactory
             service_tier = completion.ServiceTier,
             store = completion.Store,
             system_fingerprint = "llamasharp-local",
-            choices = new[]
-            {
-                new
-                {
-                    index = 0,
-                    message,
-                    finish_reason = completion.ToolCalls.Count > 0 ? "tool_calls" : "stop"
-                }
-            },
+            choices,
             usage = ToChatUsage(completion.PromptTokens, completion.CompletionTokens),
             compatibility_warnings = completion.CompatibilityWarnings.Count == 0 ? null : completion.CompatibilityWarnings
         };
+    }
+
+    private static object[] BuildChoices(InferenceCompletion completion)
+    {
+        if (completion.Choices.Count > 0)
+        {
+            return completion.Choices.Select(c =>
+            {
+                var choiceMessage = c.ToolCalls.Count > 0
+                    ? new ChatChoiceMessage("assistant", null, c.ToolCalls)
+                    : new ChatChoiceMessage("assistant", c.Text, null);
+                return (object)new
+                {
+                    index = c.Index,
+                    message = choiceMessage,
+                    finish_reason = c.FinishReason
+                };
+            }).ToArray();
+        }
+
+        var message = completion.ToolCalls.Count > 0
+            ? new ChatChoiceMessage("assistant", null, completion.ToolCalls)
+            : new ChatChoiceMessage("assistant", completion.Text, null);
+
+        return
+        [
+            new
+            {
+                index = 0,
+                message,
+                finish_reason = completion.FinishReason
+            }
+        ];
     }
 
     public static object ToChatCompletionResponse(StoredChatCompletion completion)
@@ -59,7 +82,7 @@ public static class OpenAiResponseFactory
                 {
                     index = 0,
                     message,
-                    finish_reason = completion.ToolCalls.Count > 0 ? "tool_calls" : "stop"
+                    finish_reason = completion.FinishReason
                 }
             },
             usage = ToChatUsage(completion.PromptTokens, completion.CompletionTokens),
@@ -133,7 +156,7 @@ public static class OpenAiResponseFactory
         };
     }
 
-    public static object ToChatUsageChunk(string responseId, string model, int promptTokens, long created)
+    public static object ToChatUsageChunk(string responseId, string model, int promptTokens, int outputTokens, long created)
     {
         return new
         {
@@ -142,7 +165,7 @@ public static class OpenAiResponseFactory
             created,
             model,
             choices = Array.Empty<object>(),
-            usage = ToChatUsage(promptTokens, 0)
+            usage = ToChatUsage(promptTokens, outputTokens)
         };
     }
 
