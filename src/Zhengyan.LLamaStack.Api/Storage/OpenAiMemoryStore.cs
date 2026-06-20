@@ -37,14 +37,15 @@ public sealed class OpenAiMemoryStore : IOpenAiStore
         return Task.CompletedTask;
     }
 
-    public Task<IReadOnlyList<StoredChatCompletion>> ListChatCompletionsAsync(
+    public Task<StoredListResult<StoredChatCompletion>> ListChatCompletionsAsync(
         int limit,
         string? after,
         string? before,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(OpenAiStoreHelpers.ApplyCursor(_chatCompletions.Values, x => x.Id, x => x.Created, limit, after, before));
+        var result = OpenAiStoreHelpers.ApplyCursor(_chatCompletions.Values, x => x.Id, x => x.Created, limit, after, before);
+        return Task.FromResult(new StoredListResult<StoredChatCompletion>(result.Items, result.HasMore));
     }
 
     public Task<StoredChatCompletion?> GetChatCompletionAsync(string id, CancellationToken cancellationToken)
@@ -112,14 +113,15 @@ public sealed class OpenAiMemoryStore : IOpenAiStore
         return Task.CompletedTask;
     }
 
-    public Task<IReadOnlyList<StoredResponse>> ListResponsesAsync(
+    public Task<StoredListResult<StoredResponse>> ListResponsesAsync(
         int limit,
         string? after,
         string? before,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(OpenAiStoreHelpers.ApplyCursor(_responses.Values, x => x.Id, x => x.CreatedAt, limit, after, before));
+        var result = OpenAiStoreHelpers.ApplyCursor(_responses.Values, x => x.Id, x => x.CreatedAt, limit, after, before);
+        return Task.FromResult(new StoredListResult<StoredResponse>(result.Items, result.HasMore));
     }
 
     public Task<StoredResponse?> GetResponseAsync(string id, CancellationToken cancellationToken)

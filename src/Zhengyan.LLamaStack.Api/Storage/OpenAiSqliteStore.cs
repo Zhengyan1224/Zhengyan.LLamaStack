@@ -56,7 +56,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task<IReadOnlyList<StoredChatCompletion>> ListChatCompletionsAsync(
+    public async Task<StoredListResult<StoredChatCompletion>> ListChatCompletionsAsync(
         int limit,
         string? after,
         string? before,
@@ -80,7 +80,8 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             all.Add(ReadChatCompletion(reader));
         }
 
-        return OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.Created, limit, after, before);
+        var result = OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.Created, limit, after, before);
+        return new StoredListResult<StoredChatCompletion>(result.Items, result.HasMore);
     }
 
     public async Task<StoredChatCompletion?> GetChatCompletionAsync(string id, CancellationToken cancellationToken)
@@ -185,7 +186,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task<IReadOnlyList<StoredResponse>> ListResponsesAsync(
+    public async Task<StoredListResult<StoredResponse>> ListResponsesAsync(
         int limit,
         string? after,
         string? before,
@@ -209,7 +210,8 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             all.Add(ReadResponse(reader));
         }
 
-        return OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.CreatedAt, limit, after, before);
+        var result = OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.CreatedAt, limit, after, before);
+        return new StoredListResult<StoredResponse>(result.Items, result.HasMore);
     }
 
     public async Task<StoredResponse?> GetResponseAsync(string id, CancellationToken cancellationToken)

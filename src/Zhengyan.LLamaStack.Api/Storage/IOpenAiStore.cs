@@ -6,7 +6,7 @@ public interface IOpenAiStore
 {
     Task AddChatCompletionAsync(string id, long created, InferenceRequest request, InferenceCompletion completion, CancellationToken cancellationToken);
 
-    Task<IReadOnlyList<StoredChatCompletion>> ListChatCompletionsAsync(int limit, string? after, string? before, CancellationToken cancellationToken);
+    Task<StoredListResult<StoredChatCompletion>> ListChatCompletionsAsync(int limit, string? after, string? before, CancellationToken cancellationToken);
 
     Task<StoredChatCompletion?> GetChatCompletionAsync(string id, CancellationToken cancellationToken);
 
@@ -18,7 +18,7 @@ public interface IOpenAiStore
 
     Task AddResponseAsync(StoredResponse response, CancellationToken cancellationToken);
 
-    Task<IReadOnlyList<StoredResponse>> ListResponsesAsync(int limit, string? after, string? before, CancellationToken cancellationToken);
+    Task<StoredListResult<StoredResponse>> ListResponsesAsync(int limit, string? after, string? before, CancellationToken cancellationToken);
 
     Task<StoredResponse?> GetResponseAsync(string id, CancellationToken cancellationToken);
 
@@ -28,3 +28,5 @@ public interface IOpenAiStore
 
     Task<StoredResponse?> UpdateResponseMetadataAsync(string id, IReadOnlyDictionary<string, string>? metadata, CancellationToken cancellationToken);
 }
+
+public sealed record StoredListResult<T>(IReadOnlyList<T> Items, bool HasMore);

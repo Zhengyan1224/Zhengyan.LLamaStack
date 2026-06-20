@@ -32,51 +32,61 @@ public sealed class ToolExecutor
 
     public async Task<IReadOnlyList<ToolResult>> ExecuteAsync(
         IReadOnlyList<OpenAiToolCall> toolCalls,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool parallel = false)
     {
-        var results = new List<ToolResult>();
+        if (parallel && toolCalls.Count > 1)
+        {
+            var tasks = toolCalls.Select(call => ExecuteOneAsync(call, cancellationToken));
+            return await Task.WhenAll(tasks);
+        }
+
+        var results = new List<ToolResult>(toolCalls.Count);
         foreach (var call in toolCalls)
         {
-            if (_tools.TryGetValue(call.Function.Name, out var tool))
+            results.Add(await ExecuteOneAsync(call, cancellationToken));
+        }
+
+        return results;
+    }
+
+    private async Task<ToolResult> ExecuteOneAsync(OpenAiToolCall call, CancellationToken cancellationToken)
+    {
+        if (_tools.TryGetValue(call.Function.Name, out var tool))
+        {
+            try
             {
-                try
-                {
-                    var output = await tool.ExecuteAsync(call.Function.Arguments, cancellationToken);
-                    results.Add(new ToolResult
-                    {
-                        ToolCallId = call.Id,
-                        Name = call.Function.Name,
-                        Arguments = call.Function.Arguments,
-                        Output = output,
-                        Executed = true
-                    });
-                }
-                catch (Exception exception)
-                {
-                    results.Add(new ToolResult
-                    {
-                        ToolCallId = call.Id,
-                        Name = call.Function.Name,
-                        Arguments = call.Function.Arguments,
-                        Output = $"Error: {exception.Message}",
-                        Executed = true
-                    });
-                }
-            }
-            else
-            {
-                results.Add(new ToolResult
+                var output = await tool.ExecuteAsync(call.Function.Arguments, cancellationToken);
+                return new ToolResult
                 {
                     ToolCallId = call.Id,
                     Name = call.Function.Name,
                     Arguments = call.Function.Arguments,
-                    Output = $"Tool `{call.Function.Name}` is not registered locally.",
-                    Executed = false
-                });
+                    Output = output,
+                    Executed = true
+                };
+            }
+            catch (Exception exception)
+            {
+                return new ToolResult
+                {
+                    ToolCallId = call.Id,
+                    Name = call.Function.Name,
+                    Arguments = call.Function.Arguments,
+                    Output = $"Error: {exception.Message}",
+                    Executed = true
+                };
             }
         }
 
-        return results;
+        return new ToolResult
+        {
+            ToolCallId = call.Id,
+            Name = call.Function.Name,
+            Arguments = call.Function.Arguments,
+            Output = $"Tool `{call.Function.Name}` is not registered locally.",
+            Executed = false
+        };
     }
 
     public IReadOnlyList<InferenceMessage> BuildToolResultMessages(

@@ -21,6 +21,7 @@ builder.Services.AddSingleton<ToolExecutor>(sp =>
     var tools = sp.GetServices<IAgentTool>();
     return new ToolExecutor(tools);
 });
+builder.Services.AddSingleton<ModelQueueManager>();
 builder.Services.AddSingleton<LLamaInferenceService>();
 builder.Services.AddHostedService<LLamaWarmupHostedService>();
 builder.Services.AddExceptionHandler<OpenAiExceptionHandler>();

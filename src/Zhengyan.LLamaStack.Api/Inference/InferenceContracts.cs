@@ -10,123 +10,116 @@ public enum InferenceEndpointKind
 
 public sealed class InferenceRequest
 {
-    public string? RequestedModel { get; init; }
+    public string? RequestedModel { get; set; }
 
-    public IReadOnlyList<InferenceMessage> Messages { get; init; } = [];
+    public IReadOnlyList<InferenceMessage> Messages { get; set; } = [];
 
-    public IReadOnlyList<OpenAiTool> Tools { get; init; } = [];
+    public IReadOnlyList<OpenAiTool> Tools { get; set; } = [];
 
-    public string? ToolChoiceDescription { get; init; }
+    public string? ToolChoiceDescription { get; set; }
 
-    public int? N { get; init; }
+    public int? N { get; set; }
 
-    public int? MaxToolCalls { get; init; }
+    public int? MaxToolCalls { get; set; }
 
-    public int? MaxTokens { get; init; }
+    public int? MaxTokens { get; set; }
 
-    public float? Temperature { get; init; }
+    public float? Temperature { get; set; }
 
-    public float? TopP { get; init; }
+    public float? TopP { get; set; }
 
-    public int? TopK { get; init; }
+    public int? TopK { get; set; }
 
-    public float? PresencePenalty { get; init; }
+    public float? PresencePenalty { get; set; }
 
-    public float? FrequencyPenalty { get; init; }
+    public float? FrequencyPenalty { get; set; }
 
-    public uint? Seed { get; init; }
+    public uint? Seed { get; set; }
 
-    public IReadOnlyList<string> Stop { get; init; } = [];
+    public IReadOnlyList<string> Stop { get; set; } = [];
 
-    public bool ForceJson { get; init; }
+    public bool ForceJson { get; set; }
 
-    public bool StreamIncludeUsage { get; init; }
+    public bool StreamIncludeUsage { get; set; }
 
-    public bool? Store { get; init; }
+    public bool? Store { get; set; }
 
-    public string? User { get; init; }
+    public string? User { get; set; }
 
-    public string? ServiceTier { get; init; }
+    public string? ServiceTier { get; set; }
 
-    public bool? ParallelToolCalls { get; init; }
+    public bool? ParallelToolCalls { get; set; }
 
-    public string? PreviousResponseId { get; init; }
+    public string? PreviousResponseId { get; set; }
 
-    public string? Truncation { get; init; }
+    public string? Truncation { get; set; }
 
-    public IReadOnlyDictionary<string, string>? Metadata { get; init; }
+    public IReadOnlyDictionary<string, string>? Metadata { get; set; }
 
-    public int ChoiceIndex { get; init; }
+    public IReadOnlyList<string>? Include { get; set; }
 
-    public IReadOnlyList<string> CompatibilityWarnings { get; init; } = [];
+    public string? ReasoningEffort { get; set; }
+
+    public string? Prompt { get; set; }
+
+    public int ChoiceIndex { get; set; }
+
+    public IReadOnlyList<string> CompatibilityWarnings { get; set; } = [];
 
     public InferenceRequest WithChoiceIndex(int choiceIndex)
     {
-        return new InferenceRequest
-        {
-            RequestedModel = RequestedModel,
-            Messages = Messages,
-            Tools = Tools,
-            ToolChoiceDescription = ToolChoiceDescription,
-            N = N,
-            ChoiceIndex = choiceIndex,
-            MaxTokens = MaxTokens,
-            Temperature = Temperature,
-            TopP = TopP,
-            TopK = TopK,
-            PresencePenalty = PresencePenalty,
-            FrequencyPenalty = FrequencyPenalty,
-            Seed = Seed,
-            Stop = Stop,
-            ForceJson = ForceJson,
-            StreamIncludeUsage = StreamIncludeUsage,
-            Store = Store,
-            User = User,
-            ServiceTier = ServiceTier,
-            ParallelToolCalls = ParallelToolCalls,
-            PreviousResponseId = PreviousResponseId,
-            Truncation = Truncation,
-            Metadata = Metadata,
-            CompatibilityWarnings = CompatibilityWarnings
-        };
+        var copy = new InferenceRequest();
+        CopyTo(copy);
+        copy.ChoiceIndex = choiceIndex;
+        return copy;
     }
 
     public InferenceRequest WithMessages(
         IReadOnlyList<InferenceMessage> messages,
         IReadOnlyList<string>? compatibilityWarnings = null)
     {
-        return new InferenceRequest
-        {
-            RequestedModel = RequestedModel,
-            Messages = messages,
-            Tools = Tools,
-            ToolChoiceDescription = ToolChoiceDescription,
-            N = N,
-            MaxToolCalls = MaxToolCalls,
-            MaxTokens = MaxTokens,
-            Temperature = Temperature,
-            TopP = TopP,
-            TopK = TopK,
-            PresencePenalty = PresencePenalty,
-            FrequencyPenalty = FrequencyPenalty,
-            Seed = Seed,
-            Stop = Stop,
-            ForceJson = ForceJson,
-            StreamIncludeUsage = StreamIncludeUsage,
-            Store = Store,
-            User = User,
-            ServiceTier = ServiceTier,
-            ParallelToolCalls = ParallelToolCalls,
-            PreviousResponseId = PreviousResponseId,
-            Truncation = Truncation,
-            Metadata = Metadata,
-            CompatibilityWarnings = compatibilityWarnings ?? CompatibilityWarnings
-        };
+        var copy = new InferenceRequest();
+        CopyTo(copy);
+        copy.Messages = messages;
+        copy.CompatibilityWarnings = compatibilityWarnings ?? CompatibilityWarnings;
+        return copy;
     }
 
     public InferenceRequest WithCompatibilityWarnings(IReadOnlyList<string> compatibilityWarnings)
     {
         return WithMessages(Messages, compatibilityWarnings);
+    }
+
+    private void CopyTo(InferenceRequest target)
+    {
+        target.RequestedModel = RequestedModel;
+        target.Messages = Messages;
+        target.Tools = Tools;
+        target.ToolChoiceDescription = ToolChoiceDescription;
+        target.N = N;
+        target.MaxToolCalls = MaxToolCalls;
+        target.MaxTokens = MaxTokens;
+        target.Temperature = Temperature;
+        target.TopP = TopP;
+        target.TopK = TopK;
+        target.PresencePenalty = PresencePenalty;
+        target.FrequencyPenalty = FrequencyPenalty;
+        target.Seed = Seed;
+        target.Stop = Stop;
+        target.ForceJson = ForceJson;
+        target.StreamIncludeUsage = StreamIncludeUsage;
+        target.Store = Store;
+        target.User = User;
+        target.ServiceTier = ServiceTier;
+        target.ParallelToolCalls = ParallelToolCalls;
+        target.PreviousResponseId = PreviousResponseId;
+        target.Truncation = Truncation;
+        target.Metadata = Metadata;
+        target.Include = Include;
+        target.ReasoningEffort = ReasoningEffort;
+        target.Prompt = Prompt;
+        target.ChoiceIndex = ChoiceIndex;
+        target.CompatibilityWarnings = CompatibilityWarnings;
     }
 }
 

@@ -58,8 +58,6 @@ public sealed class OpenAiRequestMapper
         var tools = MergeChatTools(request.Tools, request.Functions);
         var warnings = new List<string>();
         AddChatCompatibilityWarnings(request, warnings);
-        AddWarningIf(request.ParallelToolCalls == true, warnings, "`parallel_tool_calls` is accepted but tool execution is not implemented yet.");
-        AddWarningIf(!string.IsNullOrWhiteSpace(request.ServiceTier), warnings, "`service_tier` is accepted for compatibility and does not affect local inference.");
         return new InferenceRequest
         {
             RequestedModel = request.Model,
@@ -94,6 +92,12 @@ public sealed class OpenAiRequestMapper
             messages.Add(new InferenceMessage { Role = "system", Content = request.Instructions });
         }
 
+        var promptText = ParsePromptText(request.Prompt);
+        if (!string.IsNullOrWhiteSpace(promptText))
+        {
+            messages.Add(new InferenceMessage { Role = "system", Content = promptText });
+        }
+
         if (request.Input is null)
         {
             throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "`input` is required.", param: "input");
@@ -107,12 +111,7 @@ public sealed class OpenAiRequestMapper
         ValidateUnsupportedResponsesFields(request);
         var warnings = new List<string>();
         AddWarningIf(request.Background == true, warnings, "`background` is accepted but background execution is not implemented yet.");
-        AddWarningIf(request.ParallelToolCalls == true, warnings, "`parallel_tool_calls` is accepted but tool execution is not implemented yet.");
-        AddWarningIf(!string.IsNullOrWhiteSpace(request.ServiceTier), warnings, "`service_tier` is accepted for compatibility and does not affect local inference.");
         AddWarningIf(request.Conversation is not null, warnings, "`conversation` is accepted but persistent conversations are not implemented yet.");
-        AddWarningIf(request.Include is not null, warnings, "`include` is accepted but only basic output fields are returned.");
-        AddWarningIf(request.Reasoning is not null, warnings, "`reasoning` is accepted but local reasoning controls are not implemented yet.");
-        AddWarningIf(request.Prompt is not null, warnings, "`prompt` is accepted but prompt templates are not implemented yet.");
         return new InferenceRequest
         {
             RequestedModel = request.Model,
@@ -120,8 +119,8 @@ public sealed class OpenAiRequestMapper
             Tools = request.Tools ?? [],
             ToolChoiceDescription = DescribeToolChoice(request.ToolChoice),
             MaxToolCalls = request.MaxToolCalls,
-            MaxTokens = request.MaxOutputTokens,
-            Temperature = ToSingle(request.Temperature),
+            MaxTokens = ApplyReasoningMaxTokens(ToSingle(request.Temperature), request.MaxOutputTokens, request.Reasoning),
+            Temperature = ApplyReasoningTemperature(ToSingle(request.Temperature), request.Reasoning),
             TopP = ToSingle(request.TopP),
             TopK = request.TopK,
             PresencePenalty = ToSingle(request.PresencePenalty),
@@ -136,6 +135,7 @@ public sealed class OpenAiRequestMapper
             ParallelToolCalls = request.ParallelToolCalls,
             PreviousResponseId = request.PreviousResponseId,
             Truncation = request.Truncation,
+            Include = ParseInclude(request.Include),
             Metadata = ParseMetadata(request.Metadata),
             CompatibilityWarnings = warnings
         };
@@ -535,6 +535,95 @@ public sealed class OpenAiRequestMapper
         {
             warnings.Add("`logit_bias` is accepted but not supported by this LLamaSharp service yet.");
         }
+
+        if (request.Modalities is { Count: > 0 } && request.Modalities.Any(x => !string.Equals(x, "text", StringComparison.OrdinalIgnoreCase)))
+        {
+            var nonText = string.Join(", ", request.Modalities.Where(x => !string.Equals(x, "text", StringComparison.OrdinalIgnoreCase)));
+            warnings.Add($"`modalities` values `{nonText}` are not supported by this server; only `text` output is available.");
+        }
+    }
+
+    private static IReadOnlyList<string>? ParseInclude(JsonElement? include)
+    {
+        if (include is null || include.Value.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        var result = new List<string>();
+        foreach (var item in include.Value.EnumerateArray())
+        {
+            if (item.ValueKind == JsonValueKind.String)
+            {
+                result.Add(item.GetString()!);
+            }
+        }
+
+        return result.Count > 0 ? result : null;
+    }
+
+    private static string? ParsePromptText(JsonElement? prompt)
+    {
+        if (prompt is null || prompt.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        if (prompt.Value.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String)
+        {
+            return text.GetString();
+        }
+
+        if (prompt.Value.TryGetProperty("template", out var template) && template.ValueKind == JsonValueKind.String)
+        {
+            return template.GetString();
+        }
+
+        return null;
+    }
+
+    private static float? ApplyReasoningTemperature(float? baseTemperature, JsonElement? reasoning)
+    {
+        var effort = ParseReasoningEffort(reasoning);
+        return effort switch
+        {
+            "low" => baseTemperature is not null ? Math.Min(1.5f, baseTemperature.Value + 0.3f) : 1.0f,
+            "high" => baseTemperature is not null ? Math.Max(0.1f, baseTemperature.Value - 0.2f) : 0.5f,
+            _ => baseTemperature
+        };
+    }
+
+    private static int? ApplyReasoningMaxTokens(float? baseTemperature, int? requestedMaxTokens, JsonElement? reasoning)
+    {
+        var effort = ParseReasoningEffort(reasoning);
+        var baseMax = requestedMaxTokens ?? 2048;
+        return effort switch
+        {
+            "low" => Math.Min(baseMax, 1024),
+            "high" => Math.Max(baseMax, 4096),
+            _ => requestedMaxTokens
+        };
+    }
+
+    private static string? ParseReasoningEffort(JsonElement? reasoning)
+    {
+        if (reasoning is null || reasoning.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        if (reasoning.Value.TryGetProperty("effort", out var effort) && effort.ValueKind == JsonValueKind.String)
+        {
+            var value = effort.GetString();
+            if (string.Equals(value, "low", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "medium", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "high", StringComparison.OrdinalIgnoreCase))
+            {
+                return value!.ToLowerInvariant();
+            }
+        }
+
+        return null;
     }
 
     private static void ValidateUnsupportedResponsesFields(ResponsesRequest request)

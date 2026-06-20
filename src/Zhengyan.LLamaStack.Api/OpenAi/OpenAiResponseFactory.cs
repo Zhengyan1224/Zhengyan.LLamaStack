@@ -90,7 +90,7 @@ public static class OpenAiResponseFactory
         };
     }
 
-    public static object ToResponsesResponse(InferenceCompletion completion, string responseId, long created)
+    public static object ToResponsesResponse(InferenceCompletion completion, string responseId, long created, IReadOnlyList<string>? include = null)
     {
         return ToResponsesResponse(
             responseId,
@@ -105,10 +105,11 @@ public static class OpenAiResponseFactory
             completion.ToolCalls,
             completion.PromptTokens,
             completion.CompletionTokens,
-            completion.CompatibilityWarnings);
+            completion.CompatibilityWarnings,
+            include);
     }
 
-    public static object ToResponsesResponse(StoredResponse response)
+    public static object ToResponsesResponse(StoredResponse response, IReadOnlyList<string>? include = null)
     {
         return ToResponsesResponse(
             response.Id,
@@ -123,7 +124,8 @@ public static class OpenAiResponseFactory
             response.ToolCalls,
             response.InputTokens,
             response.OutputTokens,
-            response.CompatibilityWarnings);
+            response.CompatibilityWarnings,
+            include);
     }
 
     public static object ToChatMessages(StoredChatCompletion completion)
@@ -169,13 +171,13 @@ public static class OpenAiResponseFactory
         };
     }
 
-    public static object ToList(IReadOnlyList<object> data)
+    public static object ToList(IReadOnlyList<object> data, bool hasMore = false)
     {
         return new
         {
             @object = "list",
             data,
-            has_more = false,
+            has_more = hasMore,
             first_id = TryReadId(data.FirstOrDefault()),
             last_id = TryReadId(data.LastOrDefault())
         };
@@ -204,10 +206,15 @@ public static class OpenAiResponseFactory
         IReadOnlyList<OpenAiToolCall> toolCalls,
         int inputTokens,
         int outputTokens,
-        IReadOnlyList<string> compatibilityWarnings)
+        IReadOnlyList<string> compatibilityWarnings,
+        IReadOnlyList<string>? include = null)
     {
+        var wants = include is null || include.Count == 0
+            ? null
+            : new HashSet<string>(include, StringComparer.OrdinalIgnoreCase);
+
         var output = new List<object>();
-        if (!string.IsNullOrEmpty(outputText))
+        if (!string.IsNullOrEmpty(outputText) && (wants is null || wants.Contains("output_text")))
         {
             output.Add(new
             {
@@ -229,6 +236,11 @@ public static class OpenAiResponseFactory
 
         foreach (var toolCall in toolCalls)
         {
+            if (wants is not null && !wants.Contains("tool_calls") && !wants.Contains(toolCall.Type))
+            {
+                continue;
+            }
+
             output.Add(new
             {
                 id = toolCall.Id,

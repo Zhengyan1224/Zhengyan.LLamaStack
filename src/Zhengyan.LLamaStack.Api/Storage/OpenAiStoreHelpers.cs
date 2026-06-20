@@ -18,16 +18,12 @@ public static class OpenAiStoreHelpers
             messages.Add(new InferenceMessage { Role = "system", Content = instructions });
         }
 
+        messages.AddRange(source.InputMessages);
         messages.Add(new InferenceMessage
         {
             Role = "assistant",
             Content = source.OutputText
         });
-
-        var warnings = source.CompatibilityWarnings
-            .Concat(["Local compact returns a stored context snapshot; it does not run model-based summarization yet."])
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
 
         return new StoredResponse
         {
@@ -45,11 +41,11 @@ public static class OpenAiStoreHelpers
             ToolCalls = source.ToolCalls,
             InputTokens = EstimateInputTokens(messages),
             OutputTokens = source.OutputTokens,
-            CompatibilityWarnings = warnings
+            CompatibilityWarnings = source.CompatibilityWarnings
         };
     }
 
-    public static IReadOnlyList<T> ApplyCursor<T>(
+    public static CursorResult<T> ApplyCursor<T>(
         IEnumerable<T> values,
         Func<T, string> idSelector,
         Func<T, long> createdSelector,
@@ -81,6 +77,10 @@ public static class OpenAiStoreHelpers
             }
         }
 
-        return ordered.Take(safeLimit).ToArray();
+        var result = ordered.Take(safeLimit).ToArray();
+        var hasMore = ordered.Length > safeLimit;
+        return new CursorResult<T>(result, hasMore);
     }
 }
+
+public sealed record CursorResult<T>(IReadOnlyList<T> Items, bool HasMore);

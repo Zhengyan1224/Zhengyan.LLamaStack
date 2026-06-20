@@ -58,6 +58,38 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
     }
 
+    public async Task LoadModelAsync(string modelId, CancellationToken cancellationToken)
+    {
+        var model = ResolveRuntime(modelId);
+        await EnsureLoadedAsync(model, cancellationToken);
+    }
+
+    public Task UnloadModelAsync(string modelId, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var model = ResolveRuntime(modelId);
+        return UnloadModelInternalAsync(model);
+    }
+
+    private static async Task UnloadModelInternalAsync(ModelRuntime model)
+    {
+        await model.LoadLock.WaitAsync();
+        try
+        {
+            if (model.Loaded is null)
+            {
+                return;
+            }
+
+            model.Loaded.Dispose();
+            model.Loaded = null;
+        }
+        finally
+        {
+            model.LoadLock.Release();
+        }
+    }
+
     public void ValidateRequest(InferenceRequest request, InferenceEndpointKind endpointKind, bool stream)
     {
         var model = ResolveRuntime(request.RequestedModel);
@@ -204,7 +236,8 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 break;
             }
 
-            var results = await _toolExecutor.ExecuteAsync(completion.ToolCalls, cancellationToken);
+            var parallel = request.ParallelToolCalls == true;
+            var results = await _toolExecutor.ExecuteAsync(completion.ToolCalls, cancellationToken, parallel);
             toolRounds.Add(new ToolRound
             {
                 ToolCalls = completion.ToolCalls,
@@ -241,14 +274,15 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private async Task<InferenceCompletion> SingleCompleteAsync(InferenceRequest request, CancellationToken cancellationToken)
     {
+        var model = ResolveRuntime(request.RequestedModel);
+        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+        request = ApplyTruncation(request, loaded, model);
         var createdText = new StringBuilder();
         await foreach (var token in StreamTextAsync(request, cancellationToken))
         {
             createdText.Append(token);
         }
 
-        var model = ResolveRuntime(request.RequestedModel);
-        var loaded = await EnsureLoadedAsync(model, cancellationToken);
         var text = createdText.ToString();
         var toolCalls = TryExtractToolCalls(text, request.Tools, out var cleanText);
         var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out _, out _);
@@ -291,7 +325,8 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await EnsureLoadedAsync(model, cancellationToken);
-        var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out _, out _);
+        var truncated = ApplyTruncation(request, loaded, model);
+        var prompt = BuildPrompt(loaded.Weights, truncated, loaded.MediaMarker, out _, out _);
         return (model.Options.Id, CountTokens(loaded, prompt));
     }
 
@@ -300,6 +335,40 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         var model = ResolveRuntime(requestedModel);
         var loaded = await EnsureLoadedAsync(model, cancellationToken);
         return CountTokens(loaded, text);
+    }
+
+    public async Task<IReadOnlyList<int>> TokenizeAsync(string text, string? requestedModel, CancellationToken cancellationToken)
+    {
+        var model = ResolveRuntime(requestedModel);
+        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+        try
+        {
+            return loaded.Context.Tokenize(text, addBos: false, special: true).Select(t => (int)t).ToArray();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    public async Task<string> DetokenizeAsync(IReadOnlyList<int> tokens, string? requestedModel, CancellationToken cancellationToken)
+    {
+        var model = ResolveRuntime(requestedModel);
+        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+        try
+        {
+            var decoder = new StreamingTokenDecoder(loaded.Context);
+            foreach (var token in tokens)
+            {
+                decoder.Add(token);
+            }
+
+            return decoder.Read();
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     public async Task<EmbeddingResult> EmbeddingsAsync(
@@ -361,14 +430,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await EnsureLoadedAsync(model, cancellationToken);
-        await model.InferenceLock.WaitAsync(cancellationToken);
+        request = ApplyTruncation(request, loaded, model);
+        var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out var media, out var mediaCount);
+        var inferenceParams = CreateInferenceParams(model.Options, request);
+        ResetExecutorState(loaded);
+        LoadMedia(loaded, media, mediaCount);
+
         try
         {
-            var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out var media, out var mediaCount);
-            var inferenceParams = CreateInferenceParams(model.Options, request);
-            ResetExecutorState(loaded);
-            LoadMedia(loaded, media, mediaCount);
-
             await foreach (var token in loaded.Executor.InferAsync(prompt, inferenceParams, cancellationToken).WithCancellation(cancellationToken))
             {
                 yield return token;
@@ -377,7 +446,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         finally
         {
             CleanupMedia(loaded);
-            model.InferenceLock.Release();
         }
     }
 
@@ -705,6 +773,56 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
     }
 
+    private InferenceRequest ApplyTruncation(InferenceRequest request, LoadedModel loaded, ModelRuntime model)
+    {
+        if (!string.Equals(request.Truncation, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            return request;
+        }
+
+        var ctxSize = (int)(model.Options.ContextSize ?? 4096);
+        var headroom = Math.Min(2048, ctxSize / 5);
+        var maxPromptTokens = ctxSize - headroom;
+        var truncated = request.Messages.ToList();
+
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            var testRequest = request.WithMessages(truncated);
+            var allMedia = new List<InferenceMedia>();
+            var messages = BuildPromptMessages(testRequest, loaded.MediaMarker, allMedia);
+            var tempRequest = request.WithMessages(truncated);
+            // quick token estimate without building full template
+            var roughText = string.Join("\n", messages.Select(m => m.Role + ": " + m.Content));
+            var tokenCount = CountTokens(loaded, roughText);
+            if (tokenCount <= maxPromptTokens)
+            {
+                break;
+            }
+
+            var removed = RemoveMiddleMessage(truncated);
+            if (!removed)
+            {
+                break;
+            }
+        }
+
+        return request.WithMessages(truncated);
+    }
+
+    private static bool RemoveMiddleMessage(List<InferenceMessage> messages)
+    {
+        // find index range of non-system messages
+        var nonSystem = messages.Select((m, i) => i).Where(i => !string.Equals(messages[i].Role, "system", StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (nonSystem.Length <= 1)
+        {
+            return false;
+        }
+
+        var mid = nonSystem[nonSystem.Length / 2];
+        messages.RemoveAt(mid);
+        return true;
+    }
+
     private string BuildPrompt(
         LLamaWeights weights,
         InferenceRequest request,
@@ -801,8 +919,16 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             builder.AppendLine("Tool choice: " + request.ToolChoiceDescription);
         }
 
-        builder.AppendLine("When calling a tool, respond only with JSON in this exact shape:");
-        builder.AppendLine("""{"tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"tool_name","arguments":"{\"arg\":\"value\"}"}}]}""");
+        if (request.ParallelToolCalls == true)
+        {
+            builder.AppendLine("You may call multiple tools at once. Respond only with JSON in this exact shape:");
+            builder.AppendLine("""{"tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"tool_name","arguments":"{\"arg\":\"value\"}"}},{"id":"call_<unique>","type":"function","function":{"name":"another_tool","arguments":"{\"arg\":\"value\"}"}}]}""");
+        }
+        else
+        {
+            builder.AppendLine("When calling a tool, respond only with JSON in this exact shape:");
+            builder.AppendLine("""{"tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"tool_name","arguments":"{\"arg\":\"value\"}"}}]}""");
+        }
         builder.AppendLine("If no tool is needed, answer normally.");
         if (request.ForceJson)
         {
@@ -885,8 +1011,12 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 var calls = JsonSerializer.Deserialize<List<OpenAiToolCall>>(toolCallsElement.GetRawText(), OpenAiJson.CreateOptions()) ?? [];
                 if (calls.Count > 0)
                 {
-                    cleanText = string.Empty;
-                    return calls;
+                    var valid = ValidateToolCalls(calls, requestTools);
+                    if (valid.Count > 0)
+                    {
+                        cleanText = string.Empty;
+                        return valid;
+                    }
                 }
             }
 
@@ -895,16 +1025,18 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 var call = JsonSerializer.Deserialize<OpenAiFunctionCall>(functionCallElement.GetRawText(), OpenAiJson.CreateOptions());
                 if (call is not null)
                 {
-                    cleanText = string.Empty;
-                    return
-                    [
-                        new OpenAiToolCall
-                        {
-                            Id = "call_" + Guid.NewGuid().ToString("N"),
-                            Type = "function",
-                            Function = call
-                        }
-                    ];
+                    var toolCall = new OpenAiToolCall
+                    {
+                        Id = "call_" + Guid.NewGuid().ToString("N"),
+                        Type = "function",
+                        Function = call
+                    };
+                    var single = ValidateToolCalls([toolCall], requestTools);
+                    if (single.Count > 0)
+                    {
+                        cleanText = string.Empty;
+                        return single;
+                    }
                 }
             }
         }
@@ -914,6 +1046,136 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
 
         return [];
+    }
+
+    private static IReadOnlyList<OpenAiToolCall> ValidateToolCalls(
+        IReadOnlyList<OpenAiToolCall> calls,
+        IReadOnlyList<OpenAiTool> requestTools)
+    {
+        var valid = new List<OpenAiToolCall>();
+        var schemaIndex = requestTools
+            .Where(t => t.Function is not null)
+            .ToDictionary(t => t.Function!.Name, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var call in calls)
+        {
+            if (call.Function is null || string.IsNullOrWhiteSpace(call.Function.Name))
+            {
+                continue;
+            }
+
+            if (!schemaIndex.TryGetValue(call.Function.Name, out var toolDef))
+            {
+                valid.Add(call);
+                continue;
+            }
+
+            if (toolDef.Function?.Parameters is null || toolDef.Function.Parameters.Value.ValueKind != JsonValueKind.Object)
+            {
+                valid.Add(call);
+                continue;
+            }
+
+            var schema = toolDef.Function.Parameters.Value;
+            var argsValid = ValidateArgumentsAgainstSchema(call.Function.Arguments, schema);
+            if (argsValid)
+            {
+                valid.Add(call);
+            }
+        }
+
+        return valid;
+    }
+
+    private static bool ValidateArgumentsAgainstSchema(string argumentsJson, JsonElement schema)
+    {
+        if (string.IsNullOrWhiteSpace(argumentsJson))
+        {
+            return false;
+        }
+
+        JsonDocument argsDoc;
+        try
+        {
+            argsDoc = JsonDocument.Parse(argumentsJson);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+
+        using (argsDoc)
+        {
+            var args = argsDoc.RootElement;
+            if (args.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            if (!schema.TryGetProperty("required", out var requiredElement) || requiredElement.ValueKind != JsonValueKind.Array)
+            {
+                return true;
+            }
+
+            foreach (var required in requiredElement.EnumerateArray())
+            {
+                if (required.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var propName = required.GetString();
+                if (string.IsNullOrWhiteSpace(propName))
+                {
+                    continue;
+                }
+
+                if (!args.TryGetProperty(propName, out _))
+                {
+                    return false;
+                }
+            }
+
+            if (!schema.TryGetProperty("properties", out var propsElement) || propsElement.ValueKind != JsonValueKind.Object)
+            {
+                return true;
+            }
+
+            foreach (var prop in propsElement.EnumerateObject())
+            {
+                if (!args.TryGetProperty(prop.Name, out var argValue))
+                {
+                    continue;
+                }
+
+                if (!prop.Value.TryGetProperty("type", out var typeElement) || typeElement.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var expectedType = typeElement.GetString();
+                if (!IsJsonTypeCompatible(argValue, expectedType))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsJsonTypeCompatible(JsonElement value, string? expectedType)
+    {
+        return expectedType switch
+        {
+            "string" => value.ValueKind == JsonValueKind.String,
+            "number" => value.ValueKind == JsonValueKind.Number,
+            "integer" => value.ValueKind == JsonValueKind.Number,
+            "boolean" => value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False,
+            "array" => value.ValueKind == JsonValueKind.Array,
+            "object" => value.ValueKind == JsonValueKind.Object,
+            _ => true
+        };
     }
 
     private static string? ExtractJsonObject(string text)
@@ -968,7 +1230,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             {
                 model.LoadLock.Release();
                 model.LoadLock.Dispose();
-                model.InferenceLock.Dispose();
             }
         }
     }
@@ -1015,7 +1276,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         public SemaphoreSlim LoadLock { get; } = new(1, 1);
 
-        public SemaphoreSlim InferenceLock { get; } = new(1, 1);
 
         public LoadedModel? Loaded { get; set; }
 
