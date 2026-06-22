@@ -140,16 +140,17 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 code: "model_path_not_configured");
         }
 
-        if (!File.Exists(model.Options.ModelPath))
+        var modelPath = ResolvePath(model.Options.ModelPath);
+        if (!File.Exists(modelPath))
         {
             throw new OpenAiProtocolException(
                 StatusCodes.Status503ServiceUnavailable,
-                $"Configured GGUF model file was not found for `{model.Options.Id}`: {model.Options.ModelPath}",
+                $"Configured GGUF model file was not found for `{model.Options.Id}`: {modelPath}",
                 type: "server_error",
                 code: "model_not_found");
         }
 
-        if ((hasImage || hasAudio) && !string.IsNullOrWhiteSpace(model.Options.MmprojPath) && !File.Exists(model.Options.MmprojPath))
+        if ((hasImage || hasAudio) && !string.IsNullOrWhiteSpace(model.Options.MmprojPath) && !File.Exists(ResolvePath(model.Options.MmprojPath)))
         {
             throw new OpenAiProtocolException(
                 StatusCodes.Status503ServiceUnavailable,
@@ -379,7 +380,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         var model = ResolveRuntime(requestedModel);
         var loaded = await EnsureLoadedAsync(model, cancellationToken);
 
-        var embedderParams = new ModelParams(model.Options.ModelPath!)
+        var embedderParams = new ModelParams(ResolvePath(model.Options.ModelPath!))
         {
             ContextSize = model.Options.ContextSize,
             GpuLayerCount = model.Options.GpuLayerCount,
@@ -616,16 +617,17 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                     code: "model_path_not_configured");
             }
 
-            if (!File.Exists(model.Options.ModelPath))
+            var modelPath = ResolvePath(model.Options.ModelPath);
+            if (!File.Exists(modelPath))
             {
                 throw new OpenAiProtocolException(
                     StatusCodes.Status503ServiceUnavailable,
-                    $"Configured GGUF model file was not found for `{model.Options.Id}`: {model.Options.ModelPath}",
+                    $"Configured GGUF model file was not found for `{model.Options.Id}`: {modelPath}",
                     type: "server_error",
                     code: "model_not_found");
             }
 
-            var parameters = CreateModelParams(model.Options);
+            var parameters = CreateModelParams(modelPath, model.Options);
             _logger.LogInformation("Loading GGUF model {ModelId} from {ModelPath}", model.Options.Id, model.Options.ModelPath);
             var weights = await LLamaWeights.LoadFromFileAsync(parameters, cancellationToken);
             var context = weights.CreateContext(parameters);
@@ -634,11 +636,12 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             string? mediaMarker = null;
             if (!string.IsNullOrWhiteSpace(model.Options.MmprojPath))
             {
-                if (!File.Exists(model.Options.MmprojPath))
+                var mmprojPath = ResolvePath(model.Options.MmprojPath);
+                if (!File.Exists(mmprojPath))
                 {
                     throw new OpenAiProtocolException(
                         StatusCodes.Status503ServiceUnavailable,
-                        $"Configured mmproj file was not found for `{model.Options.Id}`: {model.Options.MmprojPath}",
+                        $"Configured mmproj file was not found for `{model.Options.Id}`: {mmprojPath}",
                         type: "server_error",
                         code: "mmproj_not_found");
                 }
@@ -665,9 +668,9 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
     }
 
-    private static ModelParams CreateModelParams(LLamaModelRuntimeOptions model)
+    private static ModelParams CreateModelParams(string modelPath, LLamaModelRuntimeOptions model)
     {
-        var parameters = new ModelParams(model.ModelPath!)
+        var parameters = new ModelParams(modelPath)
         {
             ContextSize = model.ContextSize,
             GpuLayerCount = model.GpuLayerCount,
@@ -1280,6 +1283,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         public LoadedModel? Loaded { get; set; }
 
         public bool IsLoaded => Loaded is not null;
+    }
+
+    private static string ResolvePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return path ?? string.Empty;
+
+        return Path.IsPathRooted(path) ? path : Path.GetFullPath(path);
     }
 
     private sealed class LoadedModel : IDisposable

@@ -13,7 +13,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<LLamaStackOptions>(builder.Configuration.GetSection(LLamaStackOptions.SectionName));
 builder.Services.AddHttpClient(OpenAiRequestMapper.MediaHttpClientName);
 builder.Services.AddSingleton<OpenAiRequestMapper>();
-builder.Services.AddSingleton<OpenAiMemoryStore>();
+builder.Services.AddSingleton<IOpenAiStore, OpenAiMemoryStore>();
 builder.Services.AddSingleton<CalculatorTool>();
 builder.Services.AddSingleton<CurrentTimeTool>();
 builder.Services.AddSingleton<ToolExecutor>(sp =>

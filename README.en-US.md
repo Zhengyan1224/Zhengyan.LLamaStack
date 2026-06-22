@@ -392,27 +392,31 @@ The current management layer uses process memory. It is useful for development a
 
 ### Tool Calling
 
+The service ships with two built-in tools — `calculator` and `current_time` — which are automatically executed in a multi-turn loop for both Chat Completions and Responses. Unknown tools are returned to the client as-is without execution.
+
+Request body structure for the `calculator` tool:
+
 ```json
 {
-  "model": "local-gguf",
+  "model": "qwen3.5-0.8b",
   "messages": [
     {
       "role": "user",
-      "content": "What is the weather in Shanghai?"
+      "content": "Calculate 15 * 37"
     }
   ],
   "tools": [
     {
       "type": "function",
       "function": {
-        "name": "get_weather",
-        "description": "Get current weather for a city.",
+        "name": "calculator",
+        "description": "Perform arithmetic calculations",
         "parameters": {
           "type": "object",
           "properties": {
-            "city": { "type": "string" }
+            "expression": { "type": "string", "description": "Math expression to evaluate" }
           },
-          "required": [ "city" ]
+          "required": [ "expression" ]
         }
       }
     }
@@ -420,7 +424,111 @@ The current management layer uses process memory. It is useful for development a
 }
 ```
 
-The current version does not execute tools. It injects tool schemas into the prompt and converts model-generated tool-call JSON into OpenAI-compatible response fields. Real tool execution and tool-call loops are on the roadmap.
+#### Chat Completions with Tool Calling
+
+Linux:
+
+```bash
+curl -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8b",
+    "messages": [{"role": "user", "content": "Tell me what time it is now."}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "current_time",
+        "description": "Get the current time for a timezone",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "timezone": { "type": "string", "description": "Timezone (e.g. Asia/Shanghai)" }
+          }
+        }
+      }
+    }]
+  }' | jq .
+```
+
+Windows (CMD / PowerShell with `curl.exe`, save the JSON as `body.json` first):
+
+```json
+{
+  "model": "qwen3.5-0.8b",
+  "messages": [{"role": "user", "content": "Calculate 15 * 37"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "calculator",
+      "description": "Perform arithmetic calculations",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": { "type": "string", "description": "Math expression" }
+        },
+        "required": ["expression"]
+      }
+    }
+  }]
+}
+```
+
+```powershell
+curl.exe -s http://localhost:5062/v1/chat/completions -H "Content-Type: application/json" -d "@body.json"
+```
+
+#### Responses with Tool Calling
+
+Linux:
+
+```bash
+curl -s http://localhost:5062/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8b",
+    "input": "What time is it in Tokyo?",
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "current_time",
+        "description": "Get the current time for a timezone",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "timezone": { "type": "string", "description": "Timezone (e.g. Asia/Tokyo)" }
+          }
+        }
+      }
+    }]
+  }' | jq .
+```
+
+Windows (CMD / PowerShell with `curl.exe`):
+
+```json
+{
+  "model": "qwen3.5-0.8b",
+  "input": "Calculate (42 + 7) * 3",
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "calculator",
+      "description": "Perform arithmetic calculations",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": { "type": "string", "description": "Math expression" }
+        },
+        "required": ["expression"]
+      }
+    }
+  }]
+}
+```
+
+```powershell
+curl.exe -s http://localhost:5062/v1/responses -H "Content-Type: application/json" -d "@body.json"
+```
 
 ### Multimodal Input
 
@@ -562,7 +670,7 @@ Then configure:
 | Chat management endpoints | Basic in-memory endpoints are implemented, but data is lost after restart; streaming Chat responses are not stored yet. | Add a storage abstraction with SQLite/PostgreSQL/Redis backends; persist streaming outputs and complete cursor pagination. |
 | Responses API | An in-memory store and `previous_response_id` continuation are implemented; `conversation`, `background`, real cancellation, and truncation policy still degrade for compatibility. | Design a durable response store, conversation state, background job queue, real cancellation, and context truncation policy. |
 | Responses management endpoints | retrieve/delete/cancel/input_items/token count/compact have basic in-memory implementations; `compact` currently creates a context snapshot and does not run model-based summarization. | Add durable storage, a task state machine, model-driven compact, exact token counts, and SDK-compatible pagination. |
-| Tool calling | Current implementation only injects tools into prompts and parses JSON. It does not execute tools or run tool-call loops. | Add a tool registry, tool executors, multi-turn tool loops, timeout/permission controls, parallel calls, and structured output validation. |
+| Tool calling | Two built-in tools (`calculator`, `current_time`) are executed in a multi-turn loop; unknown tools are returned to the client without execution. | Add a tool registry, hot-loadable tools, parallel tool calls, timeout/permission controls, structured output validation, and a custom tool interface. |
 | Structured Outputs | Strict JSON Schema constrained decoding is not implemented. | Integrate llama.cpp/LLamaSharp grammar support or schema-to-grammar conversion, plus strict JSON Schema validation. |
 | Multimodal output | Only text output is supported. Image/audio output items are not supported. | Extend response output item models and integrate image/audio generation backends. |
 | Audio API | `/v1/audio/transcriptions`, `/v1/audio/translations`, and `/v1/audio/speech` are not implemented. | Integrate Whisper/Sherpa-ONNX/TTS backends and expose OpenAI-compatible payloads. |

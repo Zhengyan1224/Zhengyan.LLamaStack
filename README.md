@@ -392,27 +392,31 @@ Invoke-RestMethod http://localhost:5062/v1/responses `
 
 ### 工具调用
 
+服务内置了 `calculator`（计算器）和 `current_time`（当前时间）两个工具，它们会在 Chat Completions 和 Responses 的多轮调用循环中自动执行。未知工具会被原样返回给客户端，不会执行。
+
+以下是 `calculator` 工具的请求体结构：
+
 ```json
 {
-  "model": "local-gguf",
+  "model": "qwen3.5-0.8b",
   "messages": [
     {
       "role": "user",
-      "content": "What is the weather in Shanghai?"
+      "content": "Calculate 15 * 37"
     }
   ],
   "tools": [
     {
       "type": "function",
       "function": {
-        "name": "get_weather",
-        "description": "Get current weather for a city.",
+        "name": "calculator",
+        "description": "Perform arithmetic calculations",
         "parameters": {
           "type": "object",
           "properties": {
-            "city": { "type": "string" }
+            "expression": { "type": "string", "description": "Math expression to evaluate" }
           },
-          "required": [ "city" ]
+          "required": [ "expression" ]
         }
       }
     }
@@ -420,7 +424,111 @@ Invoke-RestMethod http://localhost:5062/v1/responses `
 }
 ```
 
-当前版本不会真正执行工具，而是把工具 schema 注入 prompt，并将模型生成的工具调用 JSON 转换成 OpenAI 协议响应。真实工具执行调度属于后续路线图。
+#### Chat Completions 工具调用
+
+Linux：
+
+```bash
+curl -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8b",
+    "messages": [{"role": "user", "content": "Tell me what time it is now."}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "current_time",
+        "description": "Get the current time for a timezone",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "timezone": { "type": "string", "description": "Timezone (e.g. Asia/Shanghai)" }
+          }
+        }
+      }
+    }]
+  }' | jq .
+```
+
+Windows (CMD / PowerShell with `curl.exe`，先将 JSON 保存到 `body.json`)：
+
+```json
+{
+  "model": "qwen3.5-0.8b",
+  "messages": [{"role": "user", "content": "Calculate 15 * 37"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "calculator",
+      "description": "Perform arithmetic calculations",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": { "type": "string", "description": "Math expression" }
+        },
+        "required": ["expression"]
+      }
+    }
+  }]
+}
+```
+
+```powershell
+curl.exe -s http://localhost:5062/v1/chat/completions -H "Content-Type: application/json" -d "@body.json"
+```
+
+#### Responses 工具调用
+
+Linux：
+
+```bash
+curl -s http://localhost:5062/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8b",
+    "input": "What time is it in Tokyo?",
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "current_time",
+        "description": "Get the current time for a timezone",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "timezone": { "type": "string", "description": "Timezone (e.g. Asia/Tokyo)" }
+          }
+        }
+      }
+    }]
+  }' | jq .
+```
+
+Windows (CMD / PowerShell with `curl.exe`)：
+
+```json
+{
+  "model": "qwen3.5-0.8b",
+  "input": "Calculate (42 + 7) * 3",
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "calculator",
+      "description": "Perform arithmetic calculations",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": { "type": "string", "description": "Math expression" }
+        },
+        "required": ["expression"]
+      }
+    }
+  }]
+}
+```
+
+```powershell
+curl.exe -s http://localhost:5062/v1/responses -H "Content-Type: application/json" -d "@body.json"
+```
 
 ### 多模态输入
 
@@ -562,7 +670,7 @@ dotnet add src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LL
 | Chat 管理接口 | 已有内存版管理接口，但重启丢失；streaming Chat 响应暂不落库。 | 抽象存储接口并增加 SQLite/PostgreSQL/Redis 实现；保存 streaming 完整输出和分页游标。 |
 | Responses API | 已有内存 store 和 `previous_response_id` 上下文续写；`conversation`、`background`、真实取消、截断策略仍是兼容降级。 | 设计持久化 response store、conversation state、后台执行队列、真实取消和上下文截断策略。 |
 | Responses 管理接口 | retrieve/delete/cancel/input_items/token count/compact 已有基础内存版；`compact` 当前只生成上下文快照，不做模型总结压缩。 | 增加持久化、任务状态机、模型驱动 compact、精确 token count 和 SDK 兼容分页。 |
-| Tool Calling | 当前只做 prompt 注入和 JSON 解析，不执行工具，不支持工具调度循环。 | 增加工具注册表、工具执行器、调用回合循环、超时/权限控制、并行工具调用和 structured outputs 校验。 |
+| Tool Calling | 已内置 `calculator` 和 `current_time` 两个工具的多轮执行循环；未知工具返回客户端，不执行。 | 增加工具注册表、工具热加载、并行工具调用、超时/权限控制、结构化输出校验和自定义工具接口。 |
 | Structured Outputs | 未实现 JSON Schema 强约束解码。 | 接入 llama.cpp/LLamaSharp grammar 或 schema-to-grammar 转换；补充严格 JSON Schema 校验。 |
 | 多模态输出 | 当前只支持文本输出，不支持图片、音频等输出。 | 根据 OpenAI 输出 item 类型扩展响应模型；后续集成图像/语音生成模块。 |
 | Audio API | `/v1/audio/transcriptions`、`/v1/audio/translations`、`/v1/audio/speech` 未实现。 | 规划接入 Whisper/Sherpa-ONNX/TTS 后端，并提供 OpenAI 兼容格式。 |

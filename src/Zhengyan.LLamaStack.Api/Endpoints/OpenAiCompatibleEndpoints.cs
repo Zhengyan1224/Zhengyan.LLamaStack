@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Zhengyan.LLamaStack.Api.Inference;
 using Zhengyan.LLamaStack.Api.Infrastructure;
 using Zhengyan.LLamaStack.Api.OpenAi;
@@ -7,48 +8,65 @@ using Zhengyan.LLamaStack.Api.Storage;
 
 namespace Zhengyan.LLamaStack.Api.Endpoints;
 
+internal sealed class OpenAiEndpointLogger { }
+
 public static class OpenAiCompatibleEndpoints
 {
     private static readonly DateTime _startTime = DateTime.UtcNow;
 
     public static IEndpointRouteBuilder MapOpenAiCompatibleEndpoints(this IEndpointRouteBuilder app)
     {
-        app.MapGet("/", () => Results.Json(new
+        app.MapGet("/", (ILogger<OpenAiEndpointLogger> logger) =>
         {
-            name = "Zhengyan.LLamaStack",
-            openai_compatible = true,
-            endpoints = new[] { "/v1/models", "/v1/chat/completions", "/v1/responses", "/health" }
-        }));
-
-        app.MapGet("/health", (LLamaInferenceService inference) => Results.Json(new
-        {
-            status = "ok",
-            model_loaded = inference.IsLoaded,
-            default_model = inference.DefaultModelId,
-            models = inference.GetModels().Select(x => new
+            var value = new
             {
-                id = x.Id,
-                loaded = x.Loaded
-            })
-        }));
+                name = "Zhengyan.LLamaStack",
+                openai_compatible = true,
+                endpoints = new[] { "/v1/models", "/v1/chat/completions", "/v1/responses", "/health" }
+            };
+            LogResponse(logger, "GET /", 200, value);
+            return Results.Json(value);
+        });
+
+        app.MapGet("/health", (LLamaInferenceService inference, ILogger<OpenAiEndpointLogger> logger) =>
+        {
+            var value = new
+            {
+                status = "ok",
+                model_loaded = inference.IsLoaded,
+                default_model = inference.DefaultModelId,
+                models = inference.GetModels().Select(x => new
+                {
+                    id = x.Id,
+                    loaded = x.Loaded
+                })
+            };
+            LogResponse(logger, "GET /health", 200, value);
+            return Results.Json(value);
+        });
 
         app.MapPost("/v1/embeddings", HandleEmbeddingsAsync);
 
-        app.MapGet("/v1/models", (LLamaInferenceService inference) => Results.Json(new
+        app.MapGet("/v1/models", (LLamaInferenceService inference, ILogger<OpenAiEndpointLogger> logger) =>
         {
-            @object = "list",
-            data = inference.GetModels().Select(model => new
-                {
-                    id = model.Id,
-                    @object = "model",
-                    created = model.Created,
-                    owned_by = model.OwnedBy,
-                    loaded = model.Loaded,
-                    model_path = model.ModelPath,
-                    mmproj_path = model.MmprojPath,
-                    capabilities = model.Capabilities
-                })
-        }));
+            var value = new
+            {
+                @object = "list",
+                data = inference.GetModels().Select(model => new
+                    {
+                        id = model.Id,
+                        @object = "model",
+                        created = model.Created,
+                        owned_by = model.OwnedBy,
+                        loaded = model.Loaded,
+                        model_path = model.ModelPath,
+                        mmproj_path = model.MmprojPath,
+                        capabilities = model.Capabilities
+                    })
+            };
+            LogResponse(logger, "GET /v1/models", 200, value);
+            return Results.Json(value);
+        });
 
         app.MapPost("/v1/chat/completions", HandleChatCompletionsAsync);
         app.MapPost("/chat/completions", HandleChatCompletionsAsync);
@@ -78,9 +96,21 @@ public static class OpenAiCompatibleEndpoints
         return app;
     }
 
+    private static void LogResponse<T>(ILogger logger, string endpoint, int statusCode, T value)
+    {
+        logger.LogDebug("[{Endpoint}] {StatusCode} {Json}",
+            endpoint, statusCode, JsonSerializer.Serialize(value, OpenAiJson.CreateOptions()));
+    }
+
+    private static void LogResponse(ILogger logger, string endpoint, int statusCode, string body)
+    {
+        logger.LogDebug("[{Endpoint}] {StatusCode} {Body}", endpoint, statusCode, body);
+    }
+
     private static async Task<IResult> HandleEmbeddingsAsync(
         EmbeddingRequest request,
         LLamaInferenceService inference,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         try
@@ -97,7 +127,7 @@ public static class OpenAiCompatibleEndpoints
             }
 
             var result = await inference.EmbeddingsAsync(inputs, request.Model, cancellationToken);
-            return Results.Json(new
+            var value = new
             {
                 @object = "list",
                 data = result.Data.Select(d => new
@@ -112,11 +142,13 @@ public static class OpenAiCompatibleEndpoints
                     prompt_tokens = result.TotalTokens,
                     total_tokens = result.TotalTokens
                 }
-            });
+            };
+            LogResponse(logger, "POST /v1/embeddings", 200, value);
+            return Results.Json(value);
         }
         catch (OpenAiProtocolException exception)
         {
-            return ToError(exception);
+            return ToError(logger, "POST /v1/embeddings", exception);
         }
     }
 
@@ -163,6 +195,7 @@ public static class OpenAiCompatibleEndpoints
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
+        var logger = httpContext.RequestServices.GetRequiredService<ILogger<OpenAiEndpointLogger>>();
         try
         {
             var inferenceRequest = await mapper.FromChatAsync(request, cancellationToken);
@@ -187,24 +220,28 @@ public static class OpenAiCompatibleEndpoints
                     httpContext.Response.Headers.CacheControl = "no-cache";
                     httpContext.Response.Headers.Connection = "keep-alive";
                     httpContext.Response.ContentType = "text/event-stream; charset=utf-8";
-                    var outputText = new StringBuilder();
-                    await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, cancellationToken))
-                    {
-                        await httpContext.Response.WriteAsync(evt, cancellationToken);
-                        await httpContext.Response.Body.FlushAsync(cancellationToken);
-                        outputText.Append(evt);
-                    }
 
-                    if (request.StreamOptions?.IncludeUsage == true)
-                    {
-                        var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
-                        await httpContext.Response.WriteAsync(ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens, outputTokens)), cancellationToken);
-                        await httpContext.Response.Body.FlushAsync(cancellationToken);
-                    }
+        logger.LogDebug("[POST /v1/chat/completions] Streaming started for {ResponseId}", responseId);
 
-                    await httpContext.Response.WriteAsync("data: [DONE]\n\n", cancellationToken);
-                    await httpContext.Response.Body.FlushAsync(cancellationToken);
+            var outputText = new StringBuilder();
+            await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, cancellationToken))
+            {
+                await httpContext.Response.WriteAsync(evt, cancellationToken);
+                await httpContext.Response.Body.FlushAsync(cancellationToken);
+                outputText.Append(evt);
+            }
 
+            if (request.StreamOptions?.IncludeUsage == true)
+            {
+                var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
+                await httpContext.Response.WriteAsync(ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens, outputTokens)), cancellationToken);
+                await httpContext.Response.Body.FlushAsync(cancellationToken);
+            }
+
+            await httpContext.Response.WriteAsync("data: [DONE]\n\n", cancellationToken);
+            await httpContext.Response.Body.FlushAsync(cancellationToken);
+
+            logger.LogDebug("[POST /v1/chat/completions] Streaming finished for {ResponseId}", responseId);
                     return Results.Empty;
                 }
 
@@ -215,7 +252,9 @@ public static class OpenAiCompatibleEndpoints
                     await store.AddChatCompletionAsync(responseId, created, inferenceRequest, completion, cancellationToken);
                 }
 
-                return Results.Json(OpenAiResponseFactory.ToChatCompletionResponse(completion, responseId, created));
+                var response = OpenAiResponseFactory.ToChatCompletionResponse(completion, responseId, created);
+                LogResponse(logger, "POST /v1/chat/completions", 200, response);
+                return Results.Json(response);
             }
             finally
             {
@@ -224,7 +263,7 @@ public static class OpenAiCompatibleEndpoints
         }
         catch (OpenAiProtocolException exception)
         {
-            return ToError(exception);
+            return ToError(logger, "POST /v1/chat/completions", exception);
         }
     }
 
@@ -237,6 +276,7 @@ public static class OpenAiCompatibleEndpoints
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
+        var logger = httpContext.RequestServices.GetRequiredService<ILogger<OpenAiEndpointLogger>>();
         try
         {
             var inferenceRequest = await mapper.FromResponsesAsync(request, cancellationToken);
@@ -261,6 +301,9 @@ public static class OpenAiCompatibleEndpoints
                     httpContext.Response.Headers.CacheControl = "no-cache";
                     httpContext.Response.Headers.Connection = "keep-alive";
                     httpContext.Response.ContentType = "text/event-stream; charset=utf-8";
+
+                    logger.LogDebug("[POST /v1/responses] Streaming started for {ResponseId}", responseId);
+
                     var outputText = new StringBuilder();
                     await foreach (var evt in inference.StreamResponsesEventsAsync(inferenceRequest, responseId, cancellationToken))
                     {
@@ -289,6 +332,7 @@ public static class OpenAiCompatibleEndpoints
                     await httpContext.Response.WriteAsync("data: [DONE]\n\n", cancellationToken);
                     await httpContext.Response.Body.FlushAsync(cancellationToken);
 
+                    logger.LogDebug("[POST /v1/responses] Streaming finished for {ResponseId}", responseId);
                     return Results.Empty;
                 }
 
@@ -299,7 +343,9 @@ public static class OpenAiCompatibleEndpoints
                     await store.AddResponseAsync(responseId, created, inferenceRequest, completion, cancellationToken);
                 }
 
-                return Results.Json(OpenAiResponseFactory.ToResponsesResponse(completion, responseId, created, inferenceRequest.Include));
+                var response = OpenAiResponseFactory.ToResponsesResponse(completion, responseId, created, inferenceRequest.Include);
+                LogResponse(logger, "POST /v1/responses", 200, response);
+                return Results.Json(response);
             }
             finally
             {
@@ -308,12 +354,13 @@ public static class OpenAiCompatibleEndpoints
         }
         catch (OpenAiProtocolException exception)
         {
-            return ToError(exception);
+            return ToError(logger, "POST /v1/responses", exception);
         }
     }
 
     private static async Task<IResult> ListChatCompletions(
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         int? limit,
         string? after,
         string? before,
@@ -323,24 +370,32 @@ public static class OpenAiCompatibleEndpoints
         var data = result.Items
             .Select(OpenAiResponseFactory.ToChatCompletionResponse)
             .ToArray();
-        return Results.Json(OpenAiResponseFactory.ToList(data, result.HasMore));
+        var value = OpenAiResponseFactory.ToList(data, result.HasMore);
+        LogResponse(logger, "GET /v1/chat/completions", 200, value);
+        return Results.Json(value);
     }
 
     private static async Task<IResult> GetChatCompletion(
         string completionId,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         var completion = await store.GetChatCompletionAsync(completionId, cancellationToken);
-        return completion is not null
-            ? Results.Json(OpenAiResponseFactory.ToChatCompletionResponse(completion))
-            : ToNotFound(completionId, "chat_completion_not_found");
+        if (completion is not null)
+        {
+            var value = OpenAiResponseFactory.ToChatCompletionResponse(completion);
+            LogResponse(logger, "GET /v1/chat/completions/{id}", 200, value);
+            return Results.Json(value);
+        }
+        return ToNotFound(logger, "GET /v1/chat/completions/{id}", completionId, "chat_completion_not_found");
     }
 
     private static async Task<IResult> UpdateChatCompletion(
         string completionId,
         JsonElement body,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         try
@@ -348,39 +403,55 @@ public static class OpenAiCompatibleEndpoints
             await Task.CompletedTask.WaitAsync(cancellationToken);
             var metadata = ParseOptionalMetadata(body, required: true);
             var completion = await store.UpdateChatCompletionMetadataAsync(completionId, metadata, cancellationToken);
-            return completion is not null
-                ? Results.Json(OpenAiResponseFactory.ToChatCompletionResponse(completion))
-                : ToNotFound(completionId, "chat_completion_not_found");
+            if (completion is not null)
+            {
+                var value = OpenAiResponseFactory.ToChatCompletionResponse(completion);
+                LogResponse(logger, "POST /v1/chat/completions/{id}", 200, value);
+                return Results.Json(value);
+            }
+            return ToNotFound(logger, "POST /v1/chat/completions/{id}", completionId, "chat_completion_not_found");
         }
         catch (OpenAiProtocolException exception)
         {
-            return ToError(exception);
+            return ToError(logger, "POST /v1/chat/completions/{id}", exception);
         }
     }
 
     private static async Task<IResult> DeleteChatCompletion(
         string completionId,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
-        return await store.DeleteChatCompletionAsync(completionId, cancellationToken)
-            ? Results.Json(OpenAiResponseFactory.ToDeleted(completionId, "chat.completion.deleted"))
-            : ToNotFound(completionId, "chat_completion_not_found");
+        var deleted = await store.DeleteChatCompletionAsync(completionId, cancellationToken);
+        if (deleted)
+        {
+            var value = OpenAiResponseFactory.ToDeleted(completionId, "chat.completion.deleted");
+            LogResponse(logger, "DELETE /v1/chat/completions/{id}", 200, value);
+            return Results.Json(value);
+        }
+        return ToNotFound(logger, "DELETE /v1/chat/completions/{id}", completionId, "chat_completion_not_found");
     }
 
     private static async Task<IResult> ListChatCompletionMessages(
         string completionId,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         var completion = await store.GetChatCompletionAsync(completionId, cancellationToken);
-        return completion is not null
-            ? Results.Json(OpenAiResponseFactory.ToChatMessages(completion))
-            : ToNotFound(completionId, "chat_completion_not_found");
+        if (completion is not null)
+        {
+            var value = OpenAiResponseFactory.ToChatMessages(completion);
+            LogResponse(logger, "GET /v1/chat/completions/{id}/messages", 200, value);
+            return Results.Json(value);
+        }
+        return ToNotFound(logger, "GET /v1/chat/completions/{id}/messages", completionId, "chat_completion_not_found");
     }
 
     private static async Task<IResult> ListResponses(
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         int? limit,
         string? after,
         string? before,
@@ -390,87 +461,121 @@ public static class OpenAiCompatibleEndpoints
         var data = result.Items
             .Select(r => OpenAiResponseFactory.ToResponsesResponse(r))
             .ToArray();
-        return Results.Json(OpenAiResponseFactory.ToList(data, result.HasMore));
+        var value = OpenAiResponseFactory.ToList(data, result.HasMore);
+        LogResponse(logger, "GET /v1/responses", 200, value);
+        return Results.Json(value);
     }
 
     private static async Task<IResult> GetResponse(
         string responseId,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         var response = await store.GetResponseAsync(responseId, cancellationToken);
-        return response is not null
-            ? Results.Json(OpenAiResponseFactory.ToResponsesResponse(response))
-            : ToNotFound(responseId, "response_not_found");
+        if (response is not null)
+        {
+            var value = OpenAiResponseFactory.ToResponsesResponse(response);
+            LogResponse(logger, "GET /v1/responses/{id}", 200, value);
+            return Results.Json(value);
+        }
+        return ToNotFound(logger, "GET /v1/responses/{id}", responseId, "response_not_found");
     }
 
     private static async Task<IResult> UpdateResponse(
         string responseId,
         JsonElement body,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         try
         {
             var metadata = ParseOptionalMetadata(body, required: true);
             var response = await store.UpdateResponseMetadataAsync(responseId, metadata, cancellationToken);
-            return response is not null
-                ? Results.Json(OpenAiResponseFactory.ToResponsesResponse(response))
-                : ToNotFound(responseId, "response_not_found");
+            if (response is not null)
+            {
+                var value = OpenAiResponseFactory.ToResponsesResponse(response);
+                LogResponse(logger, "POST /v1/responses/{id}", 200, value);
+                return Results.Json(value);
+            }
+            return ToNotFound(logger, "POST /v1/responses/{id}", responseId, "response_not_found");
         }
         catch (OpenAiProtocolException exception)
         {
-            return ToError(exception);
+            return ToError(logger, "POST /v1/responses/{id}", exception);
         }
     }
 
     private static async Task<IResult> DeleteResponse(
         string responseId,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
-        return await store.DeleteResponseAsync(responseId, cancellationToken)
-            ? Results.Json(OpenAiResponseFactory.ToDeleted(responseId, "response.deleted"))
-            : ToNotFound(responseId, "response_not_found");
+        var deleted = await store.DeleteResponseAsync(responseId, cancellationToken);
+        if (deleted)
+        {
+            var value = OpenAiResponseFactory.ToDeleted(responseId, "response.deleted");
+            LogResponse(logger, "DELETE /v1/responses/{id}", 200, value);
+            return Results.Json(value);
+        }
+        return ToNotFound(logger, "DELETE /v1/responses/{id}", responseId, "response_not_found");
     }
 
     private static async Task<IResult> CancelResponse(
         string responseId,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         var response = await store.CancelResponseAsync(responseId, cancellationToken);
-        return response is not null
-            ? Results.Json(OpenAiResponseFactory.ToResponsesResponse(response))
-            : ToNotFound(responseId, "response_not_found");
+        if (response is not null)
+        {
+            var value = OpenAiResponseFactory.ToResponsesResponse(response);
+            LogResponse(logger, "POST /v1/responses/{id}/cancel", 200, value);
+            return Results.Json(value);
+        }
+        return ToNotFound(logger, "POST /v1/responses/{id}/cancel", responseId, "response_not_found");
     }
 
     private static async Task<IResult> ListResponseInputItems(
         string responseId,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         var response = await store.GetResponseAsync(responseId, cancellationToken);
-        return response is not null
-            ? Results.Json(OpenAiResponseFactory.ToResponsesInputItems(response))
-            : ToNotFound(responseId, "response_not_found");
+        if (response is not null)
+        {
+            var value = OpenAiResponseFactory.ToResponsesInputItems(response);
+            LogResponse(logger, "GET /v1/responses/{id}/input_items", 200, value);
+            return Results.Json(value);
+        }
+        return ToNotFound(logger, "GET /v1/responses/{id}/input_items", responseId, "response_not_found");
     }
 
     private static async Task<IResult> CountStoredResponseTokens(
         string responseId,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         var response = await store.GetResponseAsync(responseId, cancellationToken);
-        return response is not null
-            ? Results.Json(OpenAiResponseFactory.ToTokenCount(response))
-            : ToNotFound(responseId, "response_not_found");
+        if (response is not null)
+        {
+            var value = OpenAiResponseFactory.ToTokenCount(response);
+            LogResponse(logger, "POST /v1/responses/{id}/count_tokens", 200, value);
+            return Results.Json(value);
+        }
+        return ToNotFound(logger, "POST /v1/responses/{id}/count_tokens", responseId, "response_not_found");
     }
 
     private static async Task<IResult> CountResponseInputTokensAsync(
         ResponsesRequest request,
         OpenAiRequestMapper mapper,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         try
@@ -478,22 +583,25 @@ public static class OpenAiCompatibleEndpoints
             var inferenceRequest = await mapper.FromResponsesAsync(request, cancellationToken);
             inferenceRequest = await ApplyPreviousResponseAsync(inferenceRequest, store, cancellationToken);
             var inputTokens = OpenAiStoreHelpers.EstimateInputTokens(inferenceRequest.Messages);
-            return Results.Json(new
+            var value = new
             {
                 @object = "response.input_tokens",
                 input_tokens = inputTokens,
                 model = string.IsNullOrWhiteSpace(inferenceRequest.RequestedModel) ? null : inferenceRequest.RequestedModel
-            });
+            };
+            LogResponse(logger, "POST /v1/responses/input_tokens", 200, value);
+            return Results.Json(value);
         }
         catch (OpenAiProtocolException exception)
         {
-            return ToError(exception);
+            return ToError(logger, "POST /v1/responses/input_tokens", exception);
         }
     }
 
     private static async Task<IResult> CompactResponseAsync(
         JsonElement body,
         IOpenAiStore store,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         try
@@ -502,16 +610,17 @@ public static class OpenAiCompatibleEndpoints
             var responseId = TryGetString(body, "response_id") ?? TryGetString(body, "id");
             if (string.IsNullOrWhiteSpace(responseId))
             {
-                return ToError(new OpenAiProtocolException(
+                var err = new OpenAiProtocolException(
                     StatusCodes.Status400BadRequest,
                     "`response_id` is required.",
-                    param: "response_id"));
+                    param: "response_id");
+                return ToError(logger, "POST /v1/responses/compact", err);
             }
 
             var response = await store.GetResponseAsync(responseId, cancellationToken);
             if (response is null)
             {
-                return ToNotFound(responseId, "response_not_found");
+                return ToNotFound(logger, "POST /v1/responses/compact", responseId, "response_not_found");
             }
 
             var compacted = OpenAiStoreHelpers.CreateCompactedResponse(
@@ -521,11 +630,13 @@ public static class OpenAiCompatibleEndpoints
                 TryGetString(body, "instructions"));
             await store.AddResponseAsync(compacted, cancellationToken);
 
-            return Results.Json(OpenAiResponseFactory.ToResponsesResponse(compacted));
+            var value = OpenAiResponseFactory.ToResponsesResponse(compacted);
+            LogResponse(logger, "POST /v1/responses/compact", 200, value);
+            return Results.Json(value);
         }
         catch (OpenAiProtocolException exception)
         {
-            return ToError(exception);
+            return ToError(logger, "POST /v1/responses/compact", exception);
         }
     }
 
@@ -570,21 +681,28 @@ public static class OpenAiCompatibleEndpoints
         return request.WithMessages(messages, warnings);
     }
 
-    private static IResult ToError(OpenAiProtocolException exception)
+    private static IResult ToError(ILogger logger, string endpoint, OpenAiProtocolException exception)
     {
-        return Results.Json(
-            new OpenAiErrorEnvelope
+        var envelope = new OpenAiErrorEnvelope
+        {
+            Error = new OpenAiError
             {
-                Error = new OpenAiError
-                {
-                    Message = exception.Message,
-                    Type = exception.Type,
-                    Code = exception.Code,
-                    Param = exception.Param
-                }
-            },
-            OpenAiJson.CreateOptions(),
-            statusCode: exception.StatusCode);
+                Message = exception.Message,
+                Type = exception.Type,
+                Code = exception.Code,
+                Param = exception.Param
+            }
+        };
+        LogResponse(logger, endpoint, exception.StatusCode, envelope);
+        return Results.Json(envelope, OpenAiJson.CreateOptions(), statusCode: exception.StatusCode);
+    }
+
+    private static IResult ToNotFound(ILogger logger, string endpoint, string id, string code)
+    {
+        return ToError(logger, endpoint, new OpenAiProtocolException(
+            StatusCodes.Status404NotFound,
+            $"Object `{id}` was not found in the local in-memory store.",
+            code: code));
     }
 
     private static long UnixNow() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -597,14 +715,6 @@ public static class OpenAiCompatibleEndpoints
     private static string ToSse(object payload)
     {
         return "data: " + JsonSerializer.Serialize(payload, OpenAiJson.CreateOptions()) + "\n\n";
-    }
-
-    private static IResult ToNotFound(string id, string code)
-    {
-        return ToError(new OpenAiProtocolException(
-            StatusCodes.Status404NotFound,
-            $"Object `{id}` was not found in the local in-memory store.",
-            code: code));
     }
 
     private static IReadOnlyDictionary<string, string>? ParseOptionalMetadata(JsonElement body, bool required)
@@ -637,30 +747,35 @@ public static class OpenAiCompatibleEndpoints
 
     private static IResult GetQueueStatus(
         string entryId,
-        ModelQueueManager queueManager)
+        ModelQueueManager queueManager,
+        ILogger<OpenAiEndpointLogger> logger)
     {
         foreach (var kvp in queueManager.GetAll())
         {
             var entry = kvp.Value.GetEntry(entryId);
             if (entry is not null)
             {
-                return Results.Json(new
+                var value = new
                 {
                     id = entry.Id,
                     model_id = entry.ModelId,
                     position = entry.Position,
                     status = entry.Status,
                     created_at = entry.CreatedAt
-                });
+                };
+                LogResponse(logger, "GET /v1/queue/{id}", 200, value);
+                return Results.Json(value);
             }
         }
 
-        return Results.NotFound(new { error = "queue_entry_not_found", message = $"Queue entry `{entryId}` not found." });
+        var notFound = new { error = "queue_entry_not_found", message = $"Queue entry `{entryId}` not found." };
+        LogResponse(logger, "GET /v1/queue/{id}", 404, notFound);
+        return Results.NotFound(notFound);
     }
 
-    private static IResult HandleHealth(LLamaInferenceService inference)
+    private static IResult HandleHealth(LLamaInferenceService inference, ILogger<OpenAiEndpointLogger> logger)
     {
-        return Results.Json(new
+        var value = new
         {
             status = inference.IsLoaded ? "healthy" : "loading",
             models_loaded = inference.IsLoaded,
@@ -670,30 +785,39 @@ public static class OpenAiCompatibleEndpoints
                 loaded = m.Loaded
             }).ToArray(),
             uptime = (DateTime.UtcNow - _startTime).TotalSeconds
-        });
+        };
+        LogResponse(logger, "GET /v1/health", 200, value);
+        return Results.Json(value);
     }
 
     private static async Task<IResult> HandleModelLoad(
         string modelId,
         LLamaInferenceService inference,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         await inference.LoadModelAsync(modelId, cancellationToken);
-        return Results.Json(new { status = "loaded", model_id = modelId });
+        var value = new { status = "loaded", model_id = modelId };
+        LogResponse(logger, "POST /v1/models/{id}/load", 200, value);
+        return Results.Json(value);
     }
 
     private static async Task<IResult> HandleModelUnload(
         string modelId,
         LLamaInferenceService inference,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         await inference.UnloadModelAsync(modelId, cancellationToken);
-        return Results.Json(new { status = "unloaded", model_id = modelId });
+        var value = new { status = "unloaded", model_id = modelId };
+        LogResponse(logger, "POST /v1/models/{id}/unload", 200, value);
+        return Results.Json(value);
     }
 
     private static async Task<IResult> HandleTokenize(
         TokenizeRequest request,
         LLamaInferenceService inference,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(request.Input))
@@ -702,18 +826,21 @@ public static class OpenAiCompatibleEndpoints
         }
 
         var tokens = await inference.TokenizeAsync(request.Input, request.Model, cancellationToken);
-        return Results.Json(new
+        var value = new
         {
             @object = "list",
             data = tokens.Select((t, i) => new { token = t, index = i }).ToArray(),
             model = request.Model ?? inference.DefaultModelId,
             usage = new { total_tokens = tokens.Count }
-        });
+        };
+        LogResponse(logger, "POST /v1/tokenize", 200, value);
+        return Results.Json(value);
     }
 
     private static async Task<IResult> HandleDetokenize(
         DetokenizeRequest request,
         LLamaInferenceService inference,
+        ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
         if (request.Tokens is null || request.Tokens.Count == 0)
@@ -722,12 +849,14 @@ public static class OpenAiCompatibleEndpoints
         }
 
         var text = await inference.DetokenizeAsync(request.Tokens, request.Model, cancellationToken);
-        return Results.Json(new
+        var value = new
         {
             @object = "text",
             text,
             model = request.Model ?? inference.DefaultModelId
-        });
+        };
+        LogResponse(logger, "POST /v1/detokenize", 200, value);
+        return Results.Json(value);
     }
 
     private static string? TryGetString(JsonElement body, string propertyName)
