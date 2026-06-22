@@ -1,5 +1,7 @@
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Unicode;
 using Microsoft.Extensions.Logging;
 using Zhengyan.LLamaStack.Api.Inference;
 using Zhengyan.LLamaStack.Api.Infrastructure;
@@ -96,10 +98,42 @@ public static class OpenAiCompatibleEndpoints
         return app;
     }
 
+    private static readonly JsonSerializerOptions _logJsonOptions = new(OpenAiJson.CreateOptions())
+    {
+        Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
+    };
+
+    private static void LogRequest<T>(ILogger logger, string endpoint, T request)
+    {
+        var json = JsonSerializer.Serialize(request, _logJsonOptions);
+        logger.LogDebug("[{Endpoint}] Request: {Json}", endpoint, json);
+    }
+
+    private static void LogSseEvent(ILogger logger, string endpoint, string evt)
+    {
+        var trimmed = evt.AsSpan().TrimEnd();
+        const string prefix = "data: ";
+        if (trimmed.StartsWith(prefix))
+        {
+            var json = trimmed.Slice(prefix.Length);
+            try
+            {
+                var parsed = JsonSerializer.Deserialize<JsonElement>(json, _logJsonOptions);
+                var reSerialized = JsonSerializer.Serialize(parsed, _logJsonOptions);
+                logger.LogDebug("[{Endpoint}] SSE: data: {Json}", endpoint, reSerialized);
+                return;
+            }
+            catch
+            {
+            }
+        }
+        logger.LogDebug("[{Endpoint}] SSE: {Event}", endpoint, trimmed.ToString());
+    }
+
     private static void LogResponse<T>(ILogger logger, string endpoint, int statusCode, T value)
     {
-        logger.LogDebug("[{Endpoint}] {StatusCode} {Json}",
-            endpoint, statusCode, JsonSerializer.Serialize(value, OpenAiJson.CreateOptions()));
+        var json = JsonSerializer.Serialize(value, _logJsonOptions);
+        logger.LogDebug("[{Endpoint}] {StatusCode} {Json}", endpoint, statusCode, json);
     }
 
     private static void LogResponse(ILogger logger, string endpoint, int statusCode, string body)
@@ -113,6 +147,7 @@ public static class OpenAiCompatibleEndpoints
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
+        LogRequest(logger, "POST /v1/embeddings", request);
         try
         {
             if (request.Input is null || request.Input.Value.ValueKind == JsonValueKind.Null)
@@ -196,6 +231,7 @@ public static class OpenAiCompatibleEndpoints
         CancellationToken cancellationToken)
     {
         var logger = httpContext.RequestServices.GetRequiredService<ILogger<OpenAiEndpointLogger>>();
+        LogRequest(logger, "POST /v1/chat/completions", request);
         try
         {
             var inferenceRequest = await mapper.FromChatAsync(request, cancellationToken);
@@ -226,6 +262,7 @@ public static class OpenAiCompatibleEndpoints
             var outputText = new StringBuilder();
             await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, cancellationToken))
             {
+                LogSseEvent(logger, "POST /v1/chat/completions", evt);
                 await httpContext.Response.WriteAsync(evt, cancellationToken);
                 await httpContext.Response.Body.FlushAsync(cancellationToken);
                 outputText.Append(evt);
@@ -234,11 +271,15 @@ public static class OpenAiCompatibleEndpoints
             if (request.StreamOptions?.IncludeUsage == true)
             {
                 var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
-                await httpContext.Response.WriteAsync(ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens, outputTokens)), cancellationToken);
+                var usageChunk = ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens, outputTokens));
+                LogSseEvent(logger, "POST /v1/chat/completions", usageChunk);
+                await httpContext.Response.WriteAsync(usageChunk, cancellationToken);
                 await httpContext.Response.Body.FlushAsync(cancellationToken);
             }
 
-            await httpContext.Response.WriteAsync("data: [DONE]\n\n", cancellationToken);
+            var doneEvent = "data: [DONE]\n\n";
+            logger.LogDebug("[POST /v1/chat/completions] SSE: {Event}", doneEvent.TrimEnd());
+            await httpContext.Response.WriteAsync(doneEvent, cancellationToken);
             await httpContext.Response.Body.FlushAsync(cancellationToken);
 
             logger.LogDebug("[POST /v1/chat/completions] Streaming finished for {ResponseId}", responseId);
@@ -277,6 +318,7 @@ public static class OpenAiCompatibleEndpoints
         CancellationToken cancellationToken)
     {
         var logger = httpContext.RequestServices.GetRequiredService<ILogger<OpenAiEndpointLogger>>();
+        LogRequest(logger, "POST /v1/responses", request);
         try
         {
             var inferenceRequest = await mapper.FromResponsesAsync(request, cancellationToken);
@@ -307,6 +349,7 @@ public static class OpenAiCompatibleEndpoints
                     var outputText = new StringBuilder();
                     await foreach (var evt in inference.StreamResponsesEventsAsync(inferenceRequest, responseId, cancellationToken))
                     {
+                        LogSseEvent(logger, "POST /v1/responses", evt);
                         await httpContext.Response.WriteAsync(evt, cancellationToken);
                         await httpContext.Response.Body.FlushAsync(cancellationToken);
                         outputText.Append(evt);
@@ -315,7 +358,7 @@ public static class OpenAiCompatibleEndpoints
                     if (request.StreamOptions?.IncludeUsage == true)
                     {
                         var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
-                        await httpContext.Response.WriteAsync(ToSse(new
+                        var usageChunk = ToSse(new
                         {
                             type = "response.usage.delta",
                             response_id = responseId,
@@ -325,11 +368,15 @@ public static class OpenAiCompatibleEndpoints
                                 output_tokens = outputTokens,
                                 total_tokens = promptUsage.PromptTokens + outputTokens
                             }
-                        }), cancellationToken);
+                        });
+                        LogSseEvent(logger, "POST /v1/responses", usageChunk);
+                        await httpContext.Response.WriteAsync(usageChunk, cancellationToken);
                         await httpContext.Response.Body.FlushAsync(cancellationToken);
                     }
 
-                    await httpContext.Response.WriteAsync("data: [DONE]\n\n", cancellationToken);
+                    var doneEvent = "data: [DONE]\n\n";
+                    logger.LogDebug("[POST /v1/responses] SSE: {Event}", doneEvent.TrimEnd());
+                    await httpContext.Response.WriteAsync(doneEvent, cancellationToken);
                     await httpContext.Response.Body.FlushAsync(cancellationToken);
 
                     logger.LogDebug("[POST /v1/responses] Streaming finished for {ResponseId}", responseId);
@@ -398,6 +445,7 @@ public static class OpenAiCompatibleEndpoints
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
+        logger.LogDebug("[POST /v1/chat/completions/{{id}}] Request: id={CompletionId}", completionId);
         try
         {
             await Task.CompletedTask.WaitAsync(cancellationToken);
@@ -489,6 +537,7 @@ public static class OpenAiCompatibleEndpoints
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
+        logger.LogDebug("[POST /v1/responses/{{id}}] Request: id={ResponseId}", responseId);
         try
         {
             var metadata = ParseOptionalMetadata(body, required: true);
@@ -578,6 +627,7 @@ public static class OpenAiCompatibleEndpoints
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
+        LogRequest(logger, "POST /v1/responses/input_tokens", request);
         try
         {
             var inferenceRequest = await mapper.FromResponsesAsync(request, cancellationToken);
@@ -604,6 +654,8 @@ public static class OpenAiCompatibleEndpoints
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
+        var rawBody = body.ValueKind == JsonValueKind.Object ? JsonSerializer.Serialize(body, _logJsonOptions) : body.ToString();
+        logger.LogDebug("[POST /v1/responses/compact] Request: {Json}", rawBody);
         try
         {
             await Task.CompletedTask.WaitAsync(cancellationToken);
@@ -820,6 +872,7 @@ public static class OpenAiCompatibleEndpoints
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
+        LogRequest(logger, "POST /v1/tokenize", request);
         if (string.IsNullOrWhiteSpace(request.Input))
         {
             throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "`input` is required.", param: "input");
@@ -843,6 +896,7 @@ public static class OpenAiCompatibleEndpoints
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
+        LogRequest(logger, "POST /v1/detokenize", request);
         if (request.Tokens is null || request.Tokens.Count == 0)
         {
             throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "`tokens` is required.", param: "tokens");
