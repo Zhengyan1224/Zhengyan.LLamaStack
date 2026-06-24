@@ -52,6 +52,8 @@ public sealed class LLamaStackOptions
 
     public LLamaModelCapabilitiesOptions? Capabilities { get; set; }
 
+    public int? MaxConcurrency { get; set; }
+
     public LLamaStoreOptions Store { get; set; } = new();
 
     public List<LLamaModelOptions> Models { get; set; } = [];
@@ -140,7 +142,8 @@ public sealed class LLamaStackOptions
             DefaultTopP = model.DefaultTopP ?? DefaultTopP,
             DefaultTopK = model.DefaultTopK ?? DefaultTopK,
             AntiPrompts = model.AntiPrompts ?? AntiPrompts,
-            Capabilities = capabilities
+            Capabilities = capabilities,
+            MaxConcurrency = Math.Max(1, model.MaxConcurrency ?? MaxConcurrency ?? 1)
         };
     }
 
@@ -215,6 +218,8 @@ public sealed class LLamaModelOptions
     public IReadOnlyList<string>? AntiPrompts { get; set; }
 
     public LLamaModelCapabilitiesOptions? Capabilities { get; set; }
+
+    public int? MaxConcurrency { get; set; }
 }
 
 public sealed class LLamaModelCapabilitiesOptions
@@ -304,6 +309,8 @@ public sealed class LLamaModelRuntimeOptions
     public IReadOnlyList<string> AntiPrompts { get; init; } = ["<|im_end|>", "</s>"];
 
     public LLamaModelCapabilities Capabilities { get; init; } = new();
+
+    public int MaxConcurrency { get; init; } = 1;
 }
 
 public sealed class LLamaAuthOptions

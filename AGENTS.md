@@ -25,7 +25,7 @@ dotnet publish src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj -c Rel
 - **JSON**: `SnakeCaseLower` naming, `WhenWritingNull` ignore, no indentation. Set globally in `Program.cs` via `ConfigureJson`.
 - **Storage**: `IOpenAiStore` interface. Default is `OpenAiMemoryStore` (in-process, lost on restart). Can switch to `OpenAiSqliteStore` by setting `LLamaStack:Store:Provider` to `"Sqlite"`.
 - **Models**: Registered via `LLamaStack:Models[]` array. Legacy single-model config (`ModelId`/`ModelPath`) auto-registers a fallback entry. Both paths merge in `GetModelRegistrations()`.
-- **Inference**: Each model uses one `LLamaContext` / `InteractiveExecutor`. Per-model `SemaphoreSlim` serializes inference (no concurrent requests per model).
+- **Inference**: Each model pools `N` `LLamaContext` / `InteractiveExecutor` instances where `N = MaxConcurrency` (default 1). `LLamaWeights` is shared. `AcquireLoadedModelAsync` takes an instance from the pool; `ReleaseLoadedModel` returns it. `LoadModelInstancesAsync` runs once under `LoadLock`; concurrent requests wait on a per-model `SemaphoreSlim(N)`.
 - **Model loading**: Lazy by default (`LoadModelOnStartup: false`). Loaded on first request via `EnsureLoadedAsync`.
 - **Endpoint prefix**: `/v1/` on all OpenAI-compatible routes. Non-prefixed `/chat/completions` and `/responses` also mapped.
 - **Infrastructure**: Global exception handler (`OpenAiExceptionHandler`) returns OpenAI-format errors for unhandled exceptions. CORS and API key auth (`LLamaStack:Auth`) are configurable.

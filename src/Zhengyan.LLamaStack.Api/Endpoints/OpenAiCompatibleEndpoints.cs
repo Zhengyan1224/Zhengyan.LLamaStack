@@ -239,7 +239,8 @@ public static class OpenAiCompatibleEndpoints
             var responseId = "chatcmpl_" + Guid.NewGuid().ToString("N");
 
             var modelId = inferenceRequest.RequestedModel ?? inference.DefaultModelId;
-            var queue = queueManager.GetOrCreate(modelId);
+            var maxConcurrency = inference.GetModelMaxConcurrency(modelId);
+            var queue = queueManager.GetOrCreate(modelId, maxConcurrency);
             var queueEntry = queue.Enqueue(modelId);
             httpContext.Response.Headers["X-Queue-Position"] = queueEntry.Position.ToString();
             httpContext.Response.Headers["X-Queue-Entry-Id"] = queueEntry.Id;
@@ -257,32 +258,32 @@ public static class OpenAiCompatibleEndpoints
                     httpContext.Response.Headers.Connection = "keep-alive";
                     httpContext.Response.ContentType = "text/event-stream; charset=utf-8";
 
-        logger.LogDebug("[POST /v1/chat/completions] Streaming started for {ResponseId}", responseId);
+                    logger.LogDebug("[POST /v1/chat/completions] Streaming started for {ResponseId}", responseId);
 
-            var outputText = new StringBuilder();
-            await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, cancellationToken))
-            {
-                LogSseEvent(logger, "POST /v1/chat/completions", evt);
-                await httpContext.Response.WriteAsync(evt, cancellationToken);
-                await httpContext.Response.Body.FlushAsync(cancellationToken);
-                outputText.Append(evt);
-            }
+                    var outputText = new StringBuilder();
+                    await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, cancellationToken))
+                    {
+                        LogSseEvent(logger, "POST /v1/chat/completions", evt);
+                        await httpContext.Response.WriteAsync(evt, cancellationToken);
+                        await httpContext.Response.Body.FlushAsync(cancellationToken);
+                        outputText.Append(evt);
+                    }
 
-            if (request.StreamOptions?.IncludeUsage == true)
-            {
-                var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
-                var usageChunk = ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens, outputTokens));
-                LogSseEvent(logger, "POST /v1/chat/completions", usageChunk);
-                await httpContext.Response.WriteAsync(usageChunk, cancellationToken);
-                await httpContext.Response.Body.FlushAsync(cancellationToken);
-            }
+                    if (request.StreamOptions?.IncludeUsage == true)
+                    {
+                        var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
+                        var usageChunk = ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens, outputTokens));
+                        LogSseEvent(logger, "POST /v1/chat/completions", usageChunk);
+                        await httpContext.Response.WriteAsync(usageChunk, cancellationToken);
+                        await httpContext.Response.Body.FlushAsync(cancellationToken);
+                    }
 
-            var doneEvent = "data: [DONE]\n\n";
-            logger.LogDebug("[POST /v1/chat/completions] SSE: {Event}", doneEvent.TrimEnd());
-            await httpContext.Response.WriteAsync(doneEvent, cancellationToken);
-            await httpContext.Response.Body.FlushAsync(cancellationToken);
+                    var doneEvent = "data: [DONE]\n\n";
+                    logger.LogDebug("[POST /v1/chat/completions] SSE: {Event}", doneEvent.TrimEnd());
+                    await httpContext.Response.WriteAsync(doneEvent, cancellationToken);
+                    await httpContext.Response.Body.FlushAsync(cancellationToken);
 
-            logger.LogDebug("[POST /v1/chat/completions] Streaming finished for {ResponseId}", responseId);
+                    logger.LogDebug("[POST /v1/chat/completions] Streaming finished for {ResponseId}", responseId);
                     return Results.Empty;
                 }
 
@@ -327,10 +328,12 @@ public static class OpenAiCompatibleEndpoints
             var responseId = "resp_" + Guid.NewGuid().ToString("N");
 
             var modelId = inferenceRequest.RequestedModel ?? inference.DefaultModelId;
-            var queue = queueManager.GetOrCreate(modelId);
+            var maxConcurrency = inference.GetModelMaxConcurrency(modelId);
+            var queue = queueManager.GetOrCreate(modelId, maxConcurrency);
             var queueEntry = queue.Enqueue(modelId);
             httpContext.Response.Headers["X-Queue-Position"] = queueEntry.Position.ToString();
             httpContext.Response.Headers["X-Queue-Entry-Id"] = queueEntry.Id;
+
             try
             {
                 await queueEntry.TurnTcs.Task.WaitAsync(cancellationToken);

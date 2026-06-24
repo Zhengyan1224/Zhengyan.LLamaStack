@@ -61,6 +61,7 @@ The current version focuses on `chat/completions`, `responses`, SSE streaming, m
 - Parses `tools` and legacy `functions`.
 - Converts model-emitted tool-call JSON into OpenAI-compatible `tool_calls` / `function_call` response fields.
 - Supports optional `mmproj` / MTMD multimodal projection models.
+- Per-model configurable concurrency (`MaxConcurrency`), shared weights, isolated context/executor instances.
 
 ## Project Structure
 
@@ -252,6 +253,7 @@ The configuration section is `LLamaStack`. The recommended configuration style i
 | `Models[].ModelPath` | GGUF file path for that model. |
 | `Models[].MmprojPath` | mmproj file path for that model. |
 | `Models[].Capabilities` | Model capability declaration used by `/v1/models` and request preflight validation. |
+| `MaxConcurrency` | Number of concurrent inference instances per model (default `1`). LLamaWeights are shared; LLamaContext/InteractiveExecutor are isolated. |
 
 Inference settings omitted from `Models[]` inherit from the top-level defaults.
 
@@ -685,7 +687,7 @@ Then configure:
 | Legacy Assistants API | assistants, threads, runs, and run steps are not implemented. | Implement only if compatibility demand is strong; prioritize Responses API first. |
 | Authentication and rate limits | Bearer key validation, organization/project handling, and rate limits are not implemented. | Add API key configuration, request auditing, rate limiting middleware, and tenant metadata. |
 | Model management | Multi-model registration, default model, `model` routing, and capability declarations are implemented; runtime hot load/unload is not implemented yet. | Add model hot load/unload, runtime configuration refresh, model health checks, and automatic capability detection. |
-| Concurrent inference | Each loaded model currently uses one context and serializes inference. | Add a context pool, queueing, cancellation, timeouts, concurrency limits, and memory protection. |
+| Concurrent inference | Implemented per-model configurable concurrency (`MaxConcurrency`), shared LLamaWeights, pooled LLamaContext/InteractiveExecutor. | Future work: dynamic pool sizing, queueing, cancellation, and memory protection. |
 | Observability | Metrics, tracing, and structured audit logs are missing. | Add OpenTelemetry, Prometheus metrics, request IDs, token/s, and latency metrics. |
 | SDK compatibility tests | No automated OpenAI SDK compatibility matrix exists yet. | Build end-to-end tests with official OpenAI .NET, Python, and JavaScript SDKs. |
 

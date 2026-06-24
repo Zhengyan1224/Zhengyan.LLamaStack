@@ -61,6 +61,7 @@
 - 支持 `tools` 和 legacy `functions` 请求字段解析。
 - 支持将模型输出的工具调用 JSON 转换为 OpenAI 兼容 `tool_calls` / `function_call` 响应字段。
 - 支持可选 `mmproj` / MTMD 多模态投影模型。
+- 每模型支持可配并发数（`MaxConcurrency`），共享权重，独立上下文/执行器实例。
 
 ## 项目结构
 
@@ -252,6 +253,7 @@ Invoke-RestMethod http://localhost:5062/health
 | `Models[].ModelPath` | 该模型的 GGUF 文件路径。 |
 | `Models[].MmprojPath` | 该模型的 mmproj 文件路径。 |
 | `Models[].Capabilities` | 模型能力声明，用于 `/v1/models` 返回和请求前置校验。 |
+| `MaxConcurrency` | 每个模型的并发推理实例数（默认 `1`）。LLamaWeights 共享，LLamaContext/InteractiveExecutor 隔离。 |
 
 `Models[]` 中未设置的推理参数会继承顶层默认配置。
 
@@ -685,7 +687,7 @@ dotnet add src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LL
 | Assistants legacy API | assistants、threads、runs、run steps 等 legacy 接口未实现。 | 视兼容需求决定是否实现；优先级低于 Responses API。 |
 | 认证和限流 | 未实现 OpenAI 风格 Bearer key 校验、组织/project、rate limit。 | 增加 API key 配置、请求审计、限流、中间件和多租户字段。 |
 | 模型管理 | 已支持多模型注册、默认模型、按 `model` 路由和能力声明；尚不支持运行时热加载/卸载。 | 增加模型热加载/卸载、运行时配置刷新、模型健康检查和能力自动探测。 |
-| 并发推理 | 当前每个已加载模型使用单上下文串行推理。 | 增加 context pool、队列、取消、超时、并发限制和显存/内存保护。 |
+| 并发推理 | 已实现每模型可配并发数（`MaxConcurrency`），共享 LLamaWeights，池化 LLamaContext/InteractiveExecutor。 | 后续增加动态池大小、排队、取消和显存保护。 |
 | 可观测性 | 缺少 metrics、trace、结构化审计日志。 | 增加 OpenTelemetry、Prometheus metrics、请求 ID、token/s 延迟指标。 |
 | SDK 兼容测试 | 尚未建立 OpenAI SDK 自动化兼容测试矩阵。 | 使用官方 OpenAI .NET/Python/JS SDK 构建端到端兼容测试。 |
 

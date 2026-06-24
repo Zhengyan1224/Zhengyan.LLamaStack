@@ -54,14 +54,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         foreach (var model in _models.Values.Where(x => x.Options.LoadModelOnStartup))
         {
-            await EnsureLoadedAsync(model, cancellationToken);
+            await EnsureModelLoadedAsync(model, cancellationToken);
         }
     }
 
     public async Task LoadModelAsync(string modelId, CancellationToken cancellationToken)
     {
         var model = ResolveRuntime(modelId);
-        await EnsureLoadedAsync(model, cancellationToken);
+        await EnsureModelLoadedAsync(model, cancellationToken);
     }
 
     public Task UnloadModelAsync(string modelId, CancellationToken cancellationToken)
@@ -73,21 +73,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private static async Task UnloadModelInternalAsync(ModelRuntime model)
     {
-        await model.LoadLock.WaitAsync();
-        try
-        {
-            if (model.Loaded is null)
-            {
-                return;
-            }
-
-            model.Loaded.Dispose();
-            model.Loaded = null;
-        }
-        finally
-        {
-            model.LoadLock.Release();
-        }
+        await model.UnloadAsync();
     }
 
     public void ValidateRequest(InferenceRequest request, InferenceEndpointKind endpointKind, bool stream)
@@ -276,34 +262,41 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     private async Task<InferenceCompletion> SingleCompleteAsync(InferenceRequest request, CancellationToken cancellationToken)
     {
         var model = ResolveRuntime(request.RequestedModel);
-        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
+        try
+        {
         request = ApplyTruncation(request, loaded, model);
         var createdText = new StringBuilder();
-        await foreach (var token in StreamTextAsync(request, cancellationToken))
-        {
-            createdText.Append(token);
-        }
+            await foreach (var token in StreamTextAsync(request, loaded, model, cancellationToken))
+            {
+                createdText.Append(token);
+            }
 
-        var text = createdText.ToString();
-        var toolCalls = TryExtractToolCalls(text, request.Tools, out var cleanText);
-        var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out _, out _);
-        var completionTokens = CountTokens(loaded, cleanText);
-        var finishReason = DetermineFinishReason(toolCalls.Count > 0, completionTokens, request.MaxTokens, model.Options.DefaultMaxTokens);
-        return new InferenceCompletion
+            var text = createdText.ToString();
+            var toolCalls = TryExtractToolCalls(text, request.Tools, out var cleanText);
+            var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out _, out _);
+            var completionTokens = CountTokens(loaded, cleanText);
+            var finishReason = DetermineFinishReason(toolCalls.Count > 0, completionTokens, request.MaxTokens, model.Options.DefaultMaxTokens);
+            return new InferenceCompletion
+            {
+                Id = CreateCompletionId("chatcmpl"),
+                Model = model.Options.Id,
+                Text = cleanText,
+                ToolCalls = toolCalls,
+                FinishReason = finishReason,
+                PromptTokens = CountTokens(loaded, prompt),
+                CompletionTokens = completionTokens,
+                Metadata = request.Metadata,
+                User = request.User,
+                ServiceTier = request.ServiceTier,
+                Store = request.Store,
+                CompatibilityWarnings = request.CompatibilityWarnings
+            };
+        }
+        finally
         {
-            Id = CreateCompletionId("chatcmpl"),
-            Model = model.Options.Id,
-            Text = cleanText,
-            ToolCalls = toolCalls,
-            FinishReason = finishReason,
-            PromptTokens = CountTokens(loaded, prompt),
-            CompletionTokens = completionTokens,
-            Metadata = request.Metadata,
-            User = request.User,
-            ServiceTier = request.ServiceTier,
-            Store = request.Store,
-            CompatibilityWarnings = request.CompatibilityWarnings
-        };
+            ReleaseLoadedModel(model, loaded);
+        }
     }
 
     private static string DetermineFinishReason(bool hasToolCalls, int completionTokens, int? requestMaxTokens, int defaultMaxTokens)
@@ -325,23 +318,37 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     public async Task<(string Model, int PromptTokens)> EstimatePromptUsageAsync(InferenceRequest request, CancellationToken cancellationToken)
     {
         var model = ResolveRuntime(request.RequestedModel);
-        var loaded = await EnsureLoadedAsync(model, cancellationToken);
-        var truncated = ApplyTruncation(request, loaded, model);
-        var prompt = BuildPrompt(loaded.Weights, truncated, loaded.MediaMarker, out _, out _);
-        return (model.Options.Id, CountTokens(loaded, prompt));
+        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
+        try
+        {
+            var truncated = ApplyTruncation(request, loaded, model);
+            var prompt = BuildPrompt(loaded.Weights, truncated, loaded.MediaMarker, out _, out _);
+            return (model.Options.Id, CountTokens(loaded, prompt));
+        }
+        finally
+        {
+            ReleaseLoadedModel(model, loaded);
+        }
     }
 
     public async Task<int> CountTokensAsync(string text, string? requestedModel, CancellationToken cancellationToken)
     {
         var model = ResolveRuntime(requestedModel);
-        var loaded = await EnsureLoadedAsync(model, cancellationToken);
-        return CountTokens(loaded, text);
+        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
+        try
+        {
+            return CountTokens(loaded, text);
+        }
+        finally
+        {
+            ReleaseLoadedModel(model, loaded);
+        }
     }
 
     public async Task<IReadOnlyList<int>> TokenizeAsync(string text, string? requestedModel, CancellationToken cancellationToken)
     {
         var model = ResolveRuntime(requestedModel);
-        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
         {
             return loaded.Context.Tokenize(text, addBos: false, special: true).Select(t => (int)t).ToArray();
@@ -350,12 +357,16 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         {
             return [];
         }
+        finally
+        {
+            ReleaseLoadedModel(model, loaded);
+        }
     }
 
     public async Task<string> DetokenizeAsync(IReadOnlyList<int> tokens, string? requestedModel, CancellationToken cancellationToken)
     {
         var model = ResolveRuntime(requestedModel);
-        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
         {
             var decoder = new StreamingTokenDecoder(loaded.Context);
@@ -370,6 +381,10 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         {
             return string.Empty;
         }
+        finally
+        {
+            ReleaseLoadedModel(model, loaded);
+        }
     }
 
     public async Task<EmbeddingResult> EmbeddingsAsync(
@@ -378,7 +393,9 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var model = ResolveRuntime(requestedModel);
-        var loaded = await EnsureLoadedAsync(model, cancellationToken);
+        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
+        try
+        {
 
         var embedderParams = new ModelParams(ResolvePath(model.Options.ModelPath!))
         {
@@ -423,14 +440,19 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             Data = data,
             TotalTokens = totalTokens
         };
+        }
+        finally
+        {
+            ReleaseLoadedModel(model, loaded);
+        }
     }
 
-    public async IAsyncEnumerable<string> StreamTextAsync(
+    private async IAsyncEnumerable<string> StreamTextAsync(
         InferenceRequest request,
+        LoadedModel loaded,
+        ModelRuntime model,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var model = ResolveRuntime(request.RequestedModel);
-        var loaded = await EnsureLoadedAsync(model, cancellationToken);
         request = ApplyTruncation(request, loaded, model);
         var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out var media, out var mediaCount);
         var inferenceParams = CreateInferenceParams(model.Options, request);
@@ -455,8 +477,12 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         string responseId,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        var model = ResolveRuntime(request.RequestedModel);
+        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
+        try
+        {
         var completion = new StringBuilder();
-        await foreach (var token in StreamTextAsync(request, cancellationToken))
+        await foreach (var token in StreamTextAsync(request, loaded, model, cancellationToken))
         {
             completion.Append(token);
             var chunk = new
@@ -517,6 +543,11 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 }
             }
         });
+        }
+        finally
+        {
+            ReleaseLoadedModel(model, loaded);
+        }
     }
 
     public async IAsyncEnumerable<string> StreamResponsesEventsAsync(
@@ -524,6 +555,10 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         string responseId,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        var model = ResolveRuntime(request.RequestedModel);
+        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
+        try
+        {
         yield return ToSse(new
         {
             type = "response.created",
@@ -538,7 +573,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         });
 
         var completion = new StringBuilder();
-        await foreach (var token in StreamTextAsync(request, cancellationToken))
+        await foreach (var token in StreamTextAsync(request, loaded, model, cancellationToken))
         {
             completion.Append(token);
             yield return ToSse(new
@@ -591,81 +626,121 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 model = ResolveRuntime(request.RequestedModel).Options.Id
             }
         });
+        }
+        finally
+        {
+            ReleaseLoadedModel(model, loaded);
+        }
     }
 
-    private async Task<LoadedModel> EnsureLoadedAsync(ModelRuntime model, CancellationToken cancellationToken)
+    private async Task EnsureModelLoadedAsync(ModelRuntime model, CancellationToken cancellationToken)
     {
-        if (model.Loaded is not null)
-        {
-            return model.Loaded;
-        }
+        if (model.IsLoaded)
+            return;
 
         await model.LoadLock.WaitAsync(cancellationToken);
         try
         {
-            if (model.Loaded is not null)
-            {
-                return model.Loaded;
-            }
+            if (model.IsLoaded)
+                return;
 
-            if (string.IsNullOrWhiteSpace(model.Options.ModelPath))
-            {
-                throw new OpenAiProtocolException(
-                    StatusCodes.Status503ServiceUnavailable,
-                    $"Model `{model.Options.Id}` is not configured with a GGUF file path. Set LLamaStack:Models[].ModelPath or LLamaStack:ModelPath before serving inference.",
-                    type: "server_error",
-                    code: "model_path_not_configured");
-            }
-
-            var modelPath = ResolvePath(model.Options.ModelPath);
-            if (!File.Exists(modelPath))
-            {
-                throw new OpenAiProtocolException(
-                    StatusCodes.Status503ServiceUnavailable,
-                    $"Configured GGUF model file was not found for `{model.Options.Id}`: {modelPath}",
-                    type: "server_error",
-                    code: "model_not_found");
-            }
-
-            var parameters = CreateModelParams(modelPath, model.Options);
-            _logger.LogInformation("Loading GGUF model {ModelId} from {ModelPath}", model.Options.Id, model.Options.ModelPath);
-            var weights = await LLamaWeights.LoadFromFileAsync(parameters, cancellationToken);
-            var context = weights.CreateContext(parameters);
-
-            MtmdWeights? mtmd = null;
-            string? mediaMarker = null;
-            if (!string.IsNullOrWhiteSpace(model.Options.MmprojPath))
-            {
-                var mmprojPath = ResolvePath(model.Options.MmprojPath);
-                if (!File.Exists(mmprojPath))
-                {
-                    throw new OpenAiProtocolException(
-                        StatusCodes.Status503ServiceUnavailable,
-                        $"Configured mmproj file was not found for `{model.Options.Id}`: {mmprojPath}",
-                        type: "server_error",
-                        code: "mmproj_not_found");
-                }
-
-                var mtmdParams = MtmdContextParams.Default();
-                mtmdParams.UseGpu = model.Options.UseGpuForMtmd;
-                mtmd = await MtmdWeights.LoadFromFileAsync(model.Options.MmprojPath, weights, mtmdParams, cancellationToken);
-                mediaMarker = mtmdParams.MediaMarker ?? NativeApi.MtmdDefaultMarker() ?? "<media>";
-                _logger.LogInformation(
-                    "Loaded MTMD projection {ModelId} from {MmprojPath}; vision={Vision}, audio={Audio}",
-                    model.Options.Id,
-                    model.Options.MmprojPath,
-                    mtmd.SupportsVision,
-                    mtmd.SupportsAudio);
-            }
-
-            var executor = mtmd is null ? new InteractiveExecutor(context) : new InteractiveExecutor(context, mtmd);
-            model.Loaded = new LoadedModel(weights, context, executor, mtmd, mediaMarker);
-            return model.Loaded;
+            await LoadModelInstancesAsync(model, cancellationToken);
         }
         finally
         {
             model.LoadLock.Release();
         }
+    }
+
+    private async Task<LoadedModel> AcquireLoadedModelAsync(ModelRuntime model, CancellationToken cancellationToken)
+    {
+        if (!model.IsLoaded)
+        {
+            await model.LoadLock.WaitAsync(cancellationToken);
+            try
+            {
+                if (!model.IsLoaded)
+                {
+                    await LoadModelInstancesAsync(model, cancellationToken);
+                }
+            }
+            finally
+            {
+                model.LoadLock.Release();
+            }
+        }
+
+        return await model.AcquireAsync(cancellationToken);
+    }
+
+    private static void ReleaseLoadedModel(ModelRuntime model, LoadedModel loaded)
+    {
+        model.Release(loaded);
+    }
+
+    private async Task LoadModelInstancesAsync(ModelRuntime model, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(model.Options.ModelPath))
+        {
+            throw new OpenAiProtocolException(
+                StatusCodes.Status503ServiceUnavailable,
+                $"Model `{model.Options.Id}` is not configured with a GGUF file path. Set LLamaStack:Models[].ModelPath or LLamaStack:ModelPath before serving inference.",
+                type: "server_error",
+                code: "model_path_not_configured");
+        }
+
+        var modelPath = ResolvePath(model.Options.ModelPath);
+        if (!File.Exists(modelPath))
+        {
+            throw new OpenAiProtocolException(
+                StatusCodes.Status503ServiceUnavailable,
+                $"Configured GGUF model file was not found for `{model.Options.Id}`: {modelPath}",
+                type: "server_error",
+                code: "model_not_found");
+        }
+
+        var parameters = CreateModelParams(modelPath, model.Options);
+        _logger.LogInformation("Loading GGUF model {ModelId} from {ModelPath}", model.Options.Id, model.Options.ModelPath);
+        var weights = await LLamaWeights.LoadFromFileAsync(parameters, cancellationToken);
+
+        MtmdWeights? mtmd = null;
+        string? mediaMarker = null;
+        if (!string.IsNullOrWhiteSpace(model.Options.MmprojPath))
+        {
+            var mmprojPath = ResolvePath(model.Options.MmprojPath);
+            if (!File.Exists(mmprojPath))
+            {
+                throw new OpenAiProtocolException(
+                    StatusCodes.Status503ServiceUnavailable,
+                    $"Configured mmproj file was not found for `{model.Options.Id}`: {mmprojPath}",
+                    type: "server_error",
+                    code: "mmproj_not_found");
+            }
+
+            var mtmdParams = MtmdContextParams.Default();
+            mtmdParams.UseGpu = model.Options.UseGpuForMtmd;
+            mtmd = await MtmdWeights.LoadFromFileAsync(model.Options.MmprojPath, weights, mtmdParams, cancellationToken);
+            mediaMarker = mtmdParams.MediaMarker ?? NativeApi.MtmdDefaultMarker() ?? "<media>";
+            _logger.LogInformation(
+                "Loaded MTMD projection {ModelId} from {MmprojPath}; vision={Vision}, audio={Audio}",
+                model.Options.Id,
+                model.Options.MmprojPath,
+                mtmd.SupportsVision,
+                mtmd.SupportsAudio);
+        }
+
+        var shared = new ModelWeights(weights, mtmd, mediaMarker);
+        var maxConcurrency = model.Options.MaxConcurrency;
+        var instances = new List<LoadedModel>(maxConcurrency);
+
+        for (var i = 0; i < maxConcurrency; i++)
+        {
+            var context = weights.CreateContext(parameters);
+            var executor = mtmd is null ? new InteractiveExecutor(context) : new InteractiveExecutor(context, mtmd);
+            instances.Add(new LoadedModel(shared, context, executor));
+        }
+
+        model.Initialize(instances, shared);
     }
 
     private static ModelParams CreateModelParams(string modelPath, LLamaModelRuntimeOptions model)
@@ -723,7 +798,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         loaded.Context.NativeHandle.MemoryClear();
         loaded.Executor.Embeds.Clear();
-        loaded.Mtmd?.ClearMedia();
     }
 
     private static void CleanupMedia(LoadedModel loaded)
@@ -734,7 +808,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
 
         loaded.Executor.Embeds.Clear();
-        loaded.Mtmd?.ClearMedia();
     }
 
     private static void LoadMedia(LoadedModel loaded, IReadOnlyList<InferenceMedia> media, int mediaMarkerCount)
@@ -1223,18 +1296,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         foreach (var model in _models.Values)
         {
-            await model.LoadLock.WaitAsync();
-            try
-            {
-                model.Loaded?.Dispose();
-                model.Loaded = null;
-            }
-            finally
-            {
-                model.LoadLock.Release();
-                model.LoadLock.Dispose();
-            }
+            await model.UnloadAsync();
+            model.LoadLock.Dispose();
         }
+    }
+
+    public int GetModelMaxConcurrency(string? modelId)
+    {
+        return ResolveRuntime(modelId).Options.MaxConcurrency;
     }
 
     private ModelRuntime ResolveRuntime(string? requestedModel)
@@ -1268,21 +1337,111 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return _models.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).First();
     }
 
+    private sealed class ModelWeights : IDisposable
+    {
+        public LLamaWeights LlamaWeights { get; }
+        public MtmdWeights? Mtmd { get; }
+        public string? MediaMarker { get; }
+
+        public ModelWeights(LLamaWeights llamaWeights, MtmdWeights? mtmd, string? mediaMarker)
+        {
+            LlamaWeights = llamaWeights;
+            Mtmd = mtmd;
+            MediaMarker = mediaMarker;
+        }
+
+        public void Dispose()
+        {
+            Mtmd?.Dispose();
+            LlamaWeights.Dispose();
+        }
+    }
+
     private sealed class ModelRuntime
     {
+        public LLamaModelRuntimeOptions Options { get; }
+        public SemaphoreSlim LoadLock { get; } = new(1, 1);
+
+        private readonly object _lock = new();
+        private readonly List<LoadedModel> _allInstances = [];
+        private readonly Queue<LoadedModel> _available = new();
+        private SemaphoreSlim? _instanceSemaphore;
+        private ModelWeights? _shared;
+        private volatile bool _loaded;
+
+        public bool IsLoaded => _loaded;
+
         public ModelRuntime(LLamaModelRuntimeOptions options)
         {
             Options = options;
         }
 
-        public LLamaModelRuntimeOptions Options { get; }
+        public void Initialize(List<LoadedModel> instances, ModelWeights shared)
+        {
+            _shared = shared;
+            foreach (var inst in instances)
+            {
+                _allInstances.Add(inst);
+                _available.Enqueue(inst);
+            }
+            _instanceSemaphore = new SemaphoreSlim(instances.Count, instances.Count);
+            _loaded = true;
+        }
 
-        public SemaphoreSlim LoadLock { get; } = new(1, 1);
+        public async Task<LoadedModel> AcquireAsync(CancellationToken ct)
+        {
+            await _instanceSemaphore!.WaitAsync(ct);
+            lock (_lock)
+            {
+                return _available.Dequeue();
+            }
+        }
 
+        public void Release(LoadedModel model)
+        {
+            lock (_lock)
+            {
+                if (!_loaded)
+                {
+                    model.Dispose();
+                    return;
+                }
+                _available.Enqueue(model);
+            }
+            _instanceSemaphore!.Release();
+        }
 
-        public LoadedModel? Loaded { get; set; }
+        public async Task UnloadAsync()
+        {
+            await LoadLock.WaitAsync();
+            try
+            {
+                if (!_loaded) return;
+                _loaded = false;
 
-        public bool IsLoaded => Loaded is not null;
+                List<LoadedModel> toDispose;
+                lock (_lock)
+                {
+                    toDispose = [.. _allInstances];
+                    _allInstances.Clear();
+                    _available.Clear();
+                }
+
+                foreach (var instance in toDispose)
+                {
+                    instance.Dispose();
+                }
+
+                _shared?.Dispose();
+                _shared = null;
+                _instanceSemaphore?.Dispose();
+                _instanceSemaphore = null;
+            }
+            finally
+            {
+                LoadLock.Release();
+            }
+        }
     }
 
     private static string ResolvePath(string? path)
@@ -1295,31 +1454,24 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private sealed class LoadedModel : IDisposable
     {
-        public LoadedModel(LLamaWeights weights, LLamaContext context, InteractiveExecutor executor, MtmdWeights? mtmd, string? mediaMarker)
-        {
-            Weights = weights;
-            Context = context;
-            Executor = executor;
-            Mtmd = mtmd;
-            MediaMarker = mediaMarker;
-        }
+        private readonly ModelWeights _shared;
 
-        public LLamaWeights Weights { get; }
-
+        public LLamaWeights Weights => _shared.LlamaWeights;
+        public MtmdWeights? Mtmd => _shared.Mtmd;
+        public string? MediaMarker => _shared.MediaMarker;
         public LLamaContext Context { get; }
-
         public InteractiveExecutor Executor { get; }
 
-        public MtmdWeights? Mtmd { get; }
-
-        public string? MediaMarker { get; }
+        public LoadedModel(ModelWeights shared, LLamaContext context, InteractiveExecutor executor)
+        {
+            _shared = shared;
+            Context = context;
+            Executor = executor;
+        }
 
         public void Dispose()
         {
-            CleanupMedia(this);
-            Mtmd?.Dispose();
             Context.Dispose();
-            Weights.Dispose();
         }
     }
 }

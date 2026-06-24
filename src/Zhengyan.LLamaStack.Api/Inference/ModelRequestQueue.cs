@@ -16,7 +16,13 @@ public sealed class ModelRequestQueue
 {
     private readonly object _lock = new();
     private readonly LinkedList<QueueEntry> _queue = new();
-    private bool _processing;
+    private readonly int _maxConcurrency;
+    private int _activeCount;
+
+    public ModelRequestQueue(int maxConcurrency = 1)
+    {
+        _maxConcurrency = Math.Max(1, maxConcurrency);
+    }
 
     public QueueEntry Enqueue(string modelId)
     {
@@ -29,12 +35,12 @@ public sealed class ModelRequestQueue
 
         lock (_lock)
         {
-            entry.Position = _queue.Count + (_processing ? 1 : 0);
+            entry.Position = _queue.Count + 1;
             _queue.AddLast(entry);
 
-            if (!_processing)
+            if (_activeCount < _maxConcurrency)
             {
-                _processing = true;
+                _activeCount++;
                 entry.Status = "processing";
                 entry.TurnTcs.TrySetResult();
             }
@@ -43,25 +49,46 @@ public sealed class ModelRequestQueue
         return entry;
     }
 
-    public void Dequeue()
+    public void RemoveEntry(string entryId)
     {
         lock (_lock)
         {
-            _queue.RemoveFirst();
-
-            if (_queue.First is null)
+            var node = _queue.First;
+            while (node is not null)
             {
-                _processing = false;
-                return;
-            }
+                if (string.Equals(node.Value.Id, entryId, StringComparison.Ordinal))
+                {
+                    _queue.Remove(node);
 
-            var pos = 1;
-            foreach (var node in _queue)
-            {
-                node.Position = pos++;
-            }
+                    if (node.Value.Status == "processing")
+                    {
+                        _activeCount = Math.Max(0, _activeCount - 1);
+                    }
 
-            var next = _queue.First.Value;
+                    SignalNext();
+                    return;
+                }
+
+                node = node.Next;
+            }
+        }
+    }
+
+    private void SignalNext()
+    {
+        var pos = 0;
+        foreach (var entry in _queue)
+        {
+            entry.Position = pos++;
+        }
+
+        while (_activeCount < _maxConcurrency)
+        {
+            var next = _queue.FirstOrDefault(e => e.Status == "queued");
+            if (next is null)
+                break;
+
+            _activeCount++;
             next.Status = "processing";
             next.TurnTcs.TrySetResult();
         }
@@ -74,52 +101,15 @@ public sealed class ModelRequestQueue
             return _queue.FirstOrDefault(e => string.Equals(e.Id, entryId, StringComparison.Ordinal));
         }
     }
-
-    public void RemoveEntry(string entryId)
-    {
-        lock (_lock)
-        {
-            var node = _queue.First;
-            while (node is not null)
-            {
-                if (string.Equals(node.Value.Id, entryId, StringComparison.Ordinal))
-                {
-                    if (node == _queue.First && _processing)
-                    {
-                        _processing = false;
-                    }
-
-                    _queue.Remove(node);
-
-                    if (_queue.First is not null && !_processing)
-                    {
-                        _processing = true;
-                        _queue.First.Value.Status = "processing";
-                        _queue.First.Value.TurnTcs.TrySetResult();
-                    }
-
-                    var pos = 0;
-                    foreach (var n in _queue)
-                    {
-                        n.Position = pos++;
-                    }
-
-                    return;
-                }
-
-                node = node.Next;
-            }
-        }
-    }
 }
 
 public sealed class ModelQueueManager
 {
     private readonly ConcurrentDictionary<string, ModelRequestQueue> _queues = new(StringComparer.OrdinalIgnoreCase);
 
-    public ModelRequestQueue GetOrCreate(string modelId)
+    public ModelRequestQueue GetOrCreate(string modelId, int maxConcurrency = 1)
     {
-        return _queues.GetOrAdd(modelId, _ => new ModelRequestQueue());
+        return _queues.GetOrAdd(modelId, _ => new ModelRequestQueue(maxConcurrency));
     }
 
     public IReadOnlyCollection<KeyValuePair<string, ModelRequestQueue>> GetAll()
