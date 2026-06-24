@@ -32,14 +32,22 @@ The current version focuses on `chat/completions`, `responses`, SSE streaming, m
 - Exposes OpenAI-compatible endpoints:
   - `GET /v1/models`
   - `POST /v1/chat/completions`
+  - `POST /v1/responses`
+  - `POST /v1/embeddings`
+  - `POST /v1/tokenize`
+  - `POST /v1/detokenize`
+  - `GET /v1/health`
+  - `POST /v1/models/{model_id}/load`
+  - `POST /v1/models/{model_id}/unload`
+  - `GET /v1/queue/{entry_id}`
   - `GET /v1/chat/completions`
   - `GET /v1/chat/completions/{completion_id}`
   - `POST /v1/chat/completions/{completion_id}`
   - `DELETE /v1/chat/completions/{completion_id}`
   - `GET /v1/chat/completions/{completion_id}/messages`
-  - `POST /v1/responses`
   - `GET /v1/responses`
   - `GET /v1/responses/{response_id}`
+  - `POST /v1/responses/{response_id}`
   - `DELETE /v1/responses/{response_id}`
   - `POST /v1/responses/{response_id}/cancel`
   - `GET /v1/responses/{response_id}/input_items`
@@ -650,34 +658,41 @@ Then configure:
 | `GET /v1/models` | Multi-model list, load status, and capability declarations implemented. |
 | `POST /v1/chat/completions` | Basic non-streaming and streaming inference implemented. |
 | `POST /v1/responses` | Basic non-streaming and streaming inference implemented. |
+| `POST /v1/embeddings` | Implemented via LLamaEmbedder. |
+| `POST /v1/tokenize` / `POST /v1/detokenize` | Tokenization and detokenization implemented. |
+| `GET /v1/health` | Health check with model load status. |
+| `POST /v1/models/{model_id}/load` / `unload` | Runtime model hot load and unload implemented. |
+| `GET /v1/queue/{entry_id}` | Queue status lookup implemented. |
 | OpenAI-style error payloads | Implemented for main service errors. |
 | Text message/content parsing | Implemented. |
 | Image and audio input parsing | Implemented at request level; requires `MmprojPath`. |
 | `tools` / `functions` request parsing | Implemented. |
-| Tool-call response fields | Partially implemented; depends on model-emitted JSON. |
+| Tool-call execution | `calculator` and `current_time` built-in tools executed in a multi-turn loop; `parallel_tool_calls` supported. |
 | `response_format` / JSON mode | Partially implemented through prompt constraints. |
 | usage token counts | Partially implemented with LLamaSharp tokenizer estimation. |
 | Multi-model registry and `model` routing | Implemented, with legacy single-model configuration compatibility. |
 | Model capability declarations | Implemented for `/v1/models` and request preflight validation. |
-| Chat protocol fields | Accepts `metadata`, `user`, `store`, `service_tier`, `parallel_tool_calls`, and `stream_options.include_usage`; unsupported `logprobs` / `logit_bias` return explicit errors. |
+| Chat protocol fields | Accepts `metadata`, `user`, `store`, `service_tier`, `parallel_tool_calls`, and `stream_options.include_usage`; unsupported `logprobs` / `logit_bias` return compatibility warnings. |
 | Chat management endpoints | Implemented in process memory: list, retrieve, update metadata, delete, and messages. |
 | Responses protocol fields | Accepts `previous_response_id`, `conversation`, `background`, `reasoning`, `metadata`, `truncation`, `include`, `store`, and `parallel_tool_calls`; `previous_response_id` can continue from the local in-memory store. |
-| Responses management endpoints | Implemented in process memory: list, retrieve, delete, cancel, input_items, input_tokens, count_tokens, and compact. |
+| Responses management endpoints | Implemented in process memory: list, retrieve, update metadata, delete, cancel, input_items, input_tokens, count_tokens, and compact. |
+| API key authentication | Optional Bearer token middleware implemented (`LLamaStack:Auth`). |
+| CORS | Optional cross-origin configuration implemented (`LLamaStack:Cors`). |
 
 ### Missing for Full OpenAI Protocol Coverage
 
 | Area | Gap | Plan |
 | --- | --- | --- |
-| Chat Completions | Most common fields are accepted and `stream_options.include_usage` emits a basic usage chunk; `logprobs`, `top_logprobs`, and `logit_bias` do not have real sampler support yet, and `parallel_tool_calls` does not execute tools. | Verify LLamaSharp logits/logprobs support; add parallel tool execution and more complete streaming usage accounting. |
+| Chat Completions | Most common fields are accepted and `stream_options.include_usage` emits a basic usage chunk; `logprobs`, `top_logprobs`, and `logit_bias` do not have real sampler support yet. | Verify LLamaSharp logits/logprobs support; add more complete streaming usage accounting. |
 | Chat management endpoints | Basic in-memory endpoints are implemented, but data is lost after restart; streaming Chat responses are not stored yet. | Add a storage abstraction with SQLite/PostgreSQL/Redis backends; persist streaming outputs and complete cursor pagination. |
 | Responses API | An in-memory store and `previous_response_id` continuation are implemented; `conversation`, `background`, real cancellation, and truncation policy still degrade for compatibility. | Design a durable response store, conversation state, background job queue, real cancellation, and context truncation policy. |
 | Responses management endpoints | retrieve/delete/cancel/input_items/token count/compact have basic in-memory implementations; `compact` currently creates a context snapshot and does not run model-based summarization. | Add durable storage, a task state machine, model-driven compact, exact token counts, and SDK-compatible pagination. |
-| Tool calling | Two built-in tools (`calculator`, `current_time`) are executed in a multi-turn loop; unknown tools are returned to the client without execution. | Add a tool registry, hot-loadable tools, parallel tool calls, timeout/permission controls, structured output validation, and a custom tool interface. |
+| Tool calling | Two built-in tools (`calculator`, `current_time`) are executed in a multi-turn loop with `parallel_tool_calls` support; unknown tools are returned to the client without execution. | Add a tool registry, hot-loadable tools, timeout/permission controls, structured output validation, and a custom tool interface. |
 | Structured Outputs | Strict JSON Schema constrained decoding is not implemented. | Integrate llama.cpp/LLamaSharp grammar support or schema-to-grammar conversion, plus strict JSON Schema validation. |
 | Multimodal output | Only text output is supported. Image/audio output items are not supported. | Extend response output item models and integrate image/audio generation backends. |
 | Audio API | `/v1/audio/transcriptions`, `/v1/audio/translations`, and `/v1/audio/speech` are not implemented. | Integrate Whisper/Sherpa-ONNX/TTS backends and expose OpenAI-compatible payloads. |
 | Images API | `/v1/images/generations`, `/v1/images/edits`, and `/v1/images/variations` are not implemented. | Add local image generation adapters, such as Stable Diffusion or ComfyUI. |
-| Embeddings API | `/v1/embeddings` is not implemented. | Use LLamaSharp embedding mode or dedicated embedding models. |
+| Embeddings API | `/v1/embeddings` is implemented via LLamaEmbedder. | Add independent embedding model registration and dimension declaration. |
 | Moderations API | `/v1/moderations` is not implemented. | Add a local safety classification model or rules engine. |
 | Files / Uploads | `/v1/files` and `/v1/uploads` resources are not implemented. | Add file storage, validation, lifecycle management, and access control. |
 | Vector Stores | vector stores, file batches, and search endpoints are not implemented. | Add a vector database abstraction for HNSW, SQLite vec, Qdrant, Milvus, or similar backends. |
@@ -685,8 +700,8 @@ Then configure:
 | Fine-tuning | fine-tuning jobs, checkpoints, and events are not implemented. | Treat as a long-term goal; prioritize LoRA/QLoRA orchestration instead of direct large-model training. |
 | Realtime API | WebSocket/WebRTC realtime protocols are not implemented. | Plan a separate realtime host for bidirectional audio, incremental transcription, and low-latency output. |
 | Legacy Assistants API | assistants, threads, runs, and run steps are not implemented. | Implement only if compatibility demand is strong; prioritize Responses API first. |
-| Authentication and rate limits | Bearer key validation, organization/project handling, and rate limits are not implemented. | Add API key configuration, request auditing, rate limiting middleware, and tenant metadata. |
-| Model management | Multi-model registration, default model, `model` routing, and capability declarations are implemented; runtime hot load/unload is not implemented yet. | Add model hot load/unload, runtime configuration refresh, model health checks, and automatic capability detection. |
+| Authentication and rate limits | Optional API key middleware implemented (`LLamaStack:Auth`); rate limits, organization/project not implemented. | Add rate limiting, request auditing, and tenant metadata. |
+| Model management | Multi-model registration, default model, `model` routing, capability declarations, and runtime hot load/unload are implemented. | Add runtime configuration refresh, model health checks, and automatic capability detection. |
 | Concurrent inference | Implemented per-model configurable concurrency (`MaxConcurrency`), shared LLamaWeights, pooled LLamaContext/InteractiveExecutor. | Future work: dynamic pool sizing, queueing, cancellation, and memory protection. |
 | Observability | Metrics, tracing, and structured audit logs are missing. | Add OpenTelemetry, Prometheus metrics, request IDs, token/s, and latency metrics. |
 | SDK compatibility tests | No automated OpenAI SDK compatibility matrix exists yet. | Build end-to-end tests with official OpenAI .NET, Python, and JavaScript SDKs. |
@@ -697,12 +712,11 @@ Then configure:
 2. Completed a first pass of Chat Completions and Responses protocol field parsing, degradation, and basic echoing.
 3. Completed the basic in-memory response/chat store and management endpoints.
 4. Add a durable store, background task state machine, real cancellation, and model-driven compact.
-5. Implement tool execution loops and structured outputs.
-6. Implement the Embeddings API.
-7. Add Files / Uploads and Vector Stores.
-8. Add Audio, Images, Moderations, and other independent capabilities.
-9. Add authentication, rate limiting, queueing, metrics, and production deployment scaffolding.
-10. Build an OpenAI SDK compatibility test matrix, then evaluate Realtime API and fine-tuning orchestration.
+5. Implement structured outputs.
+6. Add Files / Uploads and Vector Stores.
+7. Add Audio, Images, Moderations, and other independent capabilities.
+8. Add rate limiting, queueing, metrics, and production deployment scaffolding.
+9. Build an OpenAI SDK compatibility test matrix, then evaluate Realtime API and fine-tuning orchestration.
 
 ## Development Commands
 

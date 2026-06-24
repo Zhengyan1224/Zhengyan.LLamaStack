@@ -32,14 +32,22 @@
 - 提供 OpenAI 兼容接口：
   - `GET /v1/models`
   - `POST /v1/chat/completions`
+  - `POST /v1/responses`
+  - `POST /v1/embeddings`
+  - `POST /v1/tokenize`
+  - `POST /v1/detokenize`
+  - `GET /v1/health`
+  - `POST /v1/models/{model_id}/load`
+  - `POST /v1/models/{model_id}/unload`
+  - `GET /v1/queue/{entry_id}`
   - `GET /v1/chat/completions`
   - `GET /v1/chat/completions/{completion_id}`
   - `POST /v1/chat/completions/{completion_id}`
   - `DELETE /v1/chat/completions/{completion_id}`
   - `GET /v1/chat/completions/{completion_id}/messages`
-  - `POST /v1/responses`
   - `GET /v1/responses`
   - `GET /v1/responses/{response_id}`
+  - `POST /v1/responses/{response_id}`
   - `DELETE /v1/responses/{response_id}`
   - `POST /v1/responses/{response_id}/cancel`
   - `GET /v1/responses/{response_id}/input_items`
@@ -650,34 +658,41 @@ dotnet add src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LL
 | `GET /v1/models` | 已实现多模型列表、加载状态和能力声明返回。 |
 | `POST /v1/chat/completions` | 已实现非流式和流式基础推理。 |
 | `POST /v1/responses` | 已实现非流式和流式基础推理。 |
+| `POST /v1/embeddings` | 已实现，使用 LLamaEmbedder 提取向量。 |
+| `POST /v1/tokenize` / `POST /v1/detokenize` | 已实现分词和去分词。 |
+| `GET /v1/health` | 已实现健康检查和模型加载状态。 |
+| `POST /v1/models/{model_id}/load` / `unload` | 已实现运行时热加载和卸载。 |
+| `GET /v1/queue/{entry_id}` | 已实现队列状态查询。 |
 | OpenAI 风格错误结构 | 已实现主要业务错误。 |
 | 文本 message/content 解析 | 已实现。 |
 | 图片和音频输入解析 | 已实现请求解析，需要配置 `MmprojPath`。 |
 | `tools` / `functions` 请求解析 | 已实现。 |
-| 工具调用响应字段 | 部分实现，依赖模型按约定输出 JSON。 |
+| 工具调用执行 | 已实现 `calculator`、`current_time` 内建工具的多轮执行循环；支持 `parallel_tool_calls` 并行执行。 |
 | `response_format` / JSON mode | 部分实现，通过 prompt 约束。 |
 | usage token 统计 | 部分实现，使用 LLamaSharp tokenizer 估算。 |
 | 多模型注册和按 `model` 路由 | 已实现，保留旧版单模型配置兼容。 |
 | 模型能力声明 | 已实现，用于 `/v1/models` 和请求前置校验。 |
-| Chat 协议字段兼容 | 已接收 `metadata`、`user`、`store`、`service_tier`、`parallel_tool_calls`、`stream_options.include_usage`；不支持的 `logprobs` / `logit_bias` 会返回明确错误。 |
+| Chat 协议字段兼容 | 已接收 `metadata`、`user`、`store`、`service_tier`、`parallel_tool_calls`、`stream_options.include_usage`；不支持的 `logprobs` / `logit_bias` 会返回兼容性警告。 |
 | Chat 管理接口 | 已实现进程内存版本：list、retrieve、update metadata、delete、messages。 |
 | Responses 协议字段兼容 | 已接收 `previous_response_id`、`conversation`、`background`、`reasoning`、`metadata`、`truncation`、`include`、`store`、`parallel_tool_calls`；`previous_response_id` 可从本地内存 store 续写上下文。 |
-| Responses 管理接口 | 已实现进程内存版本：list、retrieve、delete、cancel、input_items、input_tokens、count_tokens、compact。 |
+| Responses 管理接口 | 已实现进程内存版本：list、retrieve、update metadata、delete、cancel、input_items、input_tokens、count_tokens、compact。 |
+| API key 认证 | 已实现可选 Bearer token 校验中间件 (`LLamaStack:Auth`)。 |
+| CORS | 已实现可选跨域配置 (`LLamaStack:Cors`)。 |
 
 ### 距离完整 OpenAI 协议还缺的能力
 
 | 模块 | 缺口 | 计划 |
 | --- | --- | --- |
-| Chat Completions | 已接收多数字段并支持 `stream_options.include_usage` 的基础 usage chunk；`logprobs`、`top_logprobs`、`logit_bias` 尚未实现真实采样支持，`parallel_tool_calls` 尚未执行工具。 | 研究 LLamaSharp 是否暴露 logits/logprobs；补充并行工具调用和更完整的流式 usage 统计。 |
+| Chat Completions | 已接收多数字段并支持 `stream_options.include_usage` 的基础 usage chunk；`logprobs`、`top_logprobs`、`logit_bias` 尚未实现真实采样支持。 | 研究 LLamaSharp 是否暴露 logits/logprobs；补充更完整的流式 usage 统计。 |
 | Chat 管理接口 | 已有内存版管理接口，但重启丢失；streaming Chat 响应暂不落库。 | 抽象存储接口并增加 SQLite/PostgreSQL/Redis 实现；保存 streaming 完整输出和分页游标。 |
 | Responses API | 已有内存 store 和 `previous_response_id` 上下文续写；`conversation`、`background`、真实取消、截断策略仍是兼容降级。 | 设计持久化 response store、conversation state、后台执行队列、真实取消和上下文截断策略。 |
 | Responses 管理接口 | retrieve/delete/cancel/input_items/token count/compact 已有基础内存版；`compact` 当前只生成上下文快照，不做模型总结压缩。 | 增加持久化、任务状态机、模型驱动 compact、精确 token count 和 SDK 兼容分页。 |
-| Tool Calling | 已内置 `calculator` 和 `current_time` 两个工具的多轮执行循环；未知工具返回客户端，不执行。 | 增加工具注册表、工具热加载、并行工具调用、超时/权限控制、结构化输出校验和自定义工具接口。 |
+| Tool Calling | 已内置 `calculator` 和 `current_time` 两个工具的多轮执行循环，支持 `parallel_tool_calls` 并行执行；未知工具返回客户端，不执行。 | 增加工具注册表、工具热加载、超时/权限控制、结构化输出校验和自定义工具接口。 |
 | Structured Outputs | 未实现 JSON Schema 强约束解码。 | 接入 llama.cpp/LLamaSharp grammar 或 schema-to-grammar 转换；补充严格 JSON Schema 校验。 |
 | 多模态输出 | 当前只支持文本输出，不支持图片、音频等输出。 | 根据 OpenAI 输出 item 类型扩展响应模型；后续集成图像/语音生成模块。 |
 | Audio API | `/v1/audio/transcriptions`、`/v1/audio/translations`、`/v1/audio/speech` 未实现。 | 规划接入 Whisper/Sherpa-ONNX/TTS 后端，并提供 OpenAI 兼容格式。 |
 | Images API | `/v1/images/generations`、`/v1/images/edits`、`/v1/images/variations` 未实现。 | 规划接入本地图像生成后端，例如 Stable Diffusion/ComfyUI 适配器。 |
-| Embeddings API | `/v1/embeddings` 未实现。 | 使用 LLamaSharp embedding 模式或独立 embedding 模型实现向量输出。 |
+| Embeddings API | `/v1/embeddings` 已实现，使用 LLamaEmbedder 提取向量。 | 增加 embedding 模型独立注册和维度声明。 |
 | Moderations API | `/v1/moderations` 未实现。 | 增加本地安全分类模型或规则引擎。 |
 | Files / Uploads | `/v1/files`、`/v1/uploads` 资源接口未实现。 | 增加文件存储、校验、生命周期管理和权限控制。 |
 | Vector Stores | vector stores、file batches、search 等接口未实现。 | 增加向量数据库抽象，可接入 HNSW、SQLite vec、Qdrant、Milvus 等。 |
@@ -685,8 +700,8 @@ dotnet add src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LL
 | Fine-tuning | fine-tuning jobs、checkpoints、events 未实现。 | 作为长期计划，优先支持 LoRA/QLoRA 作业编排，而非直接训练大模型。 |
 | Realtime API | WebSocket/WebRTC 实时协议未实现。 | 规划独立 realtime host，处理双向音频、增量转写、低延迟输出。 |
 | Assistants legacy API | assistants、threads、runs、run steps 等 legacy 接口未实现。 | 视兼容需求决定是否实现；优先级低于 Responses API。 |
-| 认证和限流 | 未实现 OpenAI 风格 Bearer key 校验、组织/project、rate limit。 | 增加 API key 配置、请求审计、限流、中间件和多租户字段。 |
-| 模型管理 | 已支持多模型注册、默认模型、按 `model` 路由和能力声明；尚不支持运行时热加载/卸载。 | 增加模型热加载/卸载、运行时配置刷新、模型健康检查和能力自动探测。 |
+| 认证和限流 | 已实现可选 API key 校验中间件 (`LLamaStack:Auth`)；rate limit、组织/project 未实现。 | 增加限流、请求审计、多租户字段。 |
+| 模型管理 | 已支持多模型注册、默认模型、按 `model` 路由、能力声明和运行时热加载/卸载。 | 增加运行时配置刷新、模型健康检查和能力自动探测。 |
 | 并发推理 | 已实现每模型可配并发数（`MaxConcurrency`），共享 LLamaWeights，池化 LLamaContext/InteractiveExecutor。 | 后续增加动态池大小、排队、取消和显存保护。 |
 | 可观测性 | 缺少 metrics、trace、结构化审计日志。 | 增加 OpenTelemetry、Prometheus metrics、请求 ID、token/s 延迟指标。 |
 | SDK 兼容测试 | 尚未建立 OpenAI SDK 自动化兼容测试矩阵。 | 使用官方 OpenAI .NET/Python/JS SDK 构建端到端兼容测试。 |
@@ -697,12 +712,11 @@ dotnet add src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LL
 2. 已完成 Chat Completions 和 Responses 的一批协议字段接收、降级和基础回显。
 3. 已完成 response/chat 基础内存 store 和管理接口。
 4. 增加持久化 store、后台任务状态机、真实取消和模型驱动 compact。
-5. 实现工具执行循环和 structured outputs。
-6. 实现 Embeddings API。
-7. 增加 Files / Uploads 和 Vector Stores。
-8. 增加 Audio、Images、Moderations 等独立能力。
-9. 实现认证、限流、队列、metrics 和生产部署脚手架。
-10. 建立 OpenAI SDK 兼容测试矩阵，并评估 Realtime API 和 fine-tuning 编排。
+5. 实现 structured outputs。
+6. 增加 Files / Uploads 和 Vector Stores。
+7. 增加 Audio、Images、Moderations 等独立能力。
+8. 实现限流、队列、metrics 和生产部署脚手架。
+9. 建立 OpenAI SDK 兼容测试矩阵，并评估 Realtime API 和 fine-tuning 编排。
 
 ## 开发命令
 
