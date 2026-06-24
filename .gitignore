@@ -1,7 +1,7 @@
 bin/
 obj/
 temp/
-models/
+appsettings.Development.json
 .vs/
 .idea/
 *.user
