@@ -1,5 +1,7 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Zhengyan.ChatUI.Desktop/Zhengyan.ChatUI.Desktop.csproj" />
     <Project Path="src/Zhengyan.LLamaStack.Api/Zhengyan.LLamaStack.Api.csproj" />
+    <Project Path="src/Zhengyan.OpenAIModels/Zhengyan.OpenAIModels.csproj" />
   </Folder>
 </Solution>
