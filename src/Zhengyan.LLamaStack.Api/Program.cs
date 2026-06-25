@@ -13,16 +13,38 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<LLamaStackOptions>(builder.Configuration.GetSection(LLamaStackOptions.SectionName));
 builder.Services.AddHttpClient(OpenAiRequestMapper.MediaHttpClientName);
 builder.Services.AddSingleton<OpenAiRequestMapper>();
-builder.Services.AddSingleton<IOpenAiStore, OpenAiMemoryStore>();
+builder.Services.AddSingleton<IOpenAiStore>(sp =>
+{
+    var options = sp.GetRequiredService<IOptions<LLamaStackOptions>>();
+    return options.Value.Store.Provider.ToLowerInvariant() switch
+    {
+        "sqlite" => new OpenAiSqliteStore(options),
+        "postgres" => new OpenAiPostgresStore(options),
+        "redis" => new OpenAiRedisStore(options),
+        _ => new OpenAiMemoryStore()
+    };
+});
+builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
 builder.Services.AddSingleton<CalculatorTool>();
 builder.Services.AddSingleton<CurrentTimeTool>();
 builder.Services.AddSingleton<ToolExecutor>(sp =>
 {
-    var tools = sp.GetServices<IAgentTool>();
-    return new ToolExecutor(tools);
+    var registry = sp.GetRequiredService<IToolRegistry>();
+    foreach (var tool in sp.GetServices<IAgentTool>())
+    {
+        registry.Register(tool);
+    }
+
+    return new ToolExecutor(registry);
 });
 builder.Services.AddSingleton<ModelQueueManager>();
 builder.Services.AddSingleton<LLamaInferenceService>();
+builder.Services.AddSingleton<ConversationStore>();
+builder.Services.AddSingleton<ResponseExecutionTracker>();
+builder.Services.AddSingleton<IResponseCompactScheduler, ResponseCompactScheduler>();
+builder.Services.AddHostedService<ResponseCompactScheduler>(sp => (ResponseCompactScheduler)sp.GetRequiredService<IResponseCompactScheduler>());
+builder.Services.AddSingleton<ResponseBackgroundService>();
+builder.Services.AddHostedService<ResponseBackgroundService>(sp => sp.GetRequiredService<ResponseBackgroundService>());
 builder.Services.AddHostedService<LLamaWarmupHostedService>();
 builder.Services.AddExceptionHandler<OpenAiExceptionHandler>();
 builder.Services.AddProblemDetails();

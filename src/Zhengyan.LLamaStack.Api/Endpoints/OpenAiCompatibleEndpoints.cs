@@ -63,7 +63,8 @@ public static class OpenAiCompatibleEndpoints
                         loaded = model.Loaded,
                         model_path = model.ModelPath,
                         mmproj_path = model.MmprojPath,
-                        capabilities = model.Capabilities
+                        capabilities = model.Capabilities,
+                        embedding_dimensions = model.EmbeddingDimensions > 0 ? model.EmbeddingDimensions : (int?)null
                     })
             };
             LogResponse(logger, "GET /v1/models", 200, value);
@@ -84,10 +85,13 @@ public static class OpenAiCompatibleEndpoints
         app.MapPost("/v1/responses/{responseId}", UpdateResponse);
         app.MapDelete("/v1/responses/{responseId}", DeleteResponse);
         app.MapPost("/v1/responses/{responseId}/cancel", CancelResponse);
+        app.MapPost("/v1/chat/completions/{completionId}/cancel", CancelChatCompletion);
+        app.MapPost("/v1/models/{modelId}/resize", HandleModelResize);
         app.MapGet("/v1/responses/{responseId}/input_items", ListResponseInputItems);
         app.MapPost("/v1/responses/{responseId}/count_tokens", CountStoredResponseTokens);
         app.MapPost("/v1/responses/input_tokens", CountResponseInputTokensAsync);
         app.MapPost("/v1/responses/compact", CompactResponseAsync);
+        app.MapGet("/v1/responses/tasks/{taskId}", GetResponseTask);
         app.MapGet("/v1/queue/{entryId}", GetQueueStatus);
         app.MapPost("/v1/tokenize", HandleTokenize);
         app.MapPost("/v1/detokenize", HandleDetokenize);
@@ -161,7 +165,15 @@ public static class OpenAiCompatibleEndpoints
                 throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "`input` must contain at least one string.", param: "input");
             }
 
-            var result = await inference.EmbeddingsAsync(inputs, request.Model, cancellationToken);
+            var modelId = string.IsNullOrWhiteSpace(request.Model) ? inference.DefaultEmbeddingModelId : request.Model;
+            var result = await inference.EmbeddingsAsync(inputs, modelId, request.Dimensions, cancellationToken);
+
+            var usage = new
+            {
+                prompt_tokens = result.TotalTokens,
+                total_tokens = result.TotalTokens
+            };
+
             var value = new
             {
                 @object = "list",
@@ -171,12 +183,8 @@ public static class OpenAiCompatibleEndpoints
                     index = d.Index,
                     embedding = d.Embedding
                 }).ToArray(),
-                model = inference.DefaultModelId,
-                usage = new
-                {
-                    prompt_tokens = result.TotalTokens,
-                    total_tokens = result.TotalTokens
-                }
+                model = modelId,
+                usage
             };
             LogResponse(logger, "POST /v1/embeddings", 200, value);
             return Results.Json(value);
@@ -227,6 +235,7 @@ public static class OpenAiCompatibleEndpoints
         LLamaInferenceService inference,
         IOpenAiStore store,
         ModelQueueManager queueManager,
+        ResponseExecutionTracker executionTracker,
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
@@ -251,30 +260,18 @@ public static class OpenAiCompatibleEndpoints
 
                 if (request.Stream)
                 {
-                    var promptUsage = request.StreamOptions?.IncludeUsage == true
-                        ? await inference.EstimatePromptUsageAsync(inferenceRequest, cancellationToken)
-                        : default;
                     httpContext.Response.Headers.CacheControl = "no-cache";
                     httpContext.Response.Headers.Connection = "keep-alive";
                     httpContext.Response.ContentType = "text/event-stream; charset=utf-8";
 
                     logger.LogDebug("[POST /v1/chat/completions] Streaming started for {ResponseId}", responseId);
 
-                    var outputText = new StringBuilder();
-                    await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, cancellationToken))
+                    var includeUsage = request.StreamOptions?.IncludeUsage == true;
+                    var timestamp = UnixNow();
+                    await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, includeUsage, store, timestamp, cancellationToken))
                     {
                         LogSseEvent(logger, "POST /v1/chat/completions", evt);
                         await httpContext.Response.WriteAsync(evt, cancellationToken);
-                        await httpContext.Response.Body.FlushAsync(cancellationToken);
-                        outputText.Append(evt);
-                    }
-
-                    if (request.StreamOptions?.IncludeUsage == true)
-                    {
-                        var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
-                        var usageChunk = ToSse(ToChatUsageChunk(responseId, promptUsage.Model, promptUsage.PromptTokens, outputTokens));
-                        LogSseEvent(logger, "POST /v1/chat/completions", usageChunk);
-                        await httpContext.Response.WriteAsync(usageChunk, cancellationToken);
                         await httpContext.Response.Body.FlushAsync(cancellationToken);
                     }
 
@@ -287,7 +284,8 @@ public static class OpenAiCompatibleEndpoints
                     return Results.Empty;
                 }
 
-                var completion = await inference.CompleteAsync(inferenceRequest, cancellationToken);
+                using var linkedCts = executionTracker.Track(responseId, cancellationToken);
+                var completion = await inference.CompleteAsync(inferenceRequest, linkedCts.Token);
                 var created = UnixNow();
                 if (request.Store == true)
                 {
@@ -301,6 +299,7 @@ public static class OpenAiCompatibleEndpoints
             finally
             {
                 queue.RemoveEntry(queueEntry.Id);
+                executionTracker.Untrack(responseId);
             }
         }
         catch (OpenAiProtocolException exception)
@@ -314,6 +313,9 @@ public static class OpenAiCompatibleEndpoints
         OpenAiRequestMapper mapper,
         LLamaInferenceService inference,
         IOpenAiStore store,
+        ConversationStore conversationStore,
+        ResponseBackgroundService backgroundService,
+        ResponseExecutionTracker executionTracker,
         ModelQueueManager queueManager,
         HttpContext httpContext,
         CancellationToken cancellationToken)
@@ -323,12 +325,57 @@ public static class OpenAiCompatibleEndpoints
         try
         {
             var inferenceRequest = await mapper.FromResponsesAsync(request, cancellationToken);
+            var responseId = "resp_" + Guid.NewGuid().ToString("N");
+
+            var conversationId = ParseConversationId(request.Conversation);
+            if (conversationId is not null)
+            {
+                var lastId = conversationStore.GetLastResponseId(conversationId);
+                if (lastId is not null && string.IsNullOrWhiteSpace(inferenceRequest.PreviousResponseId))
+                {
+                    inferenceRequest.PreviousResponseId = lastId;
+                }
+            }
+
             inferenceRequest = await ApplyPreviousResponseAsync(inferenceRequest, store, cancellationToken);
             inference.ValidateRequest(inferenceRequest, InferenceEndpointKind.Responses, request.Stream);
-            var responseId = "resp_" + Guid.NewGuid().ToString("N");
 
             var modelId = inferenceRequest.RequestedModel ?? inference.DefaultModelId;
             var maxConcurrency = inference.GetModelMaxConcurrency(modelId);
+
+            if (request.Background == true)
+            {
+                var now = UnixNow();
+                var inProgressResponse = new StoredResponse
+                {
+                    Id = responseId,
+                    CreatedAt = now,
+                    Status = "in_progress",
+                    Model = modelId,
+                    User = request.User,
+                    ServiceTier = request.ServiceTier,
+                    Store = request.Store != false,
+                    PreviousResponseId = inferenceRequest.PreviousResponseId,
+                    InputMessages = inferenceRequest.Messages,
+                    InputTokens = 0,
+                    OutputTokens = 0,
+                    CompatibilityWarnings = inferenceRequest.CompatibilityWarnings
+                };
+                await store.AddResponseAsync(inProgressResponse, cancellationToken);
+
+                if (conversationId is not null)
+                {
+                    conversationStore.AddResponse(conversationId, responseId);
+                }
+
+                await backgroundService.EnqueueAsync(new BackgroundWorkItem(
+                    responseId, inferenceRequest, modelId, maxConcurrency), cancellationToken);
+
+                var response = OpenAiResponseFactory.ToResponsesResponse(inProgressResponse);
+                LogResponse(logger, "POST /v1/responses", 200, response);
+                return Results.Json(response);
+            }
+
             var queue = queueManager.GetOrCreate(modelId, maxConcurrency);
             var queueEntry = queue.Enqueue(modelId);
             httpContext.Response.Headers["X-Queue-Position"] = queueEntry.Position.ToString();
@@ -340,40 +387,18 @@ public static class OpenAiCompatibleEndpoints
 
                 if (request.Stream)
                 {
-                    var promptUsage = request.StreamOptions?.IncludeUsage == true
-                        ? await inference.EstimatePromptUsageAsync(inferenceRequest, cancellationToken)
-                        : default;
                     httpContext.Response.Headers.CacheControl = "no-cache";
                     httpContext.Response.Headers.Connection = "keep-alive";
                     httpContext.Response.ContentType = "text/event-stream; charset=utf-8";
 
                     logger.LogDebug("[POST /v1/responses] Streaming started for {ResponseId}", responseId);
 
-                    var outputText = new StringBuilder();
-                    await foreach (var evt in inference.StreamResponsesEventsAsync(inferenceRequest, responseId, cancellationToken))
+                    var includeUsage = request.StreamOptions?.IncludeUsage == true;
+                    var now = UnixNow();
+                    await foreach (var evt in inference.StreamResponsesEventsAsync(inferenceRequest, responseId, includeUsage, store, now, cancellationToken))
                     {
                         LogSseEvent(logger, "POST /v1/responses", evt);
                         await httpContext.Response.WriteAsync(evt, cancellationToken);
-                        await httpContext.Response.Body.FlushAsync(cancellationToken);
-                        outputText.Append(evt);
-                    }
-
-                    if (request.StreamOptions?.IncludeUsage == true)
-                    {
-                        var outputTokens = await inference.CountTokensAsync(outputText.ToString(), inferenceRequest.RequestedModel, cancellationToken);
-                        var usageChunk = ToSse(new
-                        {
-                            type = "response.usage.delta",
-                            response_id = responseId,
-                            usage = new
-                            {
-                                input_tokens = promptUsage.PromptTokens,
-                                output_tokens = outputTokens,
-                                total_tokens = promptUsage.PromptTokens + outputTokens
-                            }
-                        });
-                        LogSseEvent(logger, "POST /v1/responses", usageChunk);
-                        await httpContext.Response.WriteAsync(usageChunk, cancellationToken);
                         await httpContext.Response.Body.FlushAsync(cancellationToken);
                     }
 
@@ -386,11 +411,17 @@ public static class OpenAiCompatibleEndpoints
                     return Results.Empty;
                 }
 
-                var completion = await inference.CompleteAsync(inferenceRequest, cancellationToken);
+                using var linkedCts = executionTracker.Track(responseId, cancellationToken);
+                var completion = await inference.CompleteAsync(inferenceRequest, linkedCts.Token);
                 var created = UnixNow();
                 if (request.Store != false)
                 {
                     await store.AddResponseAsync(responseId, created, inferenceRequest, completion, cancellationToken);
+                }
+
+                if (conversationId is not null)
+                {
+                    conversationStore.AddResponse(conversationId, responseId);
                 }
 
                 var response = OpenAiResponseFactory.ToResponsesResponse(completion, responseId, created, inferenceRequest.Include);
@@ -400,6 +431,7 @@ public static class OpenAiCompatibleEndpoints
             finally
             {
                 queue.RemoveEntry(queueEntry.Id);
+                executionTracker.Untrack(responseId);
             }
         }
         catch (OpenAiProtocolException exception)
@@ -506,12 +538,19 @@ public static class OpenAiCompatibleEndpoints
         int? limit,
         string? after,
         string? before,
+        string? order,
         CancellationToken cancellationToken)
     {
         var result = await store.ListResponsesAsync(limit ?? 20, after, before, cancellationToken);
         var data = result.Items
             .Select(r => OpenAiResponseFactory.ToResponsesResponse(r))
             .ToArray();
+
+        if (string.Equals(order, "asc", StringComparison.OrdinalIgnoreCase))
+        {
+            data = data.Reverse().ToArray();
+        }
+
         var value = OpenAiResponseFactory.ToList(data, result.HasMore);
         LogResponse(logger, "GET /v1/responses", 200, value);
         return Results.Json(value);
@@ -578,16 +617,25 @@ public static class OpenAiCompatibleEndpoints
     private static async Task<IResult> CancelResponse(
         string responseId,
         IOpenAiStore store,
+        ResponseExecutionTracker executionTracker,
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
+        var cancelled = executionTracker.Cancel(responseId);
         var response = await store.CancelResponseAsync(responseId, cancellationToken);
+
         if (response is not null)
         {
+            if (cancelled)
+            {
+                logger.LogDebug("Real execution cancelled for response {ResponseId}", responseId);
+            }
+
             var value = OpenAiResponseFactory.ToResponsesResponse(response);
             LogResponse(logger, "POST /v1/responses/{id}/cancel", 200, value);
             return Results.Json(value);
         }
+
         return ToNotFound(logger, "POST /v1/responses/{id}/cancel", responseId, "response_not_found");
     }
 
@@ -627,6 +675,7 @@ public static class OpenAiCompatibleEndpoints
         ResponsesRequest request,
         OpenAiRequestMapper mapper,
         IOpenAiStore store,
+        LLamaInferenceService inference,
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
@@ -635,7 +684,18 @@ public static class OpenAiCompatibleEndpoints
         {
             var inferenceRequest = await mapper.FromResponsesAsync(request, cancellationToken);
             inferenceRequest = await ApplyPreviousResponseAsync(inferenceRequest, store, cancellationToken);
-            var inputTokens = OpenAiStoreHelpers.EstimateInputTokens(inferenceRequest.Messages);
+
+            int inputTokens;
+            try
+            {
+                var (model, promptTokens) = await inference.EstimatePromptUsageAsync(inferenceRequest, cancellationToken);
+                inputTokens = promptTokens;
+            }
+            catch
+            {
+                inputTokens = OpenAiStoreHelpers.EstimateInputTokens(inferenceRequest.Messages);
+            }
+
             var value = new
             {
                 @object = "response.input_tokens",
@@ -654,6 +714,7 @@ public static class OpenAiCompatibleEndpoints
     private static async Task<IResult> CompactResponseAsync(
         JsonElement body,
         IOpenAiStore store,
+        IResponseCompactScheduler scheduler,
         ILogger<OpenAiEndpointLogger> logger,
         CancellationToken cancellationToken)
     {
@@ -661,7 +722,6 @@ public static class OpenAiCompatibleEndpoints
         logger.LogDebug("[POST /v1/responses/compact] Request: {Json}", rawBody);
         try
         {
-            await Task.CompletedTask.WaitAsync(cancellationToken);
             var responseId = TryGetString(body, "response_id") ?? TryGetString(body, "id");
             if (string.IsNullOrWhiteSpace(responseId))
             {
@@ -672,27 +732,44 @@ public static class OpenAiCompatibleEndpoints
                 return ToError(logger, "POST /v1/responses/compact", err);
             }
 
-            var response = await store.GetResponseAsync(responseId, cancellationToken);
-            if (response is null)
+            var source = await store.GetResponseAsync(responseId, cancellationToken);
+            if (source is null)
             {
                 return ToNotFound(logger, "POST /v1/responses/compact", responseId, "response_not_found");
             }
 
-            var compacted = OpenAiStoreHelpers.CreateCompactedResponse(
-                "resp_" + Guid.NewGuid().ToString("N"),
-                UnixNow(),
-                response,
-                TryGetString(body, "instructions"));
-            await store.AddResponseAsync(compacted, cancellationToken);
+            var taskId = await scheduler.ScheduleCompactAsync(
+                responseId,
+                TryGetString(body, "instructions"),
+                cancellationToken);
 
-            var value = OpenAiResponseFactory.ToResponsesResponse(compacted);
-            LogResponse(logger, "POST /v1/responses/compact", 200, value);
-            return Results.Json(value);
+            var value = OpenAiResponseFactory.ToResponseTask(
+                await scheduler.GetTaskAsync(taskId, cancellationToken) ?? throw new InvalidOperationException("Task not found after scheduling"));
+
+            LogResponse(logger, "POST /v1/responses/compact", 202, value);
+            return Results.Json(value, statusCode: 202);
         }
         catch (OpenAiProtocolException exception)
         {
             return ToError(logger, "POST /v1/responses/compact", exception);
         }
+    }
+
+    private static async Task<IResult> GetResponseTask(
+        string taskId,
+        IResponseCompactScheduler scheduler,
+        ILogger<OpenAiEndpointLogger> logger,
+        CancellationToken cancellationToken)
+    {
+        var task = await scheduler.GetTaskAsync(taskId, cancellationToken);
+        if (task is not null)
+        {
+            var value = OpenAiResponseFactory.ToResponseTask(task);
+            LogResponse(logger, "GET /v1/responses/tasks/{id}", 200, value);
+            return Results.Json(value);
+        }
+
+        return ToNotFound(logger, "GET /v1/responses/tasks/{id}", taskId, "task_not_found");
     }
 
     private static async Task<InferenceRequest> ApplyPreviousResponseAsync(
@@ -730,7 +807,7 @@ public static class OpenAiCompatibleEndpoints
         messages.AddRange(request.Messages);
         var warnings = request.CompatibilityWarnings
             .Where(x => !x.Contains("previous_response_id", StringComparison.OrdinalIgnoreCase))
-            .Concat(["`previous_response_id` was resolved from the local in-memory response store."])
+            .Concat(["`previous_response_id` was resolved from the response store."])
             .ToArray();
 
         return request.WithMessages(messages, warnings);
@@ -756,7 +833,7 @@ public static class OpenAiCompatibleEndpoints
     {
         return ToError(logger, endpoint, new OpenAiProtocolException(
             StatusCodes.Status404NotFound,
-            $"Object `{id}` was not found in the local in-memory store.",
+            $"Object `{id}` was not found.",
             code: code));
     }
 
@@ -770,6 +847,29 @@ public static class OpenAiCompatibleEndpoints
     private static string ToSse(object payload)
     {
         return "data: " + JsonSerializer.Serialize(payload, OpenAiJson.CreateOptions()) + "\n\n";
+    }
+
+    private static string? ParseConversationId(JsonElement? conversation)
+    {
+        if (conversation is null)
+        {
+            return null;
+        }
+
+        var value = conversation.Value;
+        if (value.ValueKind == JsonValueKind.String)
+        {
+            return value.GetString();
+        }
+
+        if (value.ValueKind == JsonValueKind.Object &&
+            value.TryGetProperty("id", out var idProp) &&
+            idProp.ValueKind == JsonValueKind.String)
+        {
+            return idProp.GetString();
+        }
+
+        return null;
     }
 
     private static IReadOnlyDictionary<string, string>? ParseOptionalMetadata(JsonElement body, bool required)
@@ -857,6 +957,63 @@ public static class OpenAiCompatibleEndpoints
         return Results.Json(value);
     }
 
+    private static IResult CancelChatCompletion(
+        string completionId,
+        ResponseExecutionTracker executionTracker,
+        ILogger<OpenAiEndpointLogger> logger)
+    {
+        var cancelled = executionTracker.Cancel(completionId);
+        var value = new { cancelled, id = completionId, @object = "chat.completion.cancelled" };
+        LogResponse(logger, "POST /v1/chat/completions/{id}/cancel", 200, value);
+        return Results.Json(value);
+    }
+
+    private static async Task<IResult> HandleModelResize(
+        string modelId,
+        JsonElement body,
+        LLamaInferenceService inference,
+        ModelQueueManager queueManager,
+        ILogger<OpenAiEndpointLogger> logger,
+        CancellationToken cancellationToken)
+    {
+        var rawBody = body.ValueKind == JsonValueKind.Object ? JsonSerializer.Serialize(body, _logJsonOptions) : body.ToString();
+        logger.LogDebug("[POST /v1/models/{{id}}/resize] Request: modelId={ModelId}, body={Body}", modelId, rawBody);
+        try
+        {
+            var maxConcurrency = TryGetInt(body, "max_concurrency") ?? throw new OpenAiProtocolException(
+                StatusCodes.Status400BadRequest, "`max_concurrency` is required.", param: "max_concurrency");
+
+            await inference.ResizeModelPoolAsync(modelId, maxConcurrency, cancellationToken);
+            var queue = queueManager.GetOrCreate(modelId, 1);
+            queue.SetMaxConcurrency(maxConcurrency);
+            var info = inference.GetModelMemoryInfo(modelId);
+            var value = new
+            {
+                status = "resized",
+                model_id = modelId,
+                max_concurrency = maxConcurrency,
+                memory = new
+                {
+                    weight_bytes = info.WeightBytes,
+                    context_bytes = info.ContextBytes,
+                    total_estimated_bytes = info.TotalBytes
+                }
+            };
+            LogResponse(logger, "POST /v1/models/{id}/resize", 200, value);
+            return Results.Json(value);
+        }
+        catch (InvalidOperationException ex)
+        {
+            var err = new OpenAiProtocolException(
+                StatusCodes.Status400BadRequest, ex.Message, type: "invalid_request_error");
+            return ToError(logger, "POST /v1/models/{id}/resize", err);
+        }
+        catch (OpenAiProtocolException exception)
+        {
+            return ToError(logger, "POST /v1/models/{id}/resize", exception);
+        }
+    }
+
     private static async Task<IResult> HandleModelUnload(
         string modelId,
         LLamaInferenceService inference,
@@ -922,6 +1079,15 @@ public static class OpenAiCompatibleEndpoints
             && body.TryGetProperty(propertyName, out var value)
             && value.ValueKind == JsonValueKind.String
                 ? value.GetString()
+                : null;
+    }
+
+    private static int? TryGetInt(JsonElement body, string propertyName)
+    {
+        return body.ValueKind == JsonValueKind.Object
+            && body.TryGetProperty(propertyName, out var value)
+            && value.ValueKind == JsonValueKind.Number
+                ? value.GetInt32()
                 : null;
     }
 }

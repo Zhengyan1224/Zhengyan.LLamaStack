@@ -34,6 +34,8 @@ public sealed class LLamaStackOptions
 
     public bool LoadModelOnStartup { get; set; }
 
+    public long MaxVramBytes { get; set; }
+
     public int DefaultMaxTokens { get; set; } = 512;
 
     public float DefaultTemperature { get; set; } = 0.7f;
@@ -58,9 +60,39 @@ public sealed class LLamaStackOptions
 
     public List<LLamaModelOptions> Models { get; set; } = [];
 
+    public List<LLamaEmbeddingModelOptions> EmbeddingModels { get; set; } = [];
+
     public LLamaAuthOptions Auth { get; set; } = new();
 
     public LLamaCorsOptions Cors { get; set; } = new();
+
+    public IReadOnlyList<LLamaEmbeddingModelRuntimeOptions> GetEmbeddingModelRegistrations()
+    {
+        var result = new List<LLamaEmbeddingModelRuntimeOptions>();
+        foreach (var model in EmbeddingModels)
+        {
+            if (string.IsNullOrWhiteSpace(model.Id)) continue;
+            result.Add(CreateEmbeddingRuntimeOptions(model));
+        }
+        return result;
+    }
+
+    private LLamaEmbeddingModelRuntimeOptions CreateEmbeddingRuntimeOptions(LLamaEmbeddingModelOptions model)
+    {
+        return new LLamaEmbeddingModelRuntimeOptions
+        {
+            Id = model.Id,
+            ModelPath = model.ModelPath,
+            Dimensions = model.Dimensions ?? 0,
+            GpuLayerCount = model.GpuLayerCount ?? GpuLayerCount,
+            Threads = model.Threads ?? Threads,
+            BatchThreads = model.BatchThreads ?? BatchThreads,
+            BatchSize = model.BatchSize ?? BatchSize ?? 512,
+            UseMemoryMap = model.UseMemoryMap ?? UseMemoryMap,
+            UseMemoryLock = model.UseMemoryLock ?? UseMemoryLock,
+            MaxConcurrency = Math.Max(1, model.MaxConcurrency ?? MaxConcurrency ?? 1)
+        };
+    }
 
     public IReadOnlyList<LLamaModelRuntimeOptions> GetModelRegistrations()
     {
@@ -331,4 +363,50 @@ public sealed class LLamaCorsOptions
     public IReadOnlyList<string> AllowedHeaders { get; set; } = [];
 
     public IReadOnlyList<string> AllowedMethods { get; set; } = [];
+}
+
+public sealed class LLamaEmbeddingModelOptions
+{
+    public string Id { get; set; } = string.Empty;
+
+    public string? ModelPath { get; set; }
+
+    public int? Dimensions { get; set; }
+
+    public int? GpuLayerCount { get; set; }
+
+    public int? Threads { get; set; }
+
+    public int? BatchThreads { get; set; }
+
+    public uint? BatchSize { get; set; }
+
+    public bool? UseMemoryMap { get; set; }
+
+    public bool? UseMemoryLock { get; set; }
+
+    public int? MaxConcurrency { get; set; }
+}
+
+public sealed class LLamaEmbeddingModelRuntimeOptions
+{
+    public string Id { get; init; } = string.Empty;
+
+    public string? ModelPath { get; init; }
+
+    public int Dimensions { get; init; }
+
+    public int GpuLayerCount { get; init; }
+
+    public int? Threads { get; init; }
+
+    public int? BatchThreads { get; init; }
+
+    public uint BatchSize { get; init; } = 512;
+
+    public bool UseMemoryMap { get; init; } = true;
+
+    public bool UseMemoryLock { get; init; }
+
+    public int MaxConcurrency { get; init; } = 1;
 }

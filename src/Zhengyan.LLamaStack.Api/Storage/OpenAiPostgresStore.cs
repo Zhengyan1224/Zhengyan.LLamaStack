@@ -1,22 +1,23 @@
 using System.Data;
 using System.Text.Json;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Options;
+using Npgsql;
 using Zhengyan.LLamaStack.Api.Inference;
 using Zhengyan.LLamaStack.Api.OpenAi;
 using Zhengyan.LLamaStack.Api.Options;
 
 namespace Zhengyan.LLamaStack.Api.Storage;
 
-public sealed class OpenAiSqliteStore : IOpenAiStore
+public sealed class OpenAiPostgresStore : IOpenAiStore
 {
     private readonly string _connectionString;
     private readonly SemaphoreSlim _schemaLock = new(1, 1);
     private bool _schemaReady;
 
-    public OpenAiSqliteStore(IOptions<LLamaStackOptions> options)
+    public OpenAiPostgresStore(IOptions<LLamaStackOptions> options)
     {
-        _connectionString = CreateConnectionString(options.Value.Store);
+        _connectionString = options.Value.Store.ConnectionString
+            ?? "Host=localhost;Database=llamastack;Username=postgres;Password=postgres";
     }
 
     public async Task AddChatCompletionAsync(
@@ -31,28 +32,35 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            INSERT OR REPLACE INTO chat_completions
-                (id, created, model, metadata_json, user, service_tier, store, messages_json, output_text,
+            INSERT INTO chat_completions
+                (id, created, model, metadata_json, "user", service_tier, store, messages_json, output_text,
                  tool_calls_json, finish_reason, prompt_tokens, completion_tokens, compatibility_warnings_json)
             VALUES
-                ($id, $created, $model, $metadata_json, $user, $service_tier, $store, $messages_json, $output_text,
-                 $tool_calls_json, $finish_reason, $prompt_tokens, $completion_tokens, $compatibility_warnings_json);
+                ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                 $10, $11, $12, $13, $14)
+            ON CONFLICT (id) DO UPDATE SET
+                output_text = EXCLUDED.output_text,
+                tool_calls_json = EXCLUDED.tool_calls_json,
+                finish_reason = EXCLUDED.finish_reason,
+                prompt_tokens = EXCLUDED.prompt_tokens,
+                completion_tokens = EXCLUDED.completion_tokens,
+                compatibility_warnings_json = EXCLUDED.compatibility_warnings_json;
             """;
 
-        AddParameter(command, "$id", id);
-        AddParameter(command, "$created", created);
-        AddParameter(command, "$model", completion.Model);
-        AddParameter(command, "$metadata_json", SerializeNullable(completion.Metadata));
-        AddParameter(command, "$user", completion.User);
-        AddParameter(command, "$service_tier", completion.ServiceTier);
-        AddParameter(command, "$store", 1);
-        AddParameter(command, "$messages_json", Serialize(request.Messages));
-        AddParameter(command, "$output_text", completion.Text);
-        AddParameter(command, "$tool_calls_json", Serialize(completion.ToolCalls));
-        AddParameter(command, "$finish_reason", completion.FinishReason);
-        AddParameter(command, "$prompt_tokens", completion.PromptTokens);
-        AddParameter(command, "$completion_tokens", completion.CompletionTokens);
-        AddParameter(command, "$compatibility_warnings_json", Serialize(completion.CompatibilityWarnings));
+        command.Parameters.AddWithValue("$1", id);
+        command.Parameters.AddWithValue("$2", created);
+        command.Parameters.AddWithValue("$3", completion.Model);
+        command.Parameters.AddWithValue("$4", (object?)SerializeNullable(completion.Metadata) ?? DBNull.Value);
+        command.Parameters.AddWithValue("$5", (object?)completion.User ?? DBNull.Value);
+        command.Parameters.AddWithValue("$6", (object?)completion.ServiceTier ?? DBNull.Value);
+        command.Parameters.AddWithValue("$7", 1);
+        command.Parameters.AddWithValue("$8", Serialize(request.Messages));
+        command.Parameters.AddWithValue("$9", completion.Text);
+        command.Parameters.AddWithValue("$10", Serialize(completion.ToolCalls));
+        command.Parameters.AddWithValue("$11", completion.FinishReason);
+        command.Parameters.AddWithValue("$12", completion.PromptTokens);
+        command.Parameters.AddWithValue("$13", completion.CompletionTokens);
+        command.Parameters.AddWithValue("$14", Serialize(completion.CompatibilityWarnings));
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -63,12 +71,13 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         CancellationToken cancellationToken)
     {
         await EnsureSchemaAsync(cancellationToken);
+        var safeLimit = Math.Clamp(limit, 1, 100);
         var all = new List<StoredChatCompletion>();
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT id, created, model, metadata_json, user, service_tier, store, messages_json, output_text,
+            SELECT id, created, model, metadata_json, "user", service_tier, store, messages_json, output_text,
                    tool_calls_json, finish_reason, prompt_tokens, completion_tokens, compatibility_warnings_json
             FROM chat_completions
             ORDER BY created DESC, id ASC;
@@ -80,7 +89,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             all.Add(ReadChatCompletion(reader));
         }
 
-        var result = OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.Created, limit, after, before);
+        var result = OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.Created, safeLimit, after, before);
         return new StoredListResult<StoredChatCompletion>(result.Items, result.HasMore);
     }
 
@@ -91,12 +100,12 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT id, created, model, metadata_json, user, service_tier, store, messages_json, output_text,
+            SELECT id, created, model, metadata_json, "user", service_tier, store, messages_json, output_text,
                    tool_calls_json, finish_reason, prompt_tokens, completion_tokens, compatibility_warnings_json
             FROM chat_completions
-            WHERE id = $id;
+            WHERE id = $1;
             """;
-        AddParameter(command, "$id", id);
+        command.Parameters.AddWithValue("$1", id);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         return await reader.ReadAsync(cancellationToken) ? ReadChatCompletion(reader) : null;
     }
@@ -109,9 +118,9 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await EnsureSchemaAsync(cancellationToken);
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "UPDATE chat_completions SET metadata_json = $metadata_json WHERE id = $id;";
-        AddParameter(command, "$id", id);
-        AddParameter(command, "$metadata_json", SerializeNullable(metadata));
+        command.CommandText = "UPDATE chat_completions SET metadata_json = $1 WHERE id = $2;";
+        command.Parameters.AddWithValue("$1", (object?)SerializeNullable(metadata) ?? DBNull.Value);
+        command.Parameters.AddWithValue("$2", id);
         var affected = await command.ExecuteNonQueryAsync(cancellationToken);
         return affected == 0 ? null : await GetChatCompletionAsync(id, cancellationToken);
     }
@@ -121,8 +130,8 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await EnsureSchemaAsync(cancellationToken);
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "DELETE FROM chat_completions WHERE id = $id;";
-        AddParameter(command, "$id", id);
+        command.CommandText = "DELETE FROM chat_completions WHERE id = $1;";
+        command.Parameters.AddWithValue("$1", id);
         return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
@@ -160,29 +169,36 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            INSERT OR REPLACE INTO responses
-                (id, created_at, status, model, metadata_json, user, service_tier, store, previous_response_id,
+            INSERT INTO responses
+                (id, created_at, status, model, metadata_json, "user", service_tier, store, previous_response_id,
                  input_messages_json, output_text, tool_calls_json, input_tokens, output_tokens, compatibility_warnings_json)
             VALUES
-                ($id, $created_at, $status, $model, $metadata_json, $user, $service_tier, $store, $previous_response_id,
-                 $input_messages_json, $output_text, $tool_calls_json, $input_tokens, $output_tokens, $compatibility_warnings_json);
+                ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                 $10, $11, $12, $13, $14, $15)
+            ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status,
+                output_text = EXCLUDED.output_text,
+                tool_calls_json = EXCLUDED.tool_calls_json,
+                input_tokens = EXCLUDED.input_tokens,
+                output_tokens = EXCLUDED.output_tokens,
+                compatibility_warnings_json = EXCLUDED.compatibility_warnings_json;
             """;
 
-        AddParameter(command, "$id", response.Id);
-        AddParameter(command, "$created_at", response.CreatedAt);
-        AddParameter(command, "$status", response.Status);
-        AddParameter(command, "$model", response.Model);
-        AddParameter(command, "$metadata_json", SerializeNullable(response.Metadata));
-        AddParameter(command, "$user", response.User);
-        AddParameter(command, "$service_tier", response.ServiceTier);
-        AddParameter(command, "$store", response.Store ? 1 : 0);
-        AddParameter(command, "$previous_response_id", response.PreviousResponseId);
-        AddParameter(command, "$input_messages_json", Serialize(response.InputMessages));
-        AddParameter(command, "$output_text", response.OutputText);
-        AddParameter(command, "$tool_calls_json", Serialize(response.ToolCalls));
-        AddParameter(command, "$input_tokens", response.InputTokens);
-        AddParameter(command, "$output_tokens", response.OutputTokens);
-        AddParameter(command, "$compatibility_warnings_json", Serialize(response.CompatibilityWarnings));
+        command.Parameters.AddWithValue("$1", response.Id);
+        command.Parameters.AddWithValue("$2", response.CreatedAt);
+        command.Parameters.AddWithValue("$3", response.Status);
+        command.Parameters.AddWithValue("$4", response.Model);
+        command.Parameters.AddWithValue("$5", (object?)SerializeNullable(response.Metadata) ?? DBNull.Value);
+        command.Parameters.AddWithValue("$6", (object?)response.User ?? DBNull.Value);
+        command.Parameters.AddWithValue("$7", (object?)response.ServiceTier ?? DBNull.Value);
+        command.Parameters.AddWithValue("$8", response.Store ? 1 : 0);
+        command.Parameters.AddWithValue("$9", (object?)response.PreviousResponseId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$10", Serialize(response.InputMessages));
+        command.Parameters.AddWithValue("$11", response.OutputText);
+        command.Parameters.AddWithValue("$12", Serialize(response.ToolCalls));
+        command.Parameters.AddWithValue("$13", response.InputTokens);
+        command.Parameters.AddWithValue("$14", response.OutputTokens);
+        command.Parameters.AddWithValue("$15", Serialize(response.CompatibilityWarnings));
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -193,12 +209,13 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         CancellationToken cancellationToken)
     {
         await EnsureSchemaAsync(cancellationToken);
+        var safeLimit = Math.Clamp(limit, 1, 100);
         var all = new List<StoredResponse>();
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT id, created_at, status, model, metadata_json, user, service_tier, store, previous_response_id,
+            SELECT id, created_at, status, model, metadata_json, "user", service_tier, store, previous_response_id,
                    input_messages_json, output_text, tool_calls_json, input_tokens, output_tokens, compatibility_warnings_json
             FROM responses
             ORDER BY created_at DESC, id ASC;
@@ -210,7 +227,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             all.Add(ReadResponse(reader));
         }
 
-        var result = OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.CreatedAt, limit, after, before);
+        var result = OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.CreatedAt, safeLimit, after, before);
         return new StoredListResult<StoredResponse>(result.Items, result.HasMore);
     }
 
@@ -221,12 +238,12 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT id, created_at, status, model, metadata_json, user, service_tier, store, previous_response_id,
+            SELECT id, created_at, status, model, metadata_json, "user", service_tier, store, previous_response_id,
                    input_messages_json, output_text, tool_calls_json, input_tokens, output_tokens, compatibility_warnings_json
             FROM responses
-            WHERE id = $id;
+            WHERE id = $1;
             """;
-        AddParameter(command, "$id", id);
+        command.Parameters.AddWithValue("$1", id);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         return await reader.ReadAsync(cancellationToken) ? ReadResponse(reader) : null;
     }
@@ -236,8 +253,8 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await EnsureSchemaAsync(cancellationToken);
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "DELETE FROM responses WHERE id = $id;";
-        AddParameter(command, "$id", id);
+        command.CommandText = "DELETE FROM responses WHERE id = $1;";
+        command.Parameters.AddWithValue("$1", id);
         return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
@@ -246,8 +263,8 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await EnsureSchemaAsync(cancellationToken);
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "UPDATE responses SET status = 'cancelled' WHERE id = $id;";
-        AddParameter(command, "$id", id);
+        command.CommandText = "UPDATE responses SET status = 'cancelled' WHERE id = $1;";
+        command.Parameters.AddWithValue("$1", id);
         var affected = await command.ExecuteNonQueryAsync(cancellationToken);
         return affected == 0 ? null : await GetResponseAsync(id, cancellationToken);
     }
@@ -257,39 +274,31 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         await EnsureSchemaAsync(cancellationToken);
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "UPDATE responses SET metadata_json = $metadata_json WHERE id = $id;";
-        AddParameter(command, "$id", id);
-        AddParameter(command, "$metadata_json", SerializeNullable(metadata));
+        command.CommandText = "UPDATE responses SET metadata_json = $1 WHERE id = $2;";
+        command.Parameters.AddWithValue("$1", (object?)SerializeNullable(metadata) ?? DBNull.Value);
+        command.Parameters.AddWithValue("$2", id);
         var affected = await command.ExecuteNonQueryAsync(cancellationToken);
         return affected == 0 ? null : await GetResponseAsync(id, cancellationToken);
     }
 
     private async Task EnsureSchemaAsync(CancellationToken cancellationToken)
     {
-        if (_schemaReady)
-        {
-            return;
-        }
-
+        if (_schemaReady) return;
         await _schemaLock.WaitAsync(cancellationToken);
         try
         {
-            if (_schemaReady)
-            {
-                return;
-            }
-
+            if (_schemaReady) return;
             await using var connection = await OpenConnectionAsync(cancellationToken);
-            await ExecuteNonQueryAsync(connection, "PRAGMA journal_mode = WAL;", cancellationToken);
-            await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys = ON;", cancellationToken);
-            await ExecuteNonQueryAsync(connection,
+
+            await using var cmd1 = connection.CreateCommand();
+            cmd1.CommandText =
                 """
                 CREATE TABLE IF NOT EXISTS chat_completions (
                     id TEXT PRIMARY KEY,
-                    created INTEGER NOT NULL,
+                    created BIGINT NOT NULL,
                     model TEXT NOT NULL,
                     metadata_json TEXT NULL,
-                    user TEXT NULL,
+                    "user" TEXT NULL,
                     service_tier TEXT NULL,
                     store INTEGER NOT NULL,
                     messages_json TEXT NOT NULL,
@@ -300,23 +309,27 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
                     completion_tokens INTEGER NOT NULL,
                     compatibility_warnings_json TEXT NOT NULL
                 );
-                """,
-                cancellationToken);
-            await ExecuteNonQueryAsync(connection,
+                """;
+            await cmd1.ExecuteNonQueryAsync(cancellationToken);
+
+            await using var cmd2 = connection.CreateCommand();
+            cmd2.CommandText =
                 """
                 CREATE INDEX IF NOT EXISTS idx_chat_completions_created_id
                 ON chat_completions (created DESC, id ASC);
-                """,
-                cancellationToken);
-            await ExecuteNonQueryAsync(connection,
+                """;
+            await cmd2.ExecuteNonQueryAsync(cancellationToken);
+
+            await using var cmd3 = connection.CreateCommand();
+            cmd3.CommandText =
                 """
                 CREATE TABLE IF NOT EXISTS responses (
                     id TEXT PRIMARY KEY,
-                    created_at INTEGER NOT NULL,
+                    created_at BIGINT NOT NULL,
                     status TEXT NOT NULL,
                     model TEXT NOT NULL,
                     metadata_json TEXT NULL,
-                    user TEXT NULL,
+                    "user" TEXT NULL,
                     service_tier TEXT NULL,
                     store INTEGER NOT NULL,
                     previous_response_id TEXT NULL,
@@ -327,20 +340,24 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
                     output_tokens INTEGER NOT NULL,
                     compatibility_warnings_json TEXT NOT NULL
                 );
-                """,
-                cancellationToken);
-            await ExecuteNonQueryAsync(connection,
+                """;
+            await cmd3.ExecuteNonQueryAsync(cancellationToken);
+
+            await using var cmd4 = connection.CreateCommand();
+            cmd4.CommandText =
                 """
                 CREATE INDEX IF NOT EXISTS idx_responses_created_id
                 ON responses (created_at DESC, id ASC);
-                """,
-                cancellationToken);
-            await ExecuteNonQueryAsync(connection,
+                """;
+            await cmd4.ExecuteNonQueryAsync(cancellationToken);
+
+            await using var cmd5 = connection.CreateCommand();
+            cmd5.CommandText =
                 """
                 CREATE INDEX IF NOT EXISTS idx_responses_previous_response_id
                 ON responses (previous_response_id);
-                """,
-                cancellationToken);
+                """;
+            await cmd5.ExecuteNonQueryAsync(cancellationToken);
 
             _schemaReady = true;
         }
@@ -350,18 +367,11 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         }
     }
 
-    private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+    private async Task<NpgsqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
-        var connection = new SqliteConnection(_connectionString);
+        var connection = new NpgsqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
         return connection;
-    }
-
-    private static async Task ExecuteNonQueryAsync(SqliteConnection connection, string commandText, CancellationToken cancellationToken)
-    {
-        await using var command = connection.CreateCommand();
-        command.CommandText = commandText;
-        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static StoredChatCompletion ReadChatCompletion(IDataRecord reader)
@@ -374,7 +384,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             Metadata = DeserializeNullable<IReadOnlyDictionary<string, string>>(reader, 3),
             User = GetNullableString(reader, 4),
             ServiceTier = GetNullableString(reader, 5),
-            Store = reader.GetInt64(6) == 1,
+            Store = reader.GetInt32(6) == 1,
             Messages = Deserialize<IReadOnlyList<InferenceMessage>>(reader.GetString(7)),
             OutputText = reader.GetString(8),
             ToolCalls = Deserialize<IReadOnlyList<OpenAiToolCall>>(reader.GetString(9)),
@@ -396,7 +406,7 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             Metadata = DeserializeNullable<IReadOnlyDictionary<string, string>>(reader, 4),
             User = GetNullableString(reader, 5),
             ServiceTier = GetNullableString(reader, 6),
-            Store = reader.GetInt64(7) == 1,
+            Store = reader.GetInt32(7) == 1,
             PreviousResponseId = GetNullableString(reader, 8),
             InputMessages = Deserialize<IReadOnlyList<InferenceMessage>>(reader.GetString(9)),
             OutputText = reader.GetString(10),
@@ -405,34 +415,6 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
             OutputTokens = reader.GetInt32(13),
             CompatibilityWarnings = Deserialize<IReadOnlyList<string>>(reader.GetString(14))
         };
-    }
-
-    private static string CreateConnectionString(LLamaStoreOptions options)
-    {
-        if (!string.IsNullOrWhiteSpace(options.ConnectionString))
-        {
-            return options.ConnectionString;
-        }
-
-        var path = string.IsNullOrWhiteSpace(options.SqlitePath) ? "data/llamastack.db" : options.SqlitePath;
-        var directory = Path.GetDirectoryName(Path.GetFullPath(path));
-        if (!string.IsNullOrWhiteSpace(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
-
-        var builder = new SqliteConnectionStringBuilder
-        {
-            DataSource = path,
-            Mode = SqliteOpenMode.ReadWriteCreate,
-            Cache = SqliteCacheMode.Shared
-        };
-        return builder.ToString();
-    }
-
-    private static void AddParameter(SqliteCommand command, string name, object? value)
-    {
-        command.Parameters.AddWithValue(name, value ?? DBNull.Value);
     }
 
     private static string Serialize<T>(T value)
@@ -457,22 +439,22 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
 
     public Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Sqlite store. Use Memory store instead.");
+        throw new NotSupportedException("Response task management is not supported in Postgres store. Use Memory store instead.");
     }
 
     public Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Sqlite store. Use Memory store instead.");
+        throw new NotSupportedException("Response task management is not supported in Postgres store. Use Memory store instead.");
     }
 
     public Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default)
     {
-        throw new NotSupportedException("Response task management is not supported in Sqlite store. Use Memory store instead.");
+        throw new NotSupportedException("Response task management is not supported in Postgres store. Use Memory store instead.");
     }
 
     public Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Sqlite store. Use Memory store instead.");
+        throw new NotSupportedException("Response task management is not supported in Postgres store. Use Memory store instead.");
     }
 
     private static string? GetNullableString(IDataRecord reader, int index)

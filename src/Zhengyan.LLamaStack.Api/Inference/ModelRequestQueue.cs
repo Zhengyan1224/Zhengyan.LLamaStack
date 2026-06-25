@@ -16,7 +16,7 @@ public sealed class ModelRequestQueue
 {
     private readonly object _lock = new();
     private readonly LinkedList<QueueEntry> _queue = new();
-    private readonly int _maxConcurrency;
+    private int _maxConcurrency;
     private int _activeCount;
 
     public ModelRequestQueue(int maxConcurrency = 1)
@@ -99,6 +99,15 @@ public sealed class ModelRequestQueue
         lock (_lock)
         {
             return _queue.FirstOrDefault(e => string.Equals(e.Id, entryId, StringComparison.Ordinal));
+        }
+    }
+
+    public void SetMaxConcurrency(int maxConcurrency)
+    {
+        lock (_lock)
+        {
+            _maxConcurrency = Math.Max(1, maxConcurrency);
+            SignalNext();
         }
     }
 }

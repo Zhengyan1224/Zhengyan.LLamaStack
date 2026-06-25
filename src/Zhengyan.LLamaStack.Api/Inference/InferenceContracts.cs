@@ -40,6 +40,10 @@ public sealed class InferenceRequest
 
     public bool ForceJson { get; set; }
 
+    public string? JsonSchema { get; set; }
+
+    public bool StrictJsonSchema { get; set; }
+
     public bool StreamIncludeUsage { get; set; }
 
     public bool? Store { get; set; }
@@ -61,6 +65,8 @@ public sealed class InferenceRequest
     public string? ReasoningEffort { get; set; }
 
     public string? Prompt { get; set; }
+
+    public IReadOnlyDictionary<int, float>? LogitBias { get; set; }
 
     public int ChoiceIndex { get; set; }
 
@@ -107,6 +113,8 @@ public sealed class InferenceRequest
         target.Seed = Seed;
         target.Stop = Stop;
         target.ForceJson = ForceJson;
+        target.JsonSchema = JsonSchema;
+        target.StrictJsonSchema = StrictJsonSchema;
         target.StreamIncludeUsage = StreamIncludeUsage;
         target.Store = Store;
         target.User = User;
@@ -118,6 +126,7 @@ public sealed class InferenceRequest
         target.Include = Include;
         target.ReasoningEffort = ReasoningEffort;
         target.Prompt = Prompt;
+        target.LogitBias = LogitBias;
         target.ChoiceIndex = ChoiceIndex;
         target.CompatibilityWarnings = CompatibilityWarnings;
     }
@@ -200,6 +209,8 @@ public sealed class ToolRound
     public IReadOnlyList<ToolResult> Results { get; init; } = [];
 }
 
+public sealed record ModelMemoryInfo(long WeightBytes, long ContextBytes, long TotalBytes, bool IsLoaded);
+
 public sealed class EmbeddingResult
 {
     public IReadOnlyList<EmbeddingData> Data { get; init; } = [];
@@ -233,4 +244,6 @@ public sealed class ModelDescriptor
     public string? MmprojPath { get; init; }
 
     public object Capabilities { get; init; } = new();
+
+    public int EmbeddingDimensions { get; init; }
 }

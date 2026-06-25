@@ -51,13 +51,15 @@ public static class OpenAiStoreHelpers
         Func<T, long> createdSelector,
         int limit,
         string? after,
-        string? before)
+        string? before,
+        string? order = null)
     {
         var safeLimit = Math.Clamp(limit, 1, 100);
-        var ordered = values
-            .OrderByDescending(createdSelector)
-            .ThenBy(idSelector, StringComparer.Ordinal)
-            .ToArray();
+        var isAsc = string.Equals(order, "asc", StringComparison.OrdinalIgnoreCase);
+
+        var ordered = isAsc
+            ? values.OrderBy(createdSelector).ThenBy(idSelector, StringComparer.Ordinal).ToArray()
+            : values.OrderByDescending(createdSelector).ThenBy(idSelector, StringComparer.Ordinal).ToArray();
 
         if (!string.IsNullOrWhiteSpace(after))
         {

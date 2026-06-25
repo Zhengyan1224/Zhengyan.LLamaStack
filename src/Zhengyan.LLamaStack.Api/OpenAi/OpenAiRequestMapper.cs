@@ -73,12 +73,15 @@ public sealed class OpenAiRequestMapper
             FrequencyPenalty = ToSingle(request.FrequencyPenalty),
             Seed = request.Seed is null ? null : unchecked((uint)request.Seed.Value),
             Stop = ParseStop(request.Stop),
-            ForceJson = IsJsonResponseFormat(request.ResponseFormat),
-            StreamIncludeUsage = request.StreamOptions?.IncludeUsage == true,
+        JsonSchema = ParseJsonSchema(request.ResponseFormat),
+        StrictJsonSchema = IsStrictJsonSchema(request.ResponseFormat),
+        ForceJson = IsJsonResponseFormat(request.ResponseFormat),
+        StreamIncludeUsage = request.StreamOptions?.IncludeUsage == true,
             Store = request.Store,
             User = request.User,
             ServiceTier = request.ServiceTier,
             ParallelToolCalls = request.ParallelToolCalls,
+            LogitBias = ParseLogitBias(request.LogitBias),
             Metadata = ParseMetadata(request.Metadata),
             CompatibilityWarnings = warnings
         };
@@ -110,8 +113,6 @@ public sealed class OpenAiRequestMapper
 
         ValidateUnsupportedResponsesFields(request);
         var warnings = new List<string>();
-        AddWarningIf(request.Background == true, warnings, "`background` is accepted but background execution is not implemented yet.");
-        AddWarningIf(request.Conversation is not null, warnings, "`conversation` is accepted but persistent conversations are not implemented yet.");
         return new InferenceRequest
         {
             RequestedModel = request.Model,
@@ -127,6 +128,8 @@ public sealed class OpenAiRequestMapper
             FrequencyPenalty = ToSingle(request.FrequencyPenalty),
             Seed = request.Seed is null ? null : unchecked((uint)request.Seed.Value),
             Stop = ParseStop(request.Stop),
+            JsonSchema = ParseResponsesJsonSchema(request.Text),
+            StrictJsonSchema = IsStrictResponsesJsonSchema(request.Text),
             ForceJson = IsResponsesJsonMode(request.Text),
             StreamIncludeUsage = request.StreamOptions?.IncludeUsage == true,
             Store = request.Store,
@@ -468,6 +471,69 @@ public sealed class OpenAiRequestMapper
             || string.Equals(type, "json_schema", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static string? ParseJsonSchema(JsonElement? responseFormat)
+    {
+        if (responseFormat is null || responseFormat.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var type = GetString(responseFormat.Value, "type");
+        if (!string.Equals(type, "json_schema", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (!responseFormat.Value.TryGetProperty("json_schema", out var jsonSchema) ||
+            jsonSchema.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        if (jsonSchema.TryGetProperty("schema", out var schema) &&
+            schema.ValueKind == JsonValueKind.Object)
+        {
+            return schema.GetRawText();
+        }
+
+        if (jsonSchema.TryGetProperty("name", out var name) &&
+            name.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(name.GetString()))
+        {
+            return $"{{\"type\":\"object\",\"title\":\"{name.GetString()}\"}}";
+        }
+
+        return null;
+    }
+
+    private static bool IsStrictJsonSchema(JsonElement? responseFormat)
+    {
+        if (responseFormat is null || responseFormat.Value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        var type = GetString(responseFormat.Value, "type");
+        if (!string.Equals(type, "json_schema", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!responseFormat.Value.TryGetProperty("json_schema", out var jsonSchema) ||
+            jsonSchema.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (jsonSchema.TryGetProperty("strict", out var strict) &&
+            strict.ValueKind == JsonValueKind.True)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
     private static bool IsResponsesJsonMode(JsonElement? text)
     {
         if (text is null || text.Value.ValueKind != JsonValueKind.Object)
@@ -483,6 +549,52 @@ public sealed class OpenAiRequestMapper
         var type = GetString(format, "type");
         return string.Equals(type, "json_object", StringComparison.OrdinalIgnoreCase)
             || string.Equals(type, "json_schema", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? ParseResponsesJsonSchema(JsonElement? text)
+    {
+        if (text is null || text.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        if (!text.Value.TryGetProperty("format", out var format) || format.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var type = GetString(format, "type");
+        if (!string.Equals(type, "json_schema", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (!format.TryGetProperty("schema", out var schema) || schema.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        return schema.GetRawText();
+    }
+
+    private static bool IsStrictResponsesJsonSchema(JsonElement? text)
+    {
+        if (text is null || text.Value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!text.Value.TryGetProperty("format", out var format) || format.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!format.TryGetProperty("strict", out var strict) || strict.ValueKind != JsonValueKind.True)
+        {
+            return false;
+        }
+
+        return string.Equals(GetString(format, "type"), "json_schema", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string? DescribeToolChoice(JsonElement? toolChoice)
@@ -533,7 +645,11 @@ public sealed class OpenAiRequestMapper
 
         if (request.LogitBias is not null && request.LogitBias.Value.ValueKind != JsonValueKind.Null)
         {
-            warnings.Add("`logit_bias` is accepted but not supported by this LLamaSharp service yet.");
+            var parsed = ParseLogitBias(request.LogitBias);
+            if (parsed is null || parsed.Count == 0)
+            {
+                warnings.Add("`logit_bias` could not be parsed; expected a JSON object with integer token IDs as keys and float biases as values.");
+            }
         }
 
         if (request.Modalities is { Count: > 0 } && request.Modalities.Any(x => !string.Equals(x, "text", StringComparison.OrdinalIgnoreCase)))
@@ -556,6 +672,25 @@ public sealed class OpenAiRequestMapper
             if (item.ValueKind == JsonValueKind.String)
             {
                 result.Add(item.GetString()!);
+            }
+        }
+
+        return result.Count > 0 ? result : null;
+    }
+
+    private static IReadOnlyDictionary<int, float>? ParseLogitBias(JsonElement? logitBias)
+    {
+        if (logitBias is null || logitBias.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var result = new Dictionary<int, float>();
+        foreach (var property in logitBias.Value.EnumerateObject())
+        {
+            if (int.TryParse(property.Name, out var tokenId) && property.Value.ValueKind == JsonValueKind.Number)
+            {
+                result[tokenId] = property.Value.GetSingle();
             }
         }
 

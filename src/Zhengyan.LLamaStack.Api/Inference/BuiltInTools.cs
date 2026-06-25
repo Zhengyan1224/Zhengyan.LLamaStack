@@ -7,6 +7,30 @@ public sealed class CalculatorTool : IAgentTool
 {
     public string Name => "calculator";
 
+    public string? Description => "Evaluates a mathematical expression and returns the computed result. Supports basic arithmetic: +, -, *, /, and parentheses.";
+
+    public JsonElement? Parameters { get; }
+
+    public int TimeoutSeconds => 15;
+
+    public IReadOnlyList<string> RequiredPermissions => [];
+
+    public CalculatorTool()
+    {
+        Parameters = JsonDocument.Parse("""
+            {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "The mathematical expression to evaluate (e.g. \"2 + 3 * 4\")"
+                    }
+                },
+                "required": ["expression"]
+            }
+            """).RootElement;
+    }
+
     public Task<string> ExecuteAsync(string argumentsJson, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -37,6 +61,29 @@ public sealed class CalculatorTool : IAgentTool
 public sealed class CurrentTimeTool : IAgentTool
 {
     public string Name => "current_time";
+
+    public string? Description => "Returns the current date and time. Optionally supports timezone conversion by IANA timezone name (e.g. \"Asia/Shanghai\", \"America/New_York\").";
+
+    public JsonElement? Parameters { get; }
+
+    public int TimeoutSeconds => 10;
+
+    public IReadOnlyList<string> RequiredPermissions => [];
+
+    public CurrentTimeTool()
+    {
+        Parameters = JsonDocument.Parse("""
+            {
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "Optional IANA timezone name (e.g. \"Asia/Shanghai\", \"America/New_York\"). Defaults to UTC if not provided."
+                    }
+                }
+            }
+            """).RootElement;
+    }
 
     public Task<string> ExecuteAsync(string argumentsJson, CancellationToken cancellationToken)
     {

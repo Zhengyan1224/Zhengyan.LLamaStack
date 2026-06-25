@@ -4,7 +4,7 @@ English | [Simplified Chinese](README.md)
 
 `Zhengyan.LLamaStack` is a local large language model inference service built with **.NET 10** and **LLamaSharp**. It runs GGUF models locally and exposes an OpenAI-compatible HTTP API so existing OpenAI SDKs, clients, and tools can gradually move to a local inference runtime.
 
-The current version focuses on `chat/completions`, `responses`, SSE streaming, multi-model registration, `model` routing, model capability declarations, tool-call protocol parsing, multimodal input parsing, and basic in-memory management endpoints. Full OpenAI platform compatibility is still on the roadmap. See [OpenAI Compatibility Roadmap](#openai-compatibility-roadmap).
+The current version covers `chat/completions`, `responses`, `embeddings`, SSE streaming, multi-model registration, `model` routing, tool-call execution, structured outputs, embedding vector extraction, concurrent inference (queuing/dynamic pool size/cancellation/VRAM protection), multimodal input parsing, and persistent storage. See [OpenAI Compatibility Roadmap](#openai-compatibility-roadmap).
 
 ## Table of Contents
 
@@ -54,6 +54,9 @@ The current version focuses on `chat/completions`, `responses`, SSE streaming, m
   - `POST /v1/responses/{response_id}/count_tokens`
   - `POST /v1/responses/input_tokens`
   - `POST /v1/responses/compact`
+  - `GET /v1/responses/tasks/{taskId}`
+  - `POST /v1/chat/completions/{completionId}/cancel`
+  - `POST /v1/models/{modelId}/resize`
   - `POST /chat/completions`
   - `POST /responses`
   - `GET /health`
@@ -65,11 +68,16 @@ The current version focuses on `chat/completions`, `responses`, SSE streaming, m
   - `input_audio`
 - Supports media loading from data URLs, remote URLs, and optionally local file paths.
 - Supports SSE streaming.
-- Supports in-memory Chat/Responses storage and basic management endpoints; stored data is lost after service restart.
-- Parses `tools` and legacy `functions`.
+- Supports Chat/Responses storage (Memory/SQLite/PostgreSQL/Redis) with full management endpoints.
+- Parses and executes `tools` and legacy `functions`.
+- Built-in tools (`calculator`, `current_time`) auto-executed in a multi-turn loop; supports tool registry, hot-loading, timeout, and permission controls.
 - Converts model-emitted tool-call JSON into OpenAI-compatible `tool_calls` / `function_call` response fields.
 - Supports optional `mmproj` / MTMD multimodal projection models.
-- Per-model configurable concurrency (`MaxConcurrency`), shared weights, isolated context/executor instances.
+- Per-model configurable concurrency (`MaxConcurrency`), shared weights, isolated context/executor instances; runtime dynamic pool resizing, request queuing, real-time cancellation, and VRAM protection.
+- Independent embedding model registration and vector extraction with `Dimensions` truncation support.
+- Structured outputs: JSON Schema → GBNF Grammar constrained decoding + strict mode validation.
+- Past-Responses management (`previous_response_id` context continuation, `conversation` sessions, `compact` compression, `background` execution).
+- API Key authentication and CORS configuration.
 
 ## Project Structure
 
@@ -195,6 +203,7 @@ The configuration section is `LLamaStack`. The recommended configuration style i
     "AllowRemoteMedia": true,
     "AllowLocalMediaPaths": false,
     "MaxMediaBytes": 33554432,
+    "MaxVramBytes": 0,
     "Models": [
       {
         "Id": "local-gguf",
@@ -255,15 +264,20 @@ The configuration section is `LLamaStack`. The recommended configuration style i
 | `AllowRemoteMedia` | Allow remote image/audio URLs. |
 | `AllowLocalMediaPaths` | Allow request bodies to reference local media paths. Keep disabled in production unless needed. |
 | `MaxMediaBytes` | Maximum bytes per media input. |
+| `MaxVramBytes` | VRAM budget limit in bytes. `0` means unlimited. Checked before model loading and pool resize. |
 | `Models` | Multi-model registry. Requests are routed by the `model` field. |
 | `Models[].Id` | Public model ID. |
 | `Models[].OwnedBy` | Owner field returned by `/v1/models`. |
 | `Models[].ModelPath` | GGUF file path for that model. |
 | `Models[].MmprojPath` | mmproj file path for that model. |
 | `Models[].Capabilities` | Model capability declaration used by `/v1/models` and request preflight validation. |
-| `MaxConcurrency` | Number of concurrent inference instances per model (default `1`). LLamaWeights are shared; LLamaContext/InteractiveExecutor are isolated. |
+| `MaxConcurrency` | Number of concurrent inference instances per model (default `1`). LLamaWeights are shared; LLamaContext/InteractiveExecutor are isolated. Can be changed at runtime via `POST /v1/models/{id}/resize`. |
+| `EmbeddingModels` | Independent embedding model registry (see details below). |
+| `EmbeddingModels[].Id` | Embedding model ID. |
+| `EmbeddingModels[].ModelPath` | GGUF file path for the embedding model. |
+| `EmbeddingModels[].Dimensions` | Output embedding vector dimension (optional if the model declares it natively). |
 
-Inference settings omitted from `Models[]` inherit from the top-level defaults.
+Inference settings omitted from `Models[]` inherit from the top-level defaults. Embedding models support `GpuLayerCount`, `Threads`, `BatchSize`, `MaxConcurrency`, etc.
 
 ## Model Preparation
 
@@ -345,9 +359,59 @@ Invoke-RestMethod http://localhost:5062/v1/responses `
   -Body $body
 ```
 
+### Embeddings
+
+```powershell
+$body = @{
+  model = "bge-m3"
+  input = "Hello world"
+  dimensions = 512
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod http://localhost:5062/v1/embeddings `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+You can also use a Chat model for embeddings without registering a dedicated embedding model. The service will create a one-shot embedder from the chat model's weights.
+
+### Dynamic Pool Resize
+
+`POST /v1/models/{modelId}/resize` adjusts concurrency without unloading:
+
+```powershell
+$body = @{ max_concurrency = 4 } | ConvertTo-Json
+Invoke-RestMethod http://localhost:5062/v1/models/local-gguf/resize `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+The response includes the new concurrency count and estimated memory usage.
+
+### Request Cancellation
+
+Non-streaming Chat Completions can be cancelled via `POST /v1/chat/completions/{completionId}/cancel`:
+
+```powershell
+$body = @{
+  model = "local-gguf"
+  messages = @(@{ role = "user"; content = "Write a very long story..." })
+} | ConvertTo-Json -Depth 10
+
+$chat = Invoke-RestMethod http://localhost:5062/v1/chat/completions `
+  -Method Post -ContentType "application/json" -Body $body
+
+# Cancel
+Invoke-RestMethod "http://localhost:5062/v1/chat/completions/$($chat.id)/cancel" -Method Post
+```
+
+`POST /v1/responses/{responseId}/cancel` works the same way.
+
 ### Management Endpoints
 
-Chat Completions are stored in local memory only when the request explicitly sets `store = $true`:
+Chat Completions are stored only when the request explicitly sets `store = $true`:
 
 ```powershell
 $body = @{
@@ -398,7 +462,11 @@ Invoke-RestMethod http://localhost:5062/v1/responses `
   -Body $next
 ```
 
-The current management layer uses process memory. It is useful for development and SDK compatibility checks; production deployments should replace it with SQLite, PostgreSQL, Redis, or another durable backend.
+The management layer supports multiple storage backends via `LLamaStack:Store:Provider`:
+- `Memory` (default, in-process, lost on restart)
+- `Sqlite` — set `LLamaStack:Store:SqlitePath`
+- `Postgres` — set `LLamaStack:Store:ConnectionString`
+- `Redis` — set `LLamaStack:Store:ConnectionString`
 
 ### Tool Calling
 
@@ -655,44 +723,44 @@ Then configure:
 
 | Capability | Status |
 | --- | --- |
-| `GET /v1/models` | Multi-model list, load status, and capability declarations implemented. |
+| `GET /v1/models` | Multi-model list, load status, capability declarations, and embedding dimensions implemented. |
 | `POST /v1/chat/completions` | Basic non-streaming and streaming inference implemented. |
 | `POST /v1/responses` | Basic non-streaming and streaming inference implemented. |
-| `POST /v1/embeddings` | Implemented via LLamaEmbedder. |
+| `POST /v1/embeddings` | Implemented via LLamaEmbedder; independent embedding model registration and `Dimensions` truncation supported. |
 | `POST /v1/tokenize` / `POST /v1/detokenize` | Tokenization and detokenization implemented. |
 | `GET /v1/health` | Health check with model load status. |
 | `POST /v1/models/{model_id}/load` / `unload` | Runtime model hot load and unload implemented. |
+| `POST /v1/models/{model_id}/resize` | Runtime dynamic pool resize with VRAM budget check implemented. |
 | `GET /v1/queue/{entry_id}` | Queue status lookup implemented. |
 | OpenAI-style error payloads | Implemented for main service errors. |
 | Text message/content parsing | Implemented. |
 | Image and audio input parsing | Implemented at request level; requires `MmprojPath`. |
 | `tools` / `functions` request parsing | Implemented. |
-| Tool-call execution | `calculator` and `current_time` built-in tools executed in a multi-turn loop; `parallel_tool_calls` supported. |
-| `response_format` / JSON mode | Partially implemented through prompt constraints. |
-| usage token counts | Partially implemented with LLamaSharp tokenizer estimation. |
+| Tool-call execution | `calculator` and `current_time` built-in tools executed in a multi-turn loop; `parallel_tool_calls` supported; tool registry (`IToolRegistry`), hot-load, timeout, permission control, and output validation. |
+| `response_format` / JSON mode | Fully implemented: JSON Schema → GBNF Grammar constrained decoding + strict mode (`ValidateJsonOutput`) recursive validation. |
+| usage token counts | Fully implemented: streaming includes real-time token counts, non-streaming provides exact counts. |
 | Multi-model registry and `model` routing | Implemented, with legacy single-model configuration compatibility. |
 | Model capability declarations | Implemented for `/v1/models` and request preflight validation. |
 | Chat protocol fields | Accepts `metadata`, `user`, `store`, `service_tier`, `parallel_tool_calls`, and `stream_options.include_usage`; unsupported `logprobs` / `logit_bias` return compatibility warnings. |
-| Chat management endpoints | Implemented in process memory: list, retrieve, update metadata, delete, and messages. |
-| Responses protocol fields | Accepts `previous_response_id`, `conversation`, `background`, `reasoning`, `metadata`, `truncation`, `include`, `store`, and `parallel_tool_calls`; `previous_response_id` can continue from the local in-memory store. |
-| Responses management endpoints | Implemented in process memory: list, retrieve, update metadata, delete, cancel, input_items, input_tokens, count_tokens, and compact. |
+| Chat management endpoints | Implemented (Memory/SQLite/PostgreSQL/Redis backends): list, retrieve, update metadata, delete, messages. |
+| Responses protocol fields | Accepts `previous_response_id`, `conversation`, `background`, `reasoning`, `metadata`, `truncation`, `include`, `store`, and `parallel_tool_calls`; `previous_response_id` continues context from store. |
+| Responses management endpoints | Implemented (Memory/SQLite/PostgreSQL/Redis backends): list, retrieve, update metadata, delete, cancel, input_items, input_tokens, count_tokens, compact (with TASK state machine), tasks query. |
+| Response background execution | Implemented via `background: true` + `Channel`-based background queue. |
+| Conversation management | `ConversationStore` implemented; `conversation` field auto-resolves `previous_response_id`. |
 | API key authentication | Optional Bearer token middleware implemented (`LLamaStack:Auth`). |
 | CORS | Optional cross-origin configuration implemented (`LLamaStack:Cors`). |
+| Embedding model registration | Via `LLamaStack:EmbeddingModels[]` config; supports `Dimensions`, `MaxConcurrency`, GPU layers, etc. |
+| Concurrent inference | Two-tier concurrency control: `ModelRequestQueue` (FIFO) → `ModelRuntime` (SemaphoreSlim pool). Dynamic pool resize, request queuing, real-time cancellation (`ResponseExecutionTracker`), and VRAM protection (`MaxVramBytes`). |
+| Storage backends | Supports Memory, SQLite, PostgreSQL, and Redis providers. |
 
 ### Missing for Full OpenAI Protocol Coverage
 
 | Area | Gap | Plan |
 | --- | --- | --- |
-| Chat Completions | Most common fields are accepted and `stream_options.include_usage` emits a basic usage chunk; `logprobs`, `top_logprobs`, and `logit_bias` do not have real sampler support yet. | Verify LLamaSharp logits/logprobs support; add more complete streaming usage accounting. |
-| Chat management endpoints | Basic in-memory endpoints are implemented, but data is lost after restart; streaming Chat responses are not stored yet. | Add a storage abstraction with SQLite/PostgreSQL/Redis backends; persist streaming outputs and complete cursor pagination. |
-| Responses API | An in-memory store and `previous_response_id` continuation are implemented; `conversation`, `background`, real cancellation, and truncation policy still degrade for compatibility. | Design a durable response store, conversation state, background job queue, real cancellation, and context truncation policy. |
-| Responses management endpoints | retrieve/delete/cancel/input_items/token count/compact have basic in-memory implementations; `compact` currently creates a context snapshot and does not run model-based summarization. | Add durable storage, a task state machine, model-driven compact, exact token counts, and SDK-compatible pagination. |
-| Tool calling | Two built-in tools (`calculator`, `current_time`) are executed in a multi-turn loop with `parallel_tool_calls` support; unknown tools are returned to the client without execution. | Add a tool registry, hot-loadable tools, timeout/permission controls, structured output validation, and a custom tool interface. |
-| Structured Outputs | Strict JSON Schema constrained decoding is not implemented. | Integrate llama.cpp/LLamaSharp grammar support or schema-to-grammar conversion, plus strict JSON Schema validation. |
+| Chat Completions | `logprobs`, `top_logprobs`, and `logit_bias` do not have real sampler support (requires custom token loop). | Verify LLamaSharp logits/logprobs exposure; extend the sampling pipeline. |
 | Multimodal output | Only text output is supported. Image/audio output items are not supported. | Extend response output item models and integrate image/audio generation backends. |
 | Audio API | `/v1/audio/transcriptions`, `/v1/audio/translations`, and `/v1/audio/speech` are not implemented. | Integrate Whisper/Sherpa-ONNX/TTS backends and expose OpenAI-compatible payloads. |
 | Images API | `/v1/images/generations`, `/v1/images/edits`, and `/v1/images/variations` are not implemented. | Add local image generation adapters, such as Stable Diffusion or ComfyUI. |
-| Embeddings API | `/v1/embeddings` is implemented via LLamaEmbedder. | Add independent embedding model registration and dimension declaration. |
 | Moderations API | `/v1/moderations` is not implemented. | Add a local safety classification model or rules engine. |
 | Files / Uploads | `/v1/files` and `/v1/uploads` resources are not implemented. | Add file storage, validation, lifecycle management, and access control. |
 | Vector Stores | vector stores, file batches, and search endpoints are not implemented. | Add a vector database abstraction for HNSW, SQLite vec, Qdrant, Milvus, or similar backends. |
@@ -701,22 +769,24 @@ Then configure:
 | Realtime API | WebSocket/WebRTC realtime protocols are not implemented. | Plan a separate realtime host for bidirectional audio, incremental transcription, and low-latency output. |
 | Legacy Assistants API | assistants, threads, runs, and run steps are not implemented. | Implement only if compatibility demand is strong; prioritize Responses API first. |
 | Authentication and rate limits | Optional API key middleware implemented (`LLamaStack:Auth`); rate limits, organization/project not implemented. | Add rate limiting, request auditing, and tenant metadata. |
-| Model management | Multi-model registration, default model, `model` routing, capability declarations, and runtime hot load/unload are implemented. | Add runtime configuration refresh, model health checks, and automatic capability detection. |
-| Concurrent inference | Implemented per-model configurable concurrency (`MaxConcurrency`), shared LLamaWeights, pooled LLamaContext/InteractiveExecutor. | Future work: dynamic pool sizing, queueing, cancellation, and memory protection. |
+| Model management | Multi-model registration, default model, `model` routing, capability declarations, runtime hot load/unload, and dynamic pool resize implemented. | Add runtime configuration refresh, model health checks, and automatic capability detection. |
 | Observability | Metrics, tracing, and structured audit logs are missing. | Add OpenTelemetry, Prometheus metrics, request IDs, token/s, and latency metrics. |
 | SDK compatibility tests | No automated OpenAI SDK compatibility matrix exists yet. | Build end-to-end tests with official OpenAI .NET, Python, and JavaScript SDKs. |
 
 ### Suggested Iteration Order
 
-1. Completed multi-model registration, `model` routing, and model capability declarations.
-2. Completed a first pass of Chat Completions and Responses protocol field parsing, degradation, and basic echoing.
-3. Completed the basic in-memory response/chat store and management endpoints.
-4. Add a durable store, background task state machine, real cancellation, and model-driven compact.
-5. Implement structured outputs.
-6. Add Files / Uploads and Vector Stores.
-7. Add Audio, Images, Moderations, and other independent capabilities.
-8. Add rate limiting, queueing, metrics, and production deployment scaffolding.
-9. Build an OpenAI SDK compatibility test matrix, then evaluate Realtime API and fine-tuning orchestration.
+1. ✅ Completed multi-model registration, `model` routing, and model capability declarations.
+2. ✅ Completed Chat Completions and Responses protocol field parsing, degradation, and echoing.
+3. ✅ Completed Chat/Response store and management endpoints (with durable backends).
+4. ✅ Completed durable store, background task state machine, real cancellation, and model-driven compact.
+5. ✅ Completed structured outputs (JSON Schema → GBNF Grammar + strict validation).
+6. ✅ Completed Embedding API (independent registration, dimension declaration, vector extraction).
+7. ✅ Completed concurrent inference enhancements (dynamic pool resize, queuing, cancellation, VRAM protection).
+8. ✅ Completed tool-calling enhancements (registry, hot-load, timeout, permissions, output validation).
+9. Add Files / Uploads and Vector Stores.
+10. Add Audio, Images, Moderations, and other independent capabilities.
+11. Add rate limiting, metrics, and production deployment scaffolding.
+12. Build an OpenAI SDK compatibility test matrix, then evaluate Realtime API and fine-tuning orchestration.
 
 ## Development Commands
 

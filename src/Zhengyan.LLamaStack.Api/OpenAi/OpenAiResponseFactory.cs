@@ -146,6 +146,29 @@ public static class OpenAiResponseFactory
         return ToList(response.InputMessages.Select(ToInputItem).ToArray());
     }
 
+    public static object ToResponseTask(ResponseTaskInfo task)
+    {
+        return new
+        {
+            id = task.Id,
+            @object = "response.task",
+            type = task.Type,
+            status = task.Status switch
+            {
+                ResponseTaskStatus.Pending => "pending",
+                ResponseTaskStatus.Running => "running",
+                ResponseTaskStatus.Completed => "completed",
+                ResponseTaskStatus.Failed => "failed",
+                _ => "unknown"
+            },
+            source_response_id = task.SourceResponseId,
+            result_response_id = task.ResultResponseId,
+            error_message = task.ErrorMessage,
+            created_at = task.CreatedAt,
+            completed_at = task.CompletedAt
+        };
+    }
+
     public static object ToTokenCount(StoredResponse response)
     {
         return new
@@ -178,8 +201,8 @@ public static class OpenAiResponseFactory
             @object = "list",
             data,
             has_more = hasMore,
-            first_id = TryReadId(data.FirstOrDefault()),
-            last_id = TryReadId(data.LastOrDefault())
+            first_id = data.Count > 0 ? TryReadId(data[0]) : null,
+            last_id = data.Count > 0 ? TryReadId(data[^1]) : null
         };
     }
 

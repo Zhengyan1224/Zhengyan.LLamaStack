@@ -27,6 +27,14 @@ public interface IOpenAiStore
     Task<StoredResponse?> CancelResponseAsync(string id, CancellationToken cancellationToken);
 
     Task<StoredResponse?> UpdateResponseMetadataAsync(string id, IReadOnlyDictionary<string, string>? metadata, CancellationToken cancellationToken);
+
+    Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken);
+
+    Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken);
+
+    Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default);
+
+    Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken);
 }
 
 public sealed record StoredListResult<T>(IReadOnlyList<T> Items, bool HasMore);

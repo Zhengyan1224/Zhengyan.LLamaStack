@@ -7,6 +7,7 @@ public sealed class OpenAiMemoryStore : IOpenAiStore
 {
     private readonly ConcurrentDictionary<string, StoredChatCompletion> _chatCompletions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, StoredResponse> _responses = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ResponseTaskInfo> _tasks = new(StringComparer.Ordinal);
 
     public Task AddChatCompletionAsync(
         string id,
@@ -165,5 +166,49 @@ public sealed class OpenAiMemoryStore : IOpenAiStore
         }
 
         return Task.FromResult<StoredResponse?>(null);
+    }
+
+    public Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _tasks[task.Id] = task;
+        return Task.CompletedTask;
+    }
+
+    public Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _tasks.TryGetValue(id, out var task);
+        return Task.FromResult(task);
+    }
+
+    public Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        while (_tasks.TryGetValue(id, out var current))
+        {
+            var updated = current with
+            {
+                Status = status,
+                ResultResponseId = resultResponseId ?? current.ResultResponseId,
+                ErrorMessage = errorMessage ?? current.ErrorMessage,
+                CompletedAt = status is ResponseTaskStatus.Completed or ResponseTaskStatus.Failed
+                    ? DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                    : current.CompletedAt
+            };
+            if (_tasks.TryUpdate(id, updated, current))
+            {
+                return Task.CompletedTask;
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = OpenAiStoreHelpers.ApplyCursor(_tasks.Values, x => x.Id, x => x.CreatedAt, limit, after, before);
+        return Task.FromResult(new StoredListResult<ResponseTaskInfo>(result.Items, result.HasMore));
     }
 }

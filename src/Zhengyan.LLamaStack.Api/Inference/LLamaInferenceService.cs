@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using Zhengyan.LLamaStack.Api.Infrastructure;
 using Zhengyan.LLamaStack.Api.OpenAi;
 using Zhengyan.LLamaStack.Api.Options;
+using Zhengyan.LLamaStack.Api.Storage;
 
 namespace Zhengyan.LLamaStack.Api.Inference;
 
@@ -17,6 +18,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     private readonly LLamaStackOptions _options;
     private readonly ILogger<LLamaInferenceService> _logger;
     private readonly Dictionary<string, ModelRuntime> _models;
+    private readonly Dictionary<string, EmbeddingModelRuntime> _embeddingRuntimes;
     private readonly ToolExecutor? _toolExecutor;
 
     public LLamaInferenceService(IOptions<LLamaStackOptions> options, ILogger<LLamaInferenceService> logger, ToolExecutor? toolExecutor = null)
@@ -27,15 +29,20 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         _models = _options.GetModelRegistrations()
             .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => new ModelRuntime(x.First()), StringComparer.OrdinalIgnoreCase);
+        _embeddingRuntimes = _options.GetEmbeddingModelRegistrations()
+            .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => new EmbeddingModelRuntime(x.First()), StringComparer.OrdinalIgnoreCase);
     }
 
-    public bool IsLoaded => _models.Values.Any(x => x.IsLoaded);
+    public bool IsLoaded => _models.Values.Any(x => x.IsLoaded) || _embeddingRuntimes.Values.Any(x => x.IsLoaded);
 
     public string DefaultModelId => ResolveDefaultModelId();
 
+    public string DefaultEmbeddingModelId => ResolveDefaultEmbeddingModelId();
+
     public IReadOnlyList<ModelDescriptor> GetModels()
     {
-        return _models.Values
+        var chatModels = _models.Values
             .OrderBy(x => x.Options.Id, StringComparer.OrdinalIgnoreCase)
             .Select(x => new ModelDescriptor
             {
@@ -45,9 +52,22 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 Loaded = x.IsLoaded,
                 ModelPath = x.Options.ModelPath,
                 MmprojPath = x.Options.MmprojPath,
-                Capabilities = x.Options.Capabilities
-            })
-            .ToArray();
+                Capabilities = x.Options.Capabilities,
+                EmbeddingDimensions = 0
+            });
+        var embeddingModels = _embeddingRuntimes.Values
+            .OrderBy(x => x.Options.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(x => new ModelDescriptor
+            {
+                Id = x.Options.Id,
+                Created = 0,
+                OwnedBy = "local",
+                Loaded = x.IsLoaded,
+                ModelPath = x.Options.ModelPath,
+                Capabilities = new LLamaModelCapabilities { Embeddings = true },
+                EmbeddingDimensions = x.Options.Dimensions
+            });
+        return chatModels.Concat(embeddingModels).ToArray();
     }
 
     public async Task WarmupAsync(CancellationToken cancellationToken)
@@ -55,6 +75,11 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         foreach (var model in _models.Values.Where(x => x.Options.LoadModelOnStartup))
         {
             await EnsureModelLoadedAsync(model, cancellationToken);
+        }
+
+        foreach (var model in _embeddingRuntimes.Values.Where(x => _options.LoadModelOnStartup))
+        {
+            await EnsureEmbeddingModelLoadedAsync(model, cancellationToken);
         }
     }
 
@@ -274,6 +299,19 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
             var text = createdText.ToString();
             var toolCalls = TryExtractToolCalls(text, request.Tools, out var cleanText);
+
+            if (request.StrictJsonSchema && toolCalls.Count == 0 && !string.IsNullOrWhiteSpace(request.JsonSchema) && !string.IsNullOrWhiteSpace(cleanText))
+            {
+                try
+                {
+                    ValidateJsonOutput(cleanText, request.JsonSchema);
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogWarning("Strict JSON Schema validation failed: {Error}. Text: {Text}", ex.Message, cleanText);
+                }
+            }
+
             var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out _, out _);
             var completionTokens = CountTokens(loaded, cleanText);
             var finishReason = DetermineFinishReason(toolCalls.Count > 0, completionTokens, request.MaxTokens, model.Options.DefaultMaxTokens);
@@ -390,75 +428,179 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     public async Task<EmbeddingResult> EmbeddingsAsync(
         IReadOnlyList<string> inputs,
         string? requestedModel,
+        int? dimensions,
         CancellationToken cancellationToken)
     {
-        var model = ResolveRuntime(requestedModel);
-        var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
+        var model = ResolveEmbeddingRuntime(requestedModel);
+        EmbeddingLoadedModel embedder;
+        if (model.IsLoaded)
+        {
+            embedder = await model.AcquireAsync(cancellationToken);
+        }
+        else
+        {
+            embedder = await CreateEmbedderAsync(model.Options, cancellationToken);
+        }
+
         try
         {
-
-        var embedderParams = new ModelParams(ResolvePath(model.Options.ModelPath!))
-        {
-            ContextSize = model.Options.ContextSize,
-            GpuLayerCount = model.Options.GpuLayerCount,
-            Threads = model.Options.Threads,
-            BatchThreads = model.Options.BatchThreads,
-            UseMemorymap = model.Options.UseMemoryMap,
-            UseMemoryLock = model.Options.UseMemoryLock,
-            BatchSize = model.Options.BatchSize ?? 512,
-            Embeddings = true
-        };
-
-        var data = new List<EmbeddingData>();
-        var totalTokens = 0;
-        var embedder = new LLamaEmbedder(loaded.Weights, embedderParams, _logger);
-        try
-        {
+            var data = new List<EmbeddingData>();
+            var totalTokens = 0;
             foreach (var input in inputs)
             {
-                var tokens = loaded.Context.Tokenize(input, addBos: true, special: true);
+                var tokens = embedder.Embedder.Context.Tokenize(input, addBos: true, special: true);
                 totalTokens += tokens.Count();
-                var vectors = await embedder.GetEmbeddings(input, cancellationToken);
+                var vectors = await embedder.Embedder.GetEmbeddings(input, cancellationToken);
                 if (vectors is { Count: > 0 })
                 {
+                    var embedding = vectors[0];
+                    if (dimensions.HasValue && dimensions.Value > 0 && dimensions.Value < embedding.Length)
+                    {
+                        var truncated = new float[dimensions.Value];
+                        Array.Copy(embedding, truncated, dimensions.Value);
+                        embedding = truncated;
+                    }
+
                     data.Add(new EmbeddingData
                     {
                         Index = data.Count,
-                        Embedding = vectors[0],
+                        Embedding = embedding,
                         Object = "embedding"
                     });
                 }
             }
-        }
-        finally
-        {
-            embedder.Dispose();
-        }
 
-        return new EmbeddingResult
-        {
-            Data = data,
-            TotalTokens = totalTokens
-        };
+            return new EmbeddingResult
+            {
+                Data = data,
+                TotalTokens = totalTokens
+            };
         }
         finally
         {
-            ReleaseLoadedModel(model, loaded);
+            if (model.IsLoaded)
+            {
+                model.Release(embedder);
+            }
+            else
+            {
+                embedder.Dispose();
+            }
         }
     }
 
-    private async IAsyncEnumerable<string> StreamTextAsync(
-        InferenceRequest request,
-        LoadedModel loaded,
-        ModelRuntime model,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+    private async Task<EmbeddingLoadedModel> CreateEmbedderAsync(LLamaEmbeddingModelRuntimeOptions options, CancellationToken cancellationToken)
+    {
+        var modelPath = ResolvePath(options.ModelPath!);
+        var embedderParams = new ModelParams(modelPath)
+        {
+            ContextSize = 512,
+            GpuLayerCount = options.GpuLayerCount,
+            Threads = options.Threads,
+            BatchThreads = options.BatchThreads,
+            UseMemorymap = options.UseMemoryMap,
+            UseMemoryLock = options.UseMemoryLock,
+            BatchSize = options.BatchSize,
+            Embeddings = true
+        };
+
+        _logger.LogInformation("Loading embedding model {ModelId} from {ModelPath}", options.Id, options.ModelPath);
+        var weights = await LLamaWeights.LoadFromFileAsync(embedderParams, cancellationToken);
+        var embedder = new LLamaEmbedder(weights, embedderParams, _logger);
+        return new EmbeddingLoadedModel(weights, embedder);
+    }
+
+    private async Task EnsureEmbeddingModelLoadedAsync(EmbeddingModelRuntime model, CancellationToken cancellationToken)
+    {
+        if (model.IsLoaded)
+            return;
+
+        await model.LoadLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (model.IsLoaded)
+                return;
+
+            await LoadEmbeddingModelInstancesAsync(model, cancellationToken);
+        }
+        finally
+        {
+            model.LoadLock.Release();
+        }
+    }
+
+    private async Task LoadEmbeddingModelInstancesAsync(EmbeddingModelRuntime model, CancellationToken cancellationToken)
+    {
+        var options = model.Options;
+        var modelPath = ResolvePath(options.ModelPath!);
+        if (!File.Exists(modelPath))
+        {
+            throw new OpenAiProtocolException(
+                StatusCodes.Status503ServiceUnavailable,
+                $"Configured embedding model file was not found for `{options.Id}`: {modelPath}",
+                type: "server_error",
+                code: "model_not_found");
+        }
+
+        var weightBytes = new FileInfo(modelPath).Length;
+        var contextBytes = 512L * 1024;
+
+        var totalWeightBytes = _models.Values.Where(m => m.IsLoaded).Sum(m => m.TotalEstimatedBytes)
+            + _embeddingRuntimes.Values.Where(m => m.IsLoaded).Sum(m => m.TotalEstimatedBytes);
+        var newTotalBytes = totalWeightBytes + weightBytes + contextBytes * options.MaxConcurrency;
+        var maxVram = _options.MaxVramBytes;
+        if (maxVram > 0 && newTotalBytes > maxVram)
+        {
+            throw new OpenAiProtocolException(
+                StatusCodes.Status503ServiceUnavailable,
+                $"Loading embedding model `{options.Id}` would exceed VRAM budget of {maxVram} bytes "
+                + $"(estimated: {newTotalBytes} bytes). Increase LLamaStack:MaxVramBytes or unload another model first.",
+                type: "server_error",
+                code: "vram_budget_exceeded");
+        }
+
+        var embedderParams = new ModelParams(modelPath)
+        {
+            ContextSize = 512,
+            GpuLayerCount = options.GpuLayerCount,
+            Threads = options.Threads,
+            BatchThreads = options.BatchThreads,
+            UseMemorymap = options.UseMemoryMap,
+            UseMemoryLock = options.UseMemoryLock,
+            BatchSize = options.BatchSize,
+            Embeddings = true
+        };
+
+        _logger.LogInformation("Loading embedding model {ModelId} from {ModelPath}", options.Id, options.ModelPath);
+        var weights = await LLamaWeights.LoadFromFileAsync(embedderParams, cancellationToken);
+
+        var maxConcurrency = options.MaxConcurrency;
+        var instances = new List<EmbeddingLoadedModel>(maxConcurrency);
+        for (var i = 0; i < maxConcurrency; i++)
+        {
+            var embedder = new LLamaEmbedder(weights, embedderParams, _logger);
+            instances.Add(new EmbeddingLoadedModel(weights, embedder));
+        }
+
+        model.Initialize(instances, weightBytes, contextBytes);
+    }
+
+    private (string Prompt, int PromptTokens, IReadOnlyList<InferenceMedia> Media, int MediaCount) BuildPromptWithCount(
+        InferenceRequest request, LoadedModel loaded, ModelRuntime model)
     {
         request = ApplyTruncation(request, loaded, model);
         var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out var media, out var mediaCount);
-        var inferenceParams = CreateInferenceParams(model.Options, request);
+        var promptTokens = CountTokens(loaded, prompt);
+        return (prompt, promptTokens, media, mediaCount);
+    }
+
+    private async IAsyncEnumerable<string> StreamTextAsync(
+        string prompt, InferenceParams inferenceParams, LoadedModel loaded,
+        IReadOnlyList<InferenceMedia> media, int mediaCount,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         ResetExecutorState(loaded);
         LoadMedia(loaded, media, mediaCount);
-
         try
         {
             await foreach (var token in loaded.Executor.InferAsync(prompt, inferenceParams, cancellationToken).WithCancellation(cancellationToken))
@@ -472,17 +614,36 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
     }
 
+    private async IAsyncEnumerable<string> StreamTextAsync(
+        InferenceRequest request,
+        LoadedModel loaded,
+        ModelRuntime model,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var (prompt, _, media, mediaCount) = BuildPromptWithCount(request, loaded, model);
+        var inferenceParams = CreateInferenceParams(model.Options, request);
+        await foreach (var token in StreamTextAsync(prompt, inferenceParams, loaded, media, mediaCount, cancellationToken))
+        {
+            yield return token;
+        }
+    }
+
     public async IAsyncEnumerable<string> StreamChatEventsAsync(
         InferenceRequest request,
         string responseId,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        bool includeUsage,
+        IOpenAiStore? store,
+        long? created,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
         {
+        var (prompt, promptTokens, media, mediaCount) = BuildPromptWithCount(request, loaded, model);
+        var inferenceParams = CreateInferenceParams(model.Options, request);
         var completion = new StringBuilder();
-        await foreach (var token in StreamTextAsync(request, loaded, model, cancellationToken))
+        await foreach (var token in StreamTextAsync(prompt, inferenceParams, loaded, media, mediaCount, cancellationToken))
         {
             completion.Append(token);
             var chunk = new
@@ -490,7 +651,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 id = responseId,
                 @object = "chat.completion.chunk",
                 created = UnixNow(),
-                model = ResolveRuntime(request.RequestedModel).Options.Id,
+                model = model.Options.Id,
                 choices = new[]
                 {
                     new
@@ -505,7 +666,9 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             yield return ToSse(chunk);
         }
 
-        var toolCalls = TryExtractToolCalls(completion.ToString(), request.Tools, out _);
+        var generatedText = completion.ToString();
+        var toolCalls = TryExtractToolCalls(generatedText, request.Tools, out _);
+        var finishReason = toolCalls.Count > 0 ? "tool_calls" : "stop";
         if (toolCalls.Count > 0)
         {
             var toolChunk = new
@@ -513,7 +676,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 id = responseId,
                 @object = "chat.completion.chunk",
                 created = UnixNow(),
-                model = ResolveRuntime(request.RequestedModel).Options.Id,
+                model = model.Options.Id,
                 choices = new[]
                 {
                     new
@@ -532,17 +695,57 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             id = responseId,
             @object = "chat.completion.chunk",
             created = UnixNow(),
-            model = ResolveRuntime(request.RequestedModel).Options.Id,
+            model = model.Options.Id,
             choices = new[]
             {
                 new
                 {
                     index = 0,
                     delta = new { },
-                    finish_reason = toolCalls.Count > 0 ? "tool_calls" : "stop"
+                    finish_reason = finishReason
                 }
             }
         });
+
+        var outputTokens = CountTokens(loaded, generatedText);
+
+        if (includeUsage)
+        {
+            yield return ToSse(new
+            {
+                id = responseId,
+                @object = "chat.completion.chunk",
+                created = UnixNow(),
+                model = model.Options.Id,
+                choices = Array.Empty<object>(),
+                usage = new
+                {
+                    prompt_tokens = promptTokens,
+                    completion_tokens = outputTokens,
+                    total_tokens = promptTokens + outputTokens
+                }
+            });
+        }
+
+        if (store is not null && request.Store == true)
+        {
+            var now = created ?? UnixNow();
+            await store.AddChatCompletionAsync(responseId, now, request, new InferenceCompletion
+            {
+                Id = responseId,
+                Model = model.Options.Id,
+                Text = toolCalls.Count > 0 ? string.Empty : generatedText,
+                ToolCalls = toolCalls,
+                FinishReason = finishReason,
+                PromptTokens = promptTokens,
+                CompletionTokens = outputTokens,
+                Metadata = request.Metadata,
+                User = request.User,
+                ServiceTier = request.ServiceTier,
+                Store = true,
+                CompatibilityWarnings = request.CompatibilityWarnings
+            }, cancellationToken);
+        }
         }
         finally
         {
@@ -553,12 +756,18 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     public async IAsyncEnumerable<string> StreamResponsesEventsAsync(
         InferenceRequest request,
         string responseId,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        bool includeUsage,
+        IOpenAiStore? store,
+        long? created,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
         {
+        var (prompt, promptTokens, media, mediaCount) = BuildPromptWithCount(request, loaded, model);
+        var inferenceParams = CreateInferenceParams(model.Options, request);
+
         yield return ToSse(new
         {
             type = "response.created",
@@ -568,12 +777,12 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 @object = "response",
                 created_at = UnixNow(),
                 status = "in_progress",
-                model = ResolveRuntime(request.RequestedModel).Options.Id
+                model = model.Options.Id
             }
         });
 
         var completion = new StringBuilder();
-        await foreach (var token in StreamTextAsync(request, loaded, model, cancellationToken))
+        await foreach (var token in StreamTextAsync(prompt, inferenceParams, loaded, media, mediaCount, cancellationToken))
         {
             completion.Append(token);
             yield return ToSse(new
@@ -586,7 +795,8 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             });
         }
 
-        var toolCalls = TryExtractToolCalls(completion.ToString(), request.Tools, out var cleanText);
+        var generatedText = completion.ToString();
+        var toolCalls = TryExtractToolCalls(generatedText, request.Tools, out var cleanText);
         yield return ToSse(new
         {
             type = "response.output_text.done",
@@ -614,6 +824,23 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             });
         }
 
+        var outputTokens = CountTokens(loaded, generatedText);
+
+        if (includeUsage)
+        {
+            yield return ToSse(new
+            {
+                type = "response.usage.delta",
+                response_id = responseId,
+                usage = new
+                {
+                    input_tokens = promptTokens,
+                    output_tokens = outputTokens,
+                    total_tokens = promptTokens + outputTokens
+                }
+            });
+        }
+
         yield return ToSse(new
         {
             type = "response.completed",
@@ -623,9 +850,29 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 @object = "response",
                 created_at = UnixNow(),
                 status = "completed",
-                model = ResolveRuntime(request.RequestedModel).Options.Id
+                model = model.Options.Id
             }
         });
+
+        if (store is not null && request.Store != false)
+        {
+            var now = created ?? UnixNow();
+            await store.AddResponseAsync(responseId, now, request, new InferenceCompletion
+            {
+                Id = responseId,
+                Model = model.Options.Id,
+                Text = toolCalls.Count > 0 ? string.Empty : cleanText,
+                ToolCalls = toolCalls,
+                FinishReason = "stop",
+                PromptTokens = promptTokens,
+                CompletionTokens = outputTokens,
+                Metadata = request.Metadata,
+                User = request.User,
+                ServiceTier = request.ServiceTier,
+                Store = request.Store,
+                CompatibilityWarnings = request.CompatibilityWarnings
+            }, cancellationToken);
+        }
         }
         finally
         {
@@ -699,6 +946,24 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 code: "model_not_found");
         }
 
+        var weightBytes = new FileInfo(modelPath).Length;
+        var contextSize = model.Options.ContextSize ?? 4096;
+        var contextBytes = (long)contextSize * 2048;
+        var totalWeightBytes = _models.Values.Where(m => m.IsLoaded).Sum(m => m.TotalEstimatedBytes)
+            + _embeddingRuntimes.Values.Where(m => m.IsLoaded).Sum(m => m.TotalEstimatedBytes);
+
+        var newTotalBytes = totalWeightBytes + weightBytes + contextBytes * model.Options.MaxConcurrency;
+        var maxVram = _options.MaxVramBytes;
+        if (maxVram > 0 && newTotalBytes > maxVram)
+        {
+            throw new OpenAiProtocolException(
+                StatusCodes.Status503ServiceUnavailable,
+                $"Loading model `{model.Options.Id}` would exceed VRAM budget of {maxVram} bytes "
+                + $"(estimated: {newTotalBytes} bytes). Increase LLamaStack:MaxVramBytes or unload another model first.",
+                type: "server_error",
+                code: "vram_budget_exceeded");
+        }
+
         var parameters = CreateModelParams(modelPath, model.Options);
         _logger.LogInformation("Loading GGUF model {ModelId} from {ModelPath}", model.Options.Id, model.Options.ModelPath);
         var weights = await LLamaWeights.LoadFromFileAsync(parameters, cancellationToken);
@@ -740,7 +1005,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             instances.Add(new LoadedModel(shared, context, executor));
         }
 
-        model.Initialize(instances, shared);
+        model.Initialize(instances, shared, weightBytes, contextBytes);
     }
 
     private static ModelParams CreateModelParams(string modelPath, LLamaModelRuntimeOptions model)
@@ -771,13 +1036,33 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private static InferenceParams CreateInferenceParams(LLamaModelRuntimeOptions model, InferenceRequest request)
     {
+        var logitBias = request.LogitBias is { Count: > 0 }
+            ? request.LogitBias.ToDictionary(kv => (LLamaToken)kv.Key, kv => kv.Value)
+            : null;
+
+        string? grammar = null;
+        if (!string.IsNullOrWhiteSpace(request.JsonSchema))
+        {
+            try
+            {
+                using var schemaDoc = JsonDocument.Parse(request.JsonSchema);
+                grammar = JsonSchemaToGbnfConverter.Convert(schemaDoc.RootElement);
+            }
+            catch
+            {
+                // grammar conversion failed, fall back to prompt-based
+            }
+        }
+
         var pipeline = new DefaultSamplingPipeline
         {
             Temperature = request.Temperature ?? model.DefaultTemperature,
             TopP = request.TopP ?? model.DefaultTopP,
             TopK = request.TopK ?? model.DefaultTopK,
             PresencePenalty = request.PresencePenalty ?? 0,
-            FrequencyPenalty = request.FrequencyPenalty ?? 0
+            FrequencyPenalty = request.FrequencyPenalty ?? 0,
+            LogitBias = logitBias ?? new Dictionary<LLamaToken, float>(),
+            Grammar = !string.IsNullOrEmpty(grammar) ? new Grammar(grammar, "root") : null
         };
 
         if (request.Seed.HasValue)
@@ -785,7 +1070,8 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             pipeline.Seed = request.Seed.Value;
         }
 
-        var antiPrompts = model.AntiPrompts.Concat(request.Stop).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToArray();
+        var antiPrompts = model.AntiPrompts.Concat(request.Stop)
+            .Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToArray();
         return new InferenceParams
         {
             MaxTokens = request.MaxTokens ?? model.DefaultMaxTokens,
@@ -864,18 +1150,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         for (var attempt = 0; attempt < 10; attempt++)
         {
             var testRequest = request.WithMessages(truncated);
-            var allMedia = new List<InferenceMedia>();
-            var messages = BuildPromptMessages(testRequest, loaded.MediaMarker, allMedia);
-            var tempRequest = request.WithMessages(truncated);
-            // quick token estimate without building full template
-            var roughText = string.Join("\n", messages.Select(m => m.Role + ": " + m.Content));
-            var tokenCount = CountTokens(loaded, roughText);
+            var prompt = BuildPrompt(loaded.Weights, testRequest, loaded.MediaMarker, out _, out _);
+            var tokenCount = CountTokens(loaded, prompt);
             if (tokenCount <= maxPromptTokens)
             {
                 break;
             }
 
-            var removed = RemoveMiddleMessage(truncated);
+            var removed = RemoveLeastImportantMessage(truncated);
             if (!removed)
             {
                 break;
@@ -885,18 +1167,70 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return request.WithMessages(truncated);
     }
 
-    private static bool RemoveMiddleMessage(List<InferenceMessage> messages)
+    private static bool RemoveLeastImportantMessage(List<InferenceMessage> messages)
     {
-        // find index range of non-system messages
-        var nonSystem = messages.Select((m, i) => i).Where(i => !string.Equals(messages[i].Role, "system", StringComparison.OrdinalIgnoreCase)).ToArray();
-        if (nonSystem.Length <= 1)
+        if (messages.Count <= 2)
         {
             return false;
         }
 
-        var mid = nonSystem[nonSystem.Length / 2];
-        messages.RemoveAt(mid);
+        var nonSystemIndices = messages
+            .Select((m, i) => (Index: i, Message: m))
+            .Where(x => !string.Equals(x.Message.Role, "system", StringComparison.OrdinalIgnoreCase))
+            .Select(x => x.Index)
+            .ToArray();
+
+        if (nonSystemIndices.Length <= 1)
+        {
+            return false;
+        }
+
+        var keepFirst = 0;
+        var keepLast = nonSystemIndices.Length - 1;
+
+        var candidates = nonSystemIndices
+            .Where((_, i) => i != keepFirst && i != keepLast)
+            .ToArray();
+
+        if (candidates.Length == 0)
+        {
+            return false;
+        }
+
+        var removeScore = candidates
+            .Select(i => (Index: i, Score: ScoreMessageImportance(messages[i])))
+            .OrderBy(x => x.Score)
+            .First();
+
+        messages.RemoveAt(removeScore.Index);
         return true;
+    }
+
+    private static int ScoreMessageImportance(InferenceMessage message)
+    {
+        var score = 0;
+        if (string.Equals(message.Role, "user", StringComparison.OrdinalIgnoreCase))
+            score += 10;
+        else if (string.Equals(message.Role, "assistant", StringComparison.OrdinalIgnoreCase))
+            score += 8;
+        else if (string.Equals(message.Role, "tool", StringComparison.OrdinalIgnoreCase))
+            score += 3;
+
+        if (!string.IsNullOrWhiteSpace(message.Name))
+            score += 5;
+
+        if (!string.IsNullOrWhiteSpace(message.ToolCallId))
+            score += 2;
+
+        if (message.ToolCalls.Count > 0)
+            score += 5;
+
+        if (message.Media.Count > 0)
+            score += 10;
+
+        score += message.Content.Length / 100;
+
+        return score;
     }
 
     private string BuildPrompt(
@@ -1240,6 +1574,91 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return true;
     }
 
+    private static void ValidateJsonOutput(string text, string jsonSchemaJson)
+    {
+        using var schemaDoc = JsonDocument.Parse(jsonSchemaJson);
+        var schema = schemaDoc.RootElement;
+
+        using var outputDoc = JsonDocument.Parse(text);
+        var output = outputDoc.RootElement;
+
+        ValidateNode(output, schema);
+
+        static void ValidateNode(JsonElement node, JsonElement schema)
+        {
+            if (schema.TryGetProperty("type", out var typeProp) && typeProp.ValueKind == JsonValueKind.String)
+            {
+                var expectedType = typeProp.GetString();
+                if (!IsJsonTypeCompatible(node, expectedType))
+                {
+                    throw new JsonException($"Expected type '{expectedType}', got '{GetJsonTypeName(node)}'.");
+                }
+            }
+
+            if (node.ValueKind == JsonValueKind.Object && schema.TryGetProperty("properties", out var props) && props.ValueKind == JsonValueKind.Object)
+            {
+                var required = new HashSet<string>();
+                if (schema.TryGetProperty("required", out var req) && req.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var r in req.EnumerateArray())
+                    {
+                        if (r.ValueKind == JsonValueKind.String) required.Add(r.GetString()!);
+                    }
+                }
+
+                foreach (var prop in props.EnumerateObject())
+                {
+                    if (required.Contains(prop.Name) && !node.TryGetProperty(prop.Name, out _))
+                    {
+                        throw new JsonException($"Missing required property '{prop.Name}'.");
+                    }
+
+                    if (node.TryGetProperty(prop.Name, out var childValue))
+                    {
+                        ValidateNode(childValue, prop.Value);
+                    }
+                }
+            }
+
+            if (node.ValueKind == JsonValueKind.Array && schema.TryGetProperty("items", out var items))
+            {
+                foreach (var item in node.EnumerateArray())
+                {
+                    ValidateNode(item, items);
+                }
+            }
+
+            if (schema.TryGetProperty("enum", out var enumVals) && enumVals.ValueKind == JsonValueKind.Array)
+            {
+                var match = false;
+                foreach (var val in enumVals.EnumerateArray())
+                {
+                    if (JsonElement.DeepEquals(node, val))
+                    {
+                        match = true;
+                        break;
+                    }
+                }
+
+                if (!match)
+                {
+                    throw new JsonException($"Value '{node.GetRawText()}' is not in the enum.");
+                }
+            }
+        }
+
+        static string GetJsonTypeName(JsonElement value) => value.ValueKind switch
+        {
+            JsonValueKind.Object => "object",
+            JsonValueKind.Array => "array",
+            JsonValueKind.String => "string",
+            JsonValueKind.Number => "number",
+            JsonValueKind.True or JsonValueKind.False => "boolean",
+            JsonValueKind.Null => "null",
+            _ => "unknown"
+        };
+    }
+
     private static bool IsJsonTypeCompatible(JsonElement value, string? expectedType)
     {
         return expectedType switch
@@ -1299,11 +1718,68 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             await model.UnloadAsync();
             model.LoadLock.Dispose();
         }
+
+        foreach (var model in _embeddingRuntimes.Values)
+        {
+            await model.UnloadAsync();
+            model.LoadLock.Dispose();
+        }
     }
 
     public int GetModelMaxConcurrency(string? modelId)
     {
         return ResolveRuntime(modelId).Options.MaxConcurrency;
+    }
+
+    public ModelMemoryInfo GetModelMemoryInfo(string? modelId)
+    {
+        if (_models.TryGetValue(modelId ?? "", out var m))
+        {
+            return new ModelMemoryInfo(m.EstimatedWeightBytes, m.EstimatedContextBytes, m.TotalEstimatedBytes, m.IsLoaded);
+        }
+
+        if (_embeddingRuntimes.TryGetValue(modelId ?? "", out var e))
+        {
+            return new ModelMemoryInfo(e.EstimatedWeightBytes, e.EstimatedContextBytes, e.TotalEstimatedBytes, e.IsLoaded);
+        }
+
+        throw new OpenAiProtocolException(
+            StatusCodes.Status404NotFound,
+            $"Model `{modelId}` was not found.",
+            type: "invalid_request_error",
+            code: "model_not_found",
+            param: "model");
+    }
+
+    public long GetTotalEstimatedVramBytes()
+    {
+        return _models.Values.Where(m => m.IsLoaded).Sum(m => m.TotalEstimatedBytes)
+            + _embeddingRuntimes.Values.Where(m => m.IsLoaded).Sum(m => m.TotalEstimatedBytes);
+    }
+
+    public async Task ResizeModelPoolAsync(string modelId, int newMaxConcurrency, CancellationToken ct)
+    {
+        if (_models.TryGetValue(modelId, out var model))
+        {
+            var contextSize = model.Options.ContextSize ?? 4096;
+            var contextBytes = (long)contextSize * 2048;
+            await model.ResizeAsync(newMaxConcurrency, contextBytes, _options.MaxVramBytes, ct);
+            return;
+        }
+
+        if (_embeddingRuntimes.TryGetValue(modelId, out var embedding))
+        {
+            var contextBytes = 512L * 1024;
+            await embedding.ResizeAsync(newMaxConcurrency, contextBytes, _options.MaxVramBytes, ct);
+            return;
+        }
+
+        throw new OpenAiProtocolException(
+            StatusCodes.Status404NotFound,
+            $"Model `{modelId}` was not found.",
+            type: "invalid_request_error",
+            code: "model_not_found",
+            param: "model");
     }
 
     private ModelRuntime ResolveRuntime(string? requestedModel)
@@ -1312,6 +1788,38 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         if (_models.TryGetValue(modelId, out var model))
         {
             return model;
+        }
+
+        throw new OpenAiProtocolException(
+            StatusCodes.Status404NotFound,
+            $"Model `{modelId}` was not found. Use GET /v1/models to list configured models.",
+            type: "invalid_request_error",
+            code: "model_not_found",
+            param: "model");
+    }
+
+    private EmbeddingModelRuntime ResolveEmbeddingRuntime(string? requestedModel)
+    {
+        var modelId = string.IsNullOrWhiteSpace(requestedModel) ? DefaultEmbeddingModelId : requestedModel;
+        if (_embeddingRuntimes.TryGetValue(modelId, out var model))
+        {
+            return model;
+        }
+
+        if (_models.TryGetValue(modelId, out var chatModel))
+        {
+            return new EmbeddingModelRuntime(new LLamaEmbeddingModelRuntimeOptions
+            {
+                Id = chatModel.Options.Id,
+                ModelPath = chatModel.Options.ModelPath,
+                GpuLayerCount = chatModel.Options.GpuLayerCount,
+                Threads = chatModel.Options.Threads,
+                BatchThreads = chatModel.Options.BatchThreads,
+                BatchSize = chatModel.Options.BatchSize ?? 512,
+                UseMemoryMap = chatModel.Options.UseMemoryMap,
+                UseMemoryLock = chatModel.Options.UseMemoryLock,
+                MaxConcurrency = chatModel.Options.MaxConcurrency
+            });
         }
 
         throw new OpenAiProtocolException(
@@ -1335,6 +1843,16 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
 
         return _models.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).First();
+    }
+
+    private string ResolveDefaultEmbeddingModelId()
+    {
+        if (_embeddingRuntimes.Count > 0)
+        {
+            return _embeddingRuntimes.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).First();
+        }
+
+        return DefaultModelId;
     }
 
     private sealed class ModelWeights : IDisposable
@@ -1371,14 +1889,22 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         public bool IsLoaded => _loaded;
 
+        public long EstimatedWeightBytes { get; private set; }
+
+        public long EstimatedContextBytes { get; private set; }
+
+        public long TotalEstimatedBytes => EstimatedWeightBytes + EstimatedContextBytes * _allInstances.Count;
+
         public ModelRuntime(LLamaModelRuntimeOptions options)
         {
             Options = options;
         }
 
-        public void Initialize(List<LoadedModel> instances, ModelWeights shared)
+        public void Initialize(List<LoadedModel> instances, ModelWeights shared, long weightBytes, long contextBytes)
         {
             _shared = shared;
+            EstimatedWeightBytes = weightBytes;
+            EstimatedContextBytes = contextBytes;
             foreach (var inst in instances)
             {
                 _allInstances.Add(inst);
@@ -1409,6 +1935,82 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 _available.Enqueue(model);
             }
             _instanceSemaphore!.Release();
+        }
+
+        public async Task ResizeAsync(int newMaxConcurrency, long contextBytes, long maxVramBytes, CancellationToken ct)
+        {
+            await LoadLock.WaitAsync(ct);
+            try
+            {
+                if (!_loaded) return;
+                if (newMaxConcurrency < 1)
+                    throw new ArgumentOutOfRangeException(nameof(newMaxConcurrency), "MaxConcurrency must be at least 1.");
+
+                var currentCount = _allInstances.Count;
+                if (newMaxConcurrency == currentCount) return;
+
+                if (newMaxConcurrency > currentCount)
+                {
+                    var addCount = newMaxConcurrency - currentCount;
+                    var newTotalBytes = TotalEstimatedBytes + EstimatedContextBytes * addCount;
+                    if (maxVramBytes > 0 && newTotalBytes > maxVramBytes)
+                    {
+                        throw new InvalidOperationException(
+                            $"Resizing pool to {newMaxConcurrency} would exceed VRAM budget of {maxVramBytes} bytes.");
+                    }
+
+                    var newInstances = new List<LoadedModel>(addCount);
+                    for (var i = 0; i < addCount; i++)
+                    {
+                        var context = _shared!.LlamaWeights.CreateContext(CreateModelParams(
+                            ResolvePath(Options.ModelPath!), Options));
+                        var executor = _shared.Mtmd is null
+                            ? new InteractiveExecutor(context)
+                            : new InteractiveExecutor(context, _shared.Mtmd);
+                        newInstances.Add(new LoadedModel(_shared, context, executor));
+                    }
+
+                    lock (_lock)
+                    {
+                        _allInstances.AddRange(newInstances);
+                        foreach (var inst in newInstances)
+                        {
+                            _available.Enqueue(inst);
+                        }
+                    }
+
+                    _instanceSemaphore?.Dispose();
+                    _instanceSemaphore = new SemaphoreSlim(newMaxConcurrency, newMaxConcurrency);
+                }
+                else
+                {
+                    var removeCount = currentCount - newMaxConcurrency;
+                    _loaded = false;
+
+                    var toRecycle = new List<LoadedModel>();
+                    lock (_lock)
+                    {
+                        while (_available.Count > 0 && toRecycle.Count < removeCount)
+                        {
+                            toRecycle.Add(_available.Dequeue());
+                        }
+                    }
+
+                    foreach (var inst in toRecycle)
+                    {
+                        _allInstances.Remove(inst);
+                        inst.Dispose();
+                    }
+
+                    _instanceSemaphore?.Dispose();
+                    _instanceSemaphore = new SemaphoreSlim(newMaxConcurrency, newMaxConcurrency);
+                    _loaded = true;
+                }
+            }
+            finally
+            {
+                LoadLock.Release();
+            }
         }
 
         public async Task UnloadAsync()
@@ -1472,6 +2074,203 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         public void Dispose()
         {
             Context.Dispose();
+        }
+    }
+
+    private sealed class EmbeddingLoadedModel : IDisposable
+    {
+        public LLamaWeights Weights { get; }
+        public LLamaEmbedder Embedder { get; }
+
+        public EmbeddingLoadedModel(LLamaWeights weights, LLamaEmbedder embedder)
+        {
+            Weights = weights;
+            Embedder = embedder;
+        }
+
+        public void Dispose()
+        {
+            Embedder.Dispose();
+        }
+    }
+
+    private sealed class EmbeddingModelRuntime
+    {
+        public LLamaEmbeddingModelRuntimeOptions Options { get; }
+        public SemaphoreSlim LoadLock { get; } = new(1, 1);
+
+        private readonly object _lock = new();
+        private readonly List<EmbeddingLoadedModel> _allInstances = [];
+        private readonly Queue<EmbeddingLoadedModel> _available = new();
+        private SemaphoreSlim? _instanceSemaphore;
+        private LLamaWeights? _sharedWeights;
+        private volatile bool _loaded;
+
+        public bool IsLoaded => _loaded;
+
+        public long EstimatedWeightBytes { get; private set; }
+
+        public long EstimatedContextBytes { get; private set; }
+
+        public long TotalEstimatedBytes => EstimatedWeightBytes + EstimatedContextBytes * _allInstances.Count;
+
+        public EmbeddingModelRuntime(LLamaEmbeddingModelRuntimeOptions options)
+        {
+            Options = options;
+        }
+
+        public void Initialize(List<EmbeddingLoadedModel> instances, long weightBytes, long contextBytes)
+        {
+            EstimatedWeightBytes = weightBytes;
+            EstimatedContextBytes = contextBytes;
+            _sharedWeights = instances.Count > 0 ? instances[0].Weights : null;
+            foreach (var inst in instances)
+            {
+                _allInstances.Add(inst);
+                _available.Enqueue(inst);
+            }
+            _instanceSemaphore = new SemaphoreSlim(instances.Count, instances.Count);
+            _loaded = true;
+        }
+
+        public async Task<EmbeddingLoadedModel> AcquireAsync(CancellationToken ct)
+        {
+            await _instanceSemaphore!.WaitAsync(ct);
+            lock (_lock)
+            {
+                return _available.Dequeue();
+            }
+        }
+
+        public void Release(EmbeddingLoadedModel model)
+        {
+            lock (_lock)
+            {
+                if (!_loaded)
+                {
+                    model.Dispose();
+                    return;
+                }
+                _available.Enqueue(model);
+            }
+            _instanceSemaphore!.Release();
+        }
+
+        public async Task ResizeAsync(int newMaxConcurrency, long contextBytes, long maxVramBytes, CancellationToken ct)
+        {
+            await LoadLock.WaitAsync(ct);
+            try
+            {
+                if (!_loaded) return;
+                if (newMaxConcurrency < 1)
+                    throw new ArgumentOutOfRangeException(nameof(newMaxConcurrency), "MaxConcurrency must be at least 1.");
+
+                var currentCount = _allInstances.Count;
+                if (newMaxConcurrency == currentCount) return;
+
+                if (newMaxConcurrency > currentCount)
+                {
+                    var addCount = newMaxConcurrency - currentCount;
+                    var newTotalBytes = TotalEstimatedBytes + EstimatedContextBytes * addCount;
+                    if (maxVramBytes > 0 && newTotalBytes > maxVramBytes)
+                    {
+                        throw new InvalidOperationException(
+                            $"Resizing embedding pool to {newMaxConcurrency} would exceed VRAM budget of {maxVramBytes} bytes.");
+                    }
+
+                    var modelPath = ResolvePath(Options.ModelPath!);
+                    var embedderParams = new ModelParams(modelPath)
+                    {
+                        ContextSize = 512,
+                        GpuLayerCount = Options.GpuLayerCount,
+                        Threads = Options.Threads,
+                        BatchThreads = Options.BatchThreads,
+                        UseMemorymap = Options.UseMemoryMap,
+                        UseMemoryLock = Options.UseMemoryLock,
+                        BatchSize = Options.BatchSize,
+                        Embeddings = true
+                    };
+
+                    var newInstances = new List<EmbeddingLoadedModel>(addCount);
+                    for (var i = 0; i < addCount; i++)
+                    {
+                        var embedder = new LLamaEmbedder(_sharedWeights!, embedderParams, null!);
+                        newInstances.Add(new EmbeddingLoadedModel(_sharedWeights!, embedder));
+                    }
+
+                    lock (_lock)
+                    {
+                        _allInstances.AddRange(newInstances);
+                        foreach (var inst in newInstances)
+                        {
+                            _available.Enqueue(inst);
+                        }
+                    }
+
+                    _instanceSemaphore?.Dispose();
+                    _instanceSemaphore = new SemaphoreSlim(newMaxConcurrency, newMaxConcurrency);
+                }
+                else
+                {
+                    var removeCount = currentCount - newMaxConcurrency;
+                    _loaded = false;
+
+                    var toRecycle = new List<EmbeddingLoadedModel>();
+                    lock (_lock)
+                    {
+                        while (_available.Count > 0 && toRecycle.Count < removeCount)
+                        {
+                            toRecycle.Add(_available.Dequeue());
+                        }
+                    }
+
+                    foreach (var inst in toRecycle)
+                    {
+                        _allInstances.Remove(inst);
+                        inst.Dispose();
+                    }
+
+                    _instanceSemaphore?.Dispose();
+                    _instanceSemaphore = new SemaphoreSlim(newMaxConcurrency, newMaxConcurrency);
+                    _loaded = true;
+                }
+            }
+            finally
+            {
+                LoadLock.Release();
+            }
+        }
+
+        public async Task UnloadAsync()
+        {
+            await LoadLock.WaitAsync();
+            try
+            {
+                if (!_loaded) return;
+                _loaded = false;
+
+                List<EmbeddingLoadedModel> toDispose;
+                lock (_lock)
+                {
+                    toDispose = [.. _allInstances];
+                    _allInstances.Clear();
+                    _available.Clear();
+                }
+
+                foreach (var instance in toDispose)
+                {
+                    instance.Dispose();
+                }
+
+                _sharedWeights?.Dispose();
+                _sharedWeights = null;
+                _instanceSemaphore?.Dispose();
+                _instanceSemaphore = null;
+            }
+            finally
+            {
+                LoadLock.Release();
+            }
         }
     }
 }
