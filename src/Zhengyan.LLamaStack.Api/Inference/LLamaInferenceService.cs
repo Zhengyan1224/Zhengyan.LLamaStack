@@ -1816,8 +1816,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         InferenceRequest request,
         InferenceMessage nudgeMessage)
     {
-        var messages = new List<InferenceMessage>();
-        messages.AddRange(request.Messages.Where(message => IsSystemRole(message.Role)));
+        var messages = new List<InferenceMessage>
+        {
+            new()
+            {
+                Role = "system",
+                Content = "You are a tool-call planner for an OpenAI-compatible API. Use only the registered tools provided below. Do not answer the user directly in this retry; return only the requested tool-call JSON."
+            }
+        };
 
         var latestTask = FindLatestUserTaskMessage(request) ?? FindLatestTaskMessage(request);
         if (latestTask is not null)

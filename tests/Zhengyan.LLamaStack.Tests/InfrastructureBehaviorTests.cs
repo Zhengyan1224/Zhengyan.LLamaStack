@@ -407,7 +407,8 @@ public sealed class InfrastructureBehaviorTests
 
         Assert.Equal(3, retry.Messages.Count);
         Assert.Equal("system", retry.Messages[0].Role);
-        Assert.Equal("system prompt", retry.Messages[0].Content);
+        Assert.Contains("tool-call planner", retry.Messages[0].Content);
+        Assert.DoesNotContain("system prompt", retry.Messages[0].Content);
         Assert.Equal("user", retry.Messages[1].Role);
         Assert.Equal("check this computer memory", retry.Messages[1].Content);
         Assert.StartsWith("Retry the same request by calling", retry.Messages[2].Content);
@@ -446,7 +447,8 @@ public sealed class InfrastructureBehaviorTests
         var repair = AddToolProtocolRepairNudge(retry, "{");
 
         Assert.Equal(3, repair.Messages.Count);
-        Assert.Equal("system prompt", repair.Messages[0].Content);
+        Assert.Contains("tool-call planner", repair.Messages[0].Content);
+        Assert.DoesNotContain("system prompt", repair.Messages[0].Content);
         Assert.Equal("check this computer memory", repair.Messages[1].Content);
         Assert.StartsWith("The previous tool-call JSON was invalid.", repair.Messages[2].Content);
         Assert.DoesNotContain(repair.Messages, message => message.Content.StartsWith("Retry the same request", StringComparison.Ordinal));
