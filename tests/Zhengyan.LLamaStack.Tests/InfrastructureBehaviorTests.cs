@@ -72,6 +72,22 @@ public sealed class InfrastructureBehaviorTests
         typeof(LLamaInferenceService).GetMethod("TryBuildToolProtocolRecoveryCall", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("TryBuildToolProtocolRecoveryCall method was not found.");
 
+    private static readonly MethodInfo AddToolResultToolCallNudgeMethod =
+        typeof(LLamaInferenceService).GetMethod("AddToolResultToolCallNudge", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("AddToolResultToolCallNudge method was not found.");
+
+    private static readonly MethodInfo HasIntermediateToolResultMessageMethod =
+        typeof(LLamaInferenceService).GetMethod("HasIntermediateToolResultMessage", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("HasIntermediateToolResultMessage method was not found.");
+
+    private static readonly MethodInfo IsToolResultContinuationFailureMethod =
+        typeof(LLamaInferenceService).GetMethod("IsToolResultContinuationFailure", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("IsToolResultContinuationFailure method was not found.");
+
+    private static readonly MethodInfo TryBuildIntermediateToolResultRecoveryCallMethod =
+        typeof(LLamaInferenceService).GetMethod("TryBuildIntermediateToolResultRecoveryCall", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("TryBuildIntermediateToolResultRecoveryCall method was not found.");
+
     [Fact]
     public async Task MemoryStore_PersistsAndUpdatesResponseTasks()
     {
@@ -563,6 +579,67 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
+    public void ToolResultContinuation_TreatsThinkAndPartialJsonAsFailure()
+    {
+        Assert.True(IsToolResultContinuationFailure("<think>"));
+        Assert.True(IsToolResultContinuationFailure("{"));
+        Assert.True(IsToolResultContinuationFailure("{\"name\""));
+        Assert.False(IsToolResultContinuationFailure("The weather is sunny."));
+    }
+
+    [Fact]
+    public void IntermediateToolResultNudge_ForcesFollowUpToolCallAndKeepsToolOutput()
+    {
+        var request = CreateToolInferenceRequest("skill_list", "skill_read");
+        request.Messages =
+        [
+            new InferenceMessage { Role = "user", Content = "weather in Fuzhou" },
+            new InferenceMessage
+            {
+                Role = "tool",
+                Content = """{"ok":true,"skills":[{"name":"web_search","markdown":"skills/web_search/SKILL.md","description":"Search the public web."}]}""",
+                ToolCallId = "call_1"
+            }
+        ];
+
+        var retry = AddToolResultToolCallNudge(request);
+
+        Assert.True(retry.ForceToolCallJson);
+        Assert.Equal(InferenceToolChoiceMode.Required, retry.ToolChoiceMode);
+        Assert.Equal(0, retry.Temperature);
+        Assert.True(HasIntermediateToolResultMessage(request));
+        Assert.Equal(4, retry.Messages.Count);
+        Assert.Contains("tool-call planner", retry.Messages[0].Content);
+        Assert.Equal("weather in Fuzhou", retry.Messages[1].Content);
+        Assert.Equal("tool", retry.Messages[2].Role);
+        Assert.Contains("web_search", retry.Messages[2].Content);
+        Assert.StartsWith("The previous tool result is intermediate", retry.Messages[3].Content);
+        Assert.Contains("skill_read", retry.Messages[3].Content);
+    }
+
+    [Fact]
+    public void IntermediateToolResultRecovery_ReadsSingleListedSkill()
+    {
+        var request = CreateToolInferenceRequest("skill_list", "skill_read");
+        request.Messages =
+        [
+            new InferenceMessage { Role = "user", Content = "weather in Fuzhou" },
+            new InferenceMessage
+            {
+                Role = "tool",
+                Content = """{"ok":true,"skills":[{"name":"web_search","markdown":"skills/web_search/SKILL.md","description":"Search the public web."}]}""",
+                ToolCallId = "call_1"
+            }
+        ];
+
+        var calls = TryBuildIntermediateToolResultRecoveryCall(request);
+
+        var call = Assert.Single(calls);
+        Assert.Equal("skill_read", call.Function.Name);
+        Assert.Equal("""{"name":"web_search"}""", call.Function.Arguments);
+    }
+
+    [Fact]
     public void ToolResultFallback_ReportsFailedToolResult()
     {
         var request = new InferenceRequest
@@ -861,6 +938,30 @@ public sealed class InfrastructureBehaviorTests
     {
         object?[] parameters = [request];
         return (IReadOnlyList<OpenAiToolCall>)TryBuildToolProtocolRecoveryCallMethod.Invoke(null, parameters)!;
+    }
+
+    private static InferenceRequest AddToolResultToolCallNudge(InferenceRequest request)
+    {
+        object?[] parameters = [request];
+        return (InferenceRequest)AddToolResultToolCallNudgeMethod.Invoke(null, parameters)!;
+    }
+
+    private static bool HasIntermediateToolResultMessage(InferenceRequest request)
+    {
+        object?[] parameters = [request];
+        return (bool)HasIntermediateToolResultMessageMethod.Invoke(null, parameters)!;
+    }
+
+    private static bool IsToolResultContinuationFailure(string cleanText)
+    {
+        object?[] parameters = [cleanText];
+        return (bool)IsToolResultContinuationFailureMethod.Invoke(null, parameters)!;
+    }
+
+    private static IReadOnlyList<OpenAiToolCall> TryBuildIntermediateToolResultRecoveryCall(InferenceRequest request)
+    {
+        object?[] parameters = [request];
+        return (IReadOnlyList<OpenAiToolCall>)TryBuildIntermediateToolResultRecoveryCallMethod.Invoke(null, parameters)!;
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory

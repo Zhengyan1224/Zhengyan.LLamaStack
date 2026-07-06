@@ -302,9 +302,10 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 }
             }
 
-            if (toolCalls.Count == 0 && HasTerminalToolResultMessage(request) && IsNonAnswer(cleanText))
+            if (toolCalls.Count == 0 && HasTerminalToolResultMessage(request) && IsToolResultContinuationFailure(cleanText))
             {
-                var retryRequest = AddToolResultContinuationNudge(request);
+                var toolResultRequest = request;
+                var retryRequest = AddToolResultContinuationNudge(toolResultRequest);
                 createdText.Clear();
                 await foreach (var token in StreamTextAsync(retryRequest, loaded, model, cancellationToken))
                 {
@@ -315,9 +316,40 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 text = createdText.ToString();
                 toolCalls = TryExtractToolCalls(text, request, out cleanText);
 
-                if (toolCalls.Count == 0 && IsNonAnswer(cleanText))
+                if (toolCalls.Count == 0 &&
+                    toolResultRequest.Tools.Count > 0 &&
+                    toolResultRequest.ToolChoiceMode != InferenceToolChoiceMode.None &&
+                    HasIntermediateToolResultMessage(toolResultRequest) &&
+                    IsToolResultContinuationFailure(cleanText))
                 {
-                    cleanText = BuildToolResultNonAnswerFallback(request);
+                    var nextToolRequest = AddToolResultToolCallNudge(toolResultRequest);
+                    createdText.Clear();
+                    await foreach (var token in StreamTextAsync(nextToolRequest, loaded, model, cancellationToken))
+                    {
+                        createdText.Append(token);
+                    }
+
+                    request = nextToolRequest;
+                    text = createdText.ToString();
+                    toolCalls = TryExtractToolCalls(text, request, out cleanText);
+
+                    if (toolCalls.Count == 0 && IsToolResultContinuationFailure(cleanText))
+                    {
+                        toolCalls = TryBuildIntermediateToolResultRecoveryCall(toolResultRequest);
+                        if (toolCalls.Count > 0)
+                        {
+                            cleanText = string.Empty;
+                            request = request.WithCompatibilityWarnings(request.CompatibilityWarnings
+                                .Concat(["Model failed to continue after an intermediate tool result; recovered with a registered follow-up tool call."])
+                                .Distinct(StringComparer.Ordinal)
+                                .ToArray());
+                        }
+                    }
+                }
+
+                if (toolCalls.Count == 0 && IsToolResultContinuationFailure(cleanText))
+                {
+                    cleanText = BuildToolResultNonAnswerFallback(toolResultRequest);
                 }
             }
 
@@ -1667,6 +1699,84 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return false;
     }
 
+    private static InferenceMessage? GetLastToolResultMessage(InferenceRequest request)
+    {
+        return request.Messages.LastOrDefault(message => IsToolResultRole(message.Role));
+    }
+
+    private static bool HasIntermediateToolResultMessage(InferenceRequest request)
+    {
+        var message = GetLastToolResultMessage(request);
+        return message is not null && IsIntermediateToolResult(message);
+    }
+
+    private static bool IsIntermediateToolResult(InferenceMessage message)
+    {
+        if (IsIntermediateToolResultName(message.Name))
+        {
+            return true;
+        }
+
+        var content = message.Content.Trim();
+        if (content.Length == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(content);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            if (root.TryGetProperty("skills", out var skills) &&
+                skills.ValueKind == JsonValueKind.Array &&
+                skills.GetArrayLength() > 0)
+            {
+                return true;
+            }
+
+            if (root.TryGetProperty("matches", out var matches) &&
+                matches.ValueKind == JsonValueKind.Array &&
+                matches.GetArrayLength() > 0)
+            {
+                return true;
+            }
+
+            if (root.TryGetProperty("files", out var files) &&
+                files.ValueKind == JsonValueKind.Array &&
+                files.GetArrayLength() > 0)
+            {
+                return true;
+            }
+
+            if (TryGetString(root, "markdown")?.Contains("SKILL.md", StringComparison.OrdinalIgnoreCase) == true ||
+                TryGetString(root, "path")?.Contains("SKILL.md", StringComparison.OrdinalIgnoreCase) == true ||
+                TryGetString(root, "file")?.Contains("SKILL.md", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return true;
+            }
+        }
+        catch (JsonException)
+        {
+            return content.Contains("SKILL.md", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
+    }
+
+    private static bool IsIntermediateToolResultName(string? name)
+    {
+        return string.Equals(name, "skill_list", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "skill_read", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "skill_list_files", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "skill_search_files", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "memory_search", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsTerminalToolResultMessage(IReadOnlyList<InferenceMessage> messages, int index)
     {
         for (var i = index + 1; i < messages.Count; i++)
@@ -1705,6 +1815,74 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             .ToArray();
 
         return request.WithMessages(messages, warnings);
+    }
+
+    private static InferenceRequest AddToolResultToolCallNudge(InferenceRequest request)
+    {
+        var toolNames = BuildToolNamesList(request);
+        var messages = BuildToolResultToolCallMessages(request, new InferenceMessage
+        {
+            Role = "user",
+            Content = "The previous tool result is intermediate, not the final answer. Continue the same user task by calling exactly one next registered tool. Available tool names: " + toolNames + ". If the tool output lists skills, call skill_read for the relevant skill. If the tool output is a skill guide, follow it by calling skill_run_command or another registered tool as appropriate. Output only one complete JSON object in this simple shape: {\"name\":\"tool_name\",\"arguments\":{}}. No reasoning, Markdown, prose, or partial JSON."
+        });
+
+        var warnings = request.CompatibilityWarnings
+            .Concat(["Model returned a non-answer after an intermediate tool result; retried once with constrained follow-up tool-call JSON."])
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        var nextToolRequest = request.WithMessages(messages, warnings);
+        nextToolRequest.ForceToolCallJson = true;
+        nextToolRequest.ToolChoiceMode = nextToolRequest.ToolChoiceMode == InferenceToolChoiceMode.Auto
+            ? InferenceToolChoiceMode.Required
+            : nextToolRequest.ToolChoiceMode;
+        nextToolRequest.Temperature = 0;
+        nextToolRequest.MaxTokens = ResolveToolRetryMaxTokens(nextToolRequest.MaxTokens);
+        return nextToolRequest;
+    }
+
+    private static IReadOnlyList<InferenceMessage> BuildToolResultToolCallMessages(
+        InferenceRequest request,
+        InferenceMessage nudgeMessage)
+    {
+        var messages = new List<InferenceMessage>
+        {
+            new()
+            {
+                Role = "system",
+                Content = "You are a tool-call planner for an OpenAI-compatible API. Use only the registered tools provided below. The previous tool output was intermediate, so continue with the next tool call instead of answering directly."
+            }
+        };
+
+        var latestTask = FindLatestUserTaskMessage(request) ?? FindLatestTaskMessage(request);
+        if (latestTask is not null)
+        {
+            messages.Add(latestTask);
+        }
+
+        var toolResult = GetLastToolResultMessage(request);
+        if (toolResult is not null)
+        {
+            messages.Add(toolResult);
+        }
+
+        messages.Add(nudgeMessage);
+        return messages;
+    }
+
+    private static bool IsToolResultContinuationFailure(string text)
+    {
+        if (IsNonAnswer(text))
+        {
+            return true;
+        }
+
+        var trimmed = text.Trim();
+        return trimmed is "{" or "[" or "{\"" or "[{" ||
+            trimmed.StartsWith("<dw_tool_call>", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("{\"tool_calls\"", StringComparison.Ordinal) ||
+            trimmed.StartsWith("{\"function_call\"", StringComparison.Ordinal) ||
+            trimmed.StartsWith("{\"name\"", StringComparison.Ordinal);
     }
 
     private static bool IsNonAnswer(string text)
@@ -1865,6 +2043,8 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         return content.StartsWith("Retry the same request by calling", StringComparison.Ordinal) ||
             content.StartsWith("The previous tool-call JSON was invalid.", StringComparison.Ordinal) ||
+            content.StartsWith("The previous tool result is intermediate", StringComparison.Ordinal) ||
+            content.StartsWith("Continue the original task from the tool result.", StringComparison.Ordinal) ||
             content.StartsWith("The previous assistant message was not a valid final answer", StringComparison.Ordinal);
     }
 
@@ -1911,6 +2091,129 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
 
         return [];
+    }
+
+    private static IReadOnlyList<OpenAiToolCall> TryBuildIntermediateToolResultRecoveryCall(InferenceRequest request)
+    {
+        if (request.Tools.Count == 0 || request.ToolChoiceMode == InferenceToolChoiceMode.None)
+        {
+            return [];
+        }
+
+        if (request.ToolChoiceMode == InferenceToolChoiceMode.Function &&
+            !string.Equals(request.ToolChoiceName, "skill_read", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        var skillReadTool = GetRegisteredToolName(request, "skill_read");
+        if (string.IsNullOrWhiteSpace(skillReadTool))
+        {
+            return [];
+        }
+
+        var skillName = TrySelectSkillNameFromToolResult(request);
+        if (string.IsNullOrWhiteSpace(skillName))
+        {
+            return [];
+        }
+
+        var arguments = JsonSerializer.Serialize(new { name = skillName });
+        return [CreateToolCall(skillReadTool, arguments)];
+    }
+
+    private static string? TrySelectSkillNameFromToolResult(InferenceRequest request)
+    {
+        var message = GetLastToolResultMessage(request);
+        if (message is null || string.IsNullOrWhiteSpace(message.Content))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(message.Content);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("skills", out var skills) ||
+                skills.ValueKind != JsonValueKind.Array)
+            {
+                return null;
+            }
+
+            var candidates = new List<(string Name, string Description)>();
+            foreach (var skill in skills.EnumerateArray())
+            {
+                if (skill.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                var name = TryGetString(skill, "name");
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    continue;
+                }
+
+                var description = TryGetString(skill, "description") ?? string.Empty;
+                candidates.Add((name, description));
+            }
+
+            if (candidates.Count == 1)
+            {
+                return candidates[0].Name;
+            }
+
+            var task = FindLatestUserTaskMessage(request)?.Content ?? string.Empty;
+            return candidates
+                .Select(candidate => (candidate.Name, ScoreSkillCandidate(candidate.Name, candidate.Description, task)))
+                .Where(candidate => candidate.Item2 > 0)
+                .OrderByDescending(candidate => candidate.Item2)
+                .ThenBy(candidate => candidate.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(candidate => candidate.Name)
+                .FirstOrDefault();
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static int ScoreSkillCandidate(string name, string description, string task)
+    {
+        var score = 0;
+        var haystack = (name + " " + description).ToLowerInvariant();
+        var normalizedTask = task.ToLowerInvariant();
+        foreach (var token in name.Split(['_', '-', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (token.Length > 1 && normalizedTask.Contains(token, StringComparison.OrdinalIgnoreCase))
+            {
+                score += 4;
+            }
+        }
+
+        if ((normalizedTask.Contains("\u5929\u6c14", StringComparison.Ordinal) ||
+                normalizedTask.Contains("\u65b0\u95fb", StringComparison.Ordinal) ||
+                normalizedTask.Contains("\u8054\u7f51", StringComparison.Ordinal) ||
+                normalizedTask.Contains("\u5b9e\u65f6", StringComparison.Ordinal) ||
+                normalizedTask.Contains("current", StringComparison.Ordinal) ||
+                normalizedTask.Contains("weather", StringComparison.Ordinal) ||
+                normalizedTask.Contains("news", StringComparison.Ordinal)) &&
+            (haystack.Contains("web", StringComparison.Ordinal) ||
+                haystack.Contains("search", StringComparison.Ordinal) ||
+                haystack.Contains("public web", StringComparison.Ordinal)))
+        {
+            score += 8;
+        }
+
+        return score;
+    }
+
+    private static string? GetRegisteredToolName(InferenceRequest request, string name)
+    {
+        return request.Tools
+            .Select(tool => tool.Function?.Name)
+            .FirstOrDefault(toolName => string.Equals(toolName, name, StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool IsRegisteredToolName(InferenceRequest request, string name)
