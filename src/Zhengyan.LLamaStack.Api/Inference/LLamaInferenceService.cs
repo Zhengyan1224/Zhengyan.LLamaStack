@@ -2075,24 +2075,18 @@ ws ::= [ \t\n\r]*
             .Where(x => string.Equals(x.Role, "system", StringComparison.OrdinalIgnoreCase))
             .Select(x => x.Content ?? string.Empty));
 
-        var hasToolCatalogMarker =
-            systemContent.Contains("Available tools", StringComparison.OrdinalIgnoreCase) ||
-            systemContent.Contains("\u53ef\u7528\u5de5\u5177", StringComparison.OrdinalIgnoreCase);
-        if (!hasToolCatalogMarker)
+        if (!systemContent.Contains("Available tools are provided as JSON", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        if (!functionNames.All(name => systemContent.Contains(name, StringComparison.OrdinalIgnoreCase)))
+        if (!systemContent.Contains("\"type\"", StringComparison.OrdinalIgnoreCase) ||
+            !systemContent.Contains("\"function\"", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        return systemContent.Contains("\"function\"", StringComparison.OrdinalIgnoreCase) ||
-            systemContent.Contains("function calling", StringComparison.OrdinalIgnoreCase) ||
-            systemContent.Contains("tool_calls", StringComparison.OrdinalIgnoreCase) ||
-            systemContent.Contains("<dw_tool_call>", StringComparison.OrdinalIgnoreCase) ||
-            systemContent.Contains("\u5de5\u5177\u8c03\u7528", StringComparison.OrdinalIgnoreCase);
+        return functionNames.All(name => systemContent.Contains(name, StringComparison.OrdinalIgnoreCase));
     }
 
     private static string BuildToolInstruction(InferenceRequest request, bool includeToolDefinitions = true)

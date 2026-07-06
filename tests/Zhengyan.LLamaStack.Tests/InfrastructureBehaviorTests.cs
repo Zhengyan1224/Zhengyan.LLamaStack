@@ -494,7 +494,7 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
-    public void ToolInstruction_DoesNotDuplicateClientProvidedToolCatalog()
+    public void ToolInstruction_DoesNotTreatTextCatalogAsJsonToolDefinitions()
     {
         var request = CreateToolInferenceRequest("memory_search", "skill_list");
         request.Messages =
@@ -509,7 +509,7 @@ public sealed class InfrastructureBehaviorTests
             }
         ];
 
-        Assert.True(PromptAlreadyContainsToolDefinitions(request));
+        Assert.False(PromptAlreadyContainsToolDefinitions(request));
     }
 
     private static ResponseTaskInfo CreateTask(string id)
