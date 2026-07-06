@@ -311,8 +311,14 @@ public sealed class InfrastructureBehaviorTests
     public void ToolCallGrammar_CanBeParsedByLLamaSharp()
     {
         var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
+        var grammarText = BuildToolCallGrammar(request);
 
-        var grammar = new Grammar(BuildToolCallGrammar(request), "root");
+        Assert.DoesNotContain("\"\\{\"", grammarText);
+        Assert.DoesNotContain("\"\\}\"", grammarText);
+        Assert.DoesNotContain("\"\\[\"", grammarText);
+        Assert.DoesNotContain("\"\\]\"", grammarText);
+
+        var grammar = new Grammar(grammarText, "root");
 
         Assert.NotNull(grammar);
     }

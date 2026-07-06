@@ -1868,13 +1868,13 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             : string.Join(" | ", functionNames.Select(name => $"\"\\\"{EscapeGbnfString(name)}\\\"\""));
 
         return $$"""
-root ::= ws "\{" ws "\"tool_calls\"" ws ":" ws "\[" ws tool-call (ws "," ws tool-call)* ws "\]" ws "\}" ws
-tool-call ::= "\{" ws "\"id\"" ws ":" ws string "," ws "\"type\"" ws ":" ws "\"function\"" "," ws "\"function\"" ws ":" ws function-call ws "\}"
-function-call ::= "\{" ws "\"name\"" ws ":" ws tool-name "," ws "\"arguments\"" ws ":" ws object ws "\}"
+root ::= ws "{" ws "\"tool_calls\"" ws ":" ws "[" ws tool-call (ws "," ws tool-call)* ws "]" ws "}" ws
+tool-call ::= "{" ws "\"id\"" ws ":" ws string "," ws "\"type\"" ws ":" ws "\"function\"" "," ws "\"function\"" ws ":" ws function-call ws "}"
+function-call ::= "{" ws "\"name\"" ws ":" ws tool-name "," ws "\"arguments\"" ws ":" ws object ws "}"
 tool-name ::= {{toolNameRule}}
 value ::= object | array | string | number | "true" ws | "false" ws | "null" ws
-object ::= "\{" ws (string ":" ws value ("," ws string ":" ws value)*)? ws "\}" ws
-array ::= "\[" ws (value ("," ws value)*)? ws "\]" ws
+object ::= "{" ws (string ":" ws value ("," ws string ":" ws value)*)? ws "}" ws
+array ::= "[" ws (value ("," ws value)*)? ws "]" ws
 string ::= "\"" string-char* "\"" ws
 string-char ::= [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])
 number ::= ("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
