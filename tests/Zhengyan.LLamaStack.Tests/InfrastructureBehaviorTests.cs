@@ -586,6 +586,28 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
+    public void ToolResultFallback_DoesNotTreatNonCommandJsonAsFailedCommand()
+    {
+        var request = new InferenceRequest
+        {
+            Messages =
+            [
+                new InferenceMessage
+                {
+                    Role = "tool",
+                    Content = """{"skills":[{"name":"system_info","description":"Read system information."}]}""",
+                    ToolCallId = "call_1"
+                }
+            ]
+        };
+
+        var fallback = BuildToolResultNonAnswerFallback(request);
+
+        Assert.Contains("system_info", fallback);
+        Assert.DoesNotContain("stdout/stderr", fallback);
+    }
+
+    [Fact]
     public void InferenceParams_UsesManualOverflowManagement()
     {
         var model = new LLamaModelRuntimeOptions

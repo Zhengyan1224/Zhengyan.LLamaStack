@@ -1992,9 +1992,24 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             var stdout = TryGetString(root, "stdout");
             var stderr = TryGetString(root, "stderr");
 
-            if (ok == true && !string.IsNullOrWhiteSpace(stdout))
+            if (!LooksLikeCommandResult(ok, command, exitCode, timedOut, stdout, stderr))
             {
-                return "工具已经返回结果，但模型没有生成最终回复。工具输出如下：\n" + TruncateForFallback(stdout);
+                return BuildGenericToolResultFallback(content);
+            }
+
+            if ((ok == true || exitCode == 0) && !string.IsNullOrWhiteSpace(stdout))
+            {
+                return BuildGenericToolResultFallback(stdout);
+            }
+
+            if ((ok == true || exitCode == 0) && !string.IsNullOrWhiteSpace(stderr))
+            {
+                return BuildGenericToolResultFallback(stderr);
+            }
+
+            if (ok == true || exitCode == 0)
+            {
+                return BuildGenericToolResultFallback(content);
             }
 
             var builder = new StringBuilder("工具调用失败，所以这次没能拿到可用结果。");
@@ -2036,8 +2051,29 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
         catch (JsonException)
         {
-            return "工具返回了结果，但模型没有生成最终回复。工具输出如下：\n" + TruncateForFallback(content);
+            return BuildGenericToolResultFallback(content);
         }
+    }
+
+    private static bool LooksLikeCommandResult(
+        bool? ok,
+        string? command,
+        int? exitCode,
+        bool? timedOut,
+        string? stdout,
+        string? stderr)
+    {
+        return ok is not null ||
+            !string.IsNullOrWhiteSpace(command) ||
+            exitCode is not null ||
+            timedOut is not null ||
+            stdout is not null ||
+            stderr is not null;
+    }
+
+    private static string BuildGenericToolResultFallback(string content)
+    {
+        return "\u5de5\u5177\u8fd4\u56de\u4e86\u7ed3\u679c\uff0c\u4f46\u6a21\u578b\u6ca1\u6709\u751f\u6210\u6700\u7ec8\u56de\u590d\u3002\u5de5\u5177\u8f93\u51fa\u5982\u4e0b\uff1a\n" + TruncateForFallback(content);
     }
 
     private static string BuildEmptyToolResultFallback(InferenceRequest request)
