@@ -289,7 +289,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 }
             }
 
-            if (toolCalls.Count == 0 && HasToolResultMessage(request) && IsNonAnswer(cleanText))
+            if (toolCalls.Count == 0 && HasTerminalToolResultMessage(request) && IsNonAnswer(cleanText))
             {
                 var retryRequest = AddToolResultContinuationNudge(request);
                 createdText.Clear();
@@ -1555,14 +1555,18 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         List<InferenceMedia> media)
     {
         var messages = new List<(string Role, string Content)>();
-        foreach (var requestMessage in request.Messages)
+        for (var messageIndex = 0; messageIndex < request.Messages.Count; messageIndex++)
         {
+            var requestMessage = request.Messages[messageIndex];
             var content = requestMessage.Content ?? string.Empty;
 
             var normalizedRole = NormalizeTemplateRole(requestMessage.Role);
-            if (string.Equals(normalizedRole, "tool", StringComparison.OrdinalIgnoreCase))
+            if (IsToolResultRole(requestMessage.Role))
             {
-                messages.Add(("user", FormatToolResultForPrompt(requestMessage, content)));
+                messages.Add(("user", FormatToolResultForPrompt(
+                    requestMessage,
+                    content,
+                    IsTerminalToolResultMessage(request.Messages, messageIndex))));
                 continue;
             }
 
@@ -1610,7 +1614,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return messages;
     }
 
-    private static string FormatToolResultForPrompt(InferenceMessage message, string content)
+    private static string FormatToolResultForPrompt(InferenceMessage message, string content, bool includeContinuationInstruction)
     {
         var builder = new StringBuilder();
         builder.AppendLine("Tool result received.");
@@ -1626,16 +1630,49 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         builder.AppendLine("tool_output:");
         builder.AppendLine(content);
-        builder.AppendLine();
-        builder.AppendLine("Continue the user's original task now. If this result is successful, answer the user. If it failed, call another appropriate tool with corrected arguments or explain the failure. Do not return an empty message.");
+        if (includeContinuationInstruction)
+        {
+            builder.AppendLine();
+            builder.AppendLine("Continue the user's original task now. If this result is successful, answer the user. If it failed, call another appropriate tool with corrected arguments or explain the failure. Do not return an empty message.");
+        }
+
         return builder.ToString().TrimEnd();
     }
 
-    private static bool HasToolResultMessage(InferenceRequest request)
+    private static bool HasTerminalToolResultMessage(InferenceRequest request)
     {
-        return request.Messages.Any(message =>
-            string.Equals(message.Role, "tool", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(message.Role, "function", StringComparison.OrdinalIgnoreCase));
+        for (var i = request.Messages.Count - 1; i >= 0; i--)
+        {
+            if (string.Equals(request.Messages[i].Role, "system", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            return IsToolResultRole(request.Messages[i].Role);
+        }
+
+        return false;
+    }
+
+    private static bool IsTerminalToolResultMessage(IReadOnlyList<InferenceMessage> messages, int index)
+    {
+        for (var i = index + 1; i < messages.Count; i++)
+        {
+            if (string.Equals(messages[i].Role, "system", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            return false;
+        }
+
+        return IsToolResultRole(messages[index].Role);
+    }
+
+    private static bool IsToolResultRole(string role)
+    {
+        return string.Equals(role, "tool", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(role, "function", StringComparison.OrdinalIgnoreCase);
     }
 
     private static InferenceRequest AddToolResultContinuationNudge(InferenceRequest request)
@@ -1667,7 +1704,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         if (request.Tools.Count == 0 ||
             request.ToolChoiceMode == InferenceToolChoiceMode.None ||
-            HasToolResultMessage(request))
+            HasTerminalToolResultMessage(request))
         {
             return false;
         }

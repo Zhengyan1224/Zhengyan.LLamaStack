@@ -338,6 +338,33 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
+    public void ToolProtocolRetry_RetriesNewUserRequestAfterHistoricalToolResult()
+    {
+        var request = CreateToolInferenceRequest("lookup_weather");
+        request.Messages =
+        [
+            new InferenceMessage { Role = "user", Content = "lookup weather" },
+            new InferenceMessage { Role = "tool", Content = """{"ok":true}""", ToolCallId = "call_1" },
+            new InferenceMessage { Role = "user", Content = "lookup news" }
+        ];
+
+        Assert.True(ShouldRetryToolProtocol(request, "<think>"));
+    }
+
+    [Fact]
+    public void ToolProtocolRetry_DoesNotRetryWhenCurrentTurnIsToolResult()
+    {
+        var request = CreateToolInferenceRequest("lookup_weather");
+        request.Messages =
+        [
+            new InferenceMessage { Role = "user", Content = "lookup weather" },
+            new InferenceMessage { Role = "tool", Content = """{"ok":true}""", ToolCallId = "call_1" }
+        ];
+
+        Assert.False(ShouldRetryToolProtocol(request, "<think>"));
+    }
+
+    [Fact]
     public void ToolCallGrammar_CanBeParsedByLLamaSharp()
     {
         var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
