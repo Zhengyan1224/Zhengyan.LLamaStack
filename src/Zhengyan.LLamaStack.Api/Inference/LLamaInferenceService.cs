@@ -1770,7 +1770,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             new InferenceMessage
             {
                 Role = "user",
-                Content = "Retry the same request by calling exactly one available tool. Available tool names: " + toolNames + ". Output only one complete JSON object with tool_calls. Choose a real tool name from the list. Use {} for arguments if unsure. No reasoning, Markdown, prose, or partial JSON."
+                Content = "Retry the same request by calling exactly one available tool. Available tool names: " + toolNames + ". Output only one complete JSON object in this simple shape: {\"name\":\"tool_name\",\"arguments\":{}}. Choose a real tool name from the list. Use {} for arguments if unsure. No reasoning, Markdown, prose, or partial JSON."
             }
         ]).ToArray();
 
@@ -1798,7 +1798,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             new InferenceMessage
             {
                 Role = "user",
-                Content = "The previous tool-call JSON was invalid. Return exactly one complete JSON object now. Available tool names: " + toolNames + ". The function.name value must be one real tool name from the list. Use this shape: {\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"" + exampleToolName + "\",\"arguments\":{}}}]}. No prose or partial JSON."
+                Content = "The previous tool-call JSON was invalid. Return exactly one complete JSON object now. Available tool names: " + toolNames + ". The name value must be one real tool name from the list. Use this shape: {\"name\":\"" + exampleToolName + "\",\"arguments\":{}}. No prose or partial JSON."
             }
         ]).ToArray();
 
@@ -2050,9 +2050,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             : string.Join(" | ", functionNames.Select(name => $"\"\\\"{EscapeGbnfString(name)}\\\"\""));
 
         return $$"""
-root ::= ws "{" ws "\"tool_calls\"" ws ":" ws "[" ws tool-call (ws "," ws tool-call)* ws "]" ws "}" ws
-tool-call ::= "{" ws "\"id\"" ws ":" ws string "," ws "\"type\"" ws ":" ws "\"function\"" "," ws "\"function\"" ws ":" ws function-call ws "}"
-function-call ::= "{" ws "\"name\"" ws ":" ws tool-name "," ws "\"arguments\"" ws ":" ws object ws "}"
+root ::= ws "{" ws "\"name\"" ws ":" ws tool-name "," ws "\"arguments\"" ws ":" ws object ws "}" ws
 tool-name ::= {{toolNameRule}}
 value ::= object | array | string | number | "true" ws | "false" ws | "null" ws
 object ::= "{" ws (string ":" ws value ("," ws string ":" ws value)*)? ws "}" ws
@@ -2143,15 +2141,16 @@ ws ::= [ \t\n\r]*
 
         if (request.ParallelToolCalls == true)
         {
-            builder.AppendLine("You may call multiple tools at once. When calling tools, do not output reasoning, Markdown, prose, or any text outside JSON. The first non-whitespace character must be `{`. Respond only with JSON in this exact shape:");
-            builder.AppendLine("""{"tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"tool_name","arguments":"{\"arg\":\"value\"}"}},{"id":"call_<unique>","type":"function","function":{"name":"another_tool","arguments":"{\"arg\":\"value\"}"}}]}""");
+            builder.AppendLine("You may call multiple tools at once. When calling tools, do not output reasoning, Markdown, prose, or any text outside JSON. The first non-whitespace character must be `{`. Prefer the simple single-tool JSON shape; if you need multiple tools, use the OpenAI tool_calls shape:");
+            builder.AppendLine("""{"name":"tool_name","arguments":{"arg":"value"}}""");
+            builder.AppendLine("""{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"tool_name","arguments":{"arg":"value"}}},{"id":"call_2","type":"function","function":{"name":"another_tool","arguments":{}}}]}""");
         }
         else
         {
-            builder.AppendLine("When calling a tool, do not output reasoning, Markdown, prose, or any text outside JSON. The first non-whitespace character must be `{`. Respond only with JSON in this exact shape:");
-            builder.AppendLine("""{"tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"tool_name","arguments":"{\"arg\":\"value\"}"}}]}""");
+            builder.AppendLine("When calling a tool, do not output reasoning, Markdown, prose, or any text outside JSON. The first non-whitespace character must be `{`. Respond only with one complete JSON object in this simple shape:");
+            builder.AppendLine("""{"name":"tool_name","arguments":{"arg":"value"}}""");
         }
-        builder.AppendLine("""If you already produced a <dw_tool_call>{"name":"tool_name","arguments":{}}</dw_tool_call> text-protocol call, output the equivalent JSON tool_calls object instead.""");
+        builder.AppendLine("""If you already produced a <dw_tool_call>{"name":"tool_name","arguments":{}}</dw_tool_call> text-protocol call, output the equivalent simple JSON object instead.""");
         builder.AppendLine("When a tool result is provided, continue the task. If the tool succeeded, answer the user from the tool result. If it failed, call another appropriate tool with corrected arguments or explain the failure. Never return an empty message after a tool result.");
         builder.AppendLine("When using shell commands, quote URLs or arguments that contain shell metacharacters such as `&`.");
         builder.AppendLine("If the request can be answered without any registered tool, answer normally.");

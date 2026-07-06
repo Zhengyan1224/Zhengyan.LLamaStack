@@ -384,7 +384,8 @@ public sealed class InfrastructureBehaviorTests
         Assert.Equal(0, retry.Temperature);
         Assert.Contains("lookup_weather", nudge.Content);
         Assert.Contains("skill_list", nudge.Content);
-        Assert.DoesNotContain("tool_name", nudge.Content);
+        Assert.Contains("""{"name":"tool_name","arguments":{}}""", nudge.Content);
+        Assert.DoesNotContain("tool_calls", nudge.Content);
     }
 
     [Fact]
@@ -399,7 +400,8 @@ public sealed class InfrastructureBehaviorTests
         Assert.Equal(0, repair.Temperature);
         Assert.Contains("lookup_weather", nudge.Content);
         Assert.Contains("skill_list", nudge.Content);
-        Assert.DoesNotContain("\"name\":\"tool_name\"", nudge.Content);
+        Assert.Contains("""{"name":"lookup_weather","arguments":{}}""", nudge.Content);
+        Assert.DoesNotContain("tool_calls", nudge.Content);
     }
 
     [Fact]
@@ -412,6 +414,9 @@ public sealed class InfrastructureBehaviorTests
         Assert.DoesNotContain("\"\\}\"", grammarText);
         Assert.DoesNotContain("\"\\[\"", grammarText);
         Assert.DoesNotContain("\"\\]\"", grammarText);
+        Assert.DoesNotContain("\"tool_calls\"", grammarText);
+        Assert.Contains("\"\\\"name\\\"\"", grammarText);
+        Assert.Contains("\"\\\"arguments\\\"\"", grammarText);
 
         var grammar = new Grammar(grammarText, "root");
 
@@ -528,7 +533,7 @@ public sealed class InfrastructureBehaviorTests
 
         Assert.DoesNotContain("[{\"type\":\"function\"", instruction);
         Assert.Contains("already provided", instruction);
-        Assert.Contains("tool_calls", instruction);
+        Assert.Contains("""{"name":"tool_name","arguments":{"arg":"value"}}""", instruction);
     }
 
     [Fact]
