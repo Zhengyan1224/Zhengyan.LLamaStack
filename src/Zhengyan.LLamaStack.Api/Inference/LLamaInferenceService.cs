@@ -1764,12 +1764,13 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private static InferenceRequest AddToolProtocolRetryNudge(InferenceRequest request)
     {
+        var toolNames = BuildToolNamesList(request);
         var messages = request.Messages.Concat(
         [
             new InferenceMessage
             {
                 Role = "user",
-                Content = "Retry the same request by calling the appropriate available tool. Output only the JSON tool_calls object. No reasoning, Markdown, prose, or partial JSON."
+                Content = "Retry the same request by calling exactly one available tool. Available tool names: " + toolNames + ". Output only one complete JSON object with tool_calls. Choose a real tool name from the list. Use {} for arguments if unsure. No reasoning, Markdown, prose, or partial JSON."
             }
         ]).ToArray();
 
@@ -1790,13 +1791,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private static InferenceRequest AddToolProtocolRepairNudge(InferenceRequest request, string invalidOutput)
     {
-        var excerpt = TruncateForFallback(invalidOutput);
+        var toolNames = BuildToolNamesList(request);
+        var exampleToolName = GetFirstToolName(request) ?? "tool_name";
         var messages = request.Messages.Concat(
         [
             new InferenceMessage
             {
                 Role = "user",
-                Content = "The previous tool-call JSON was invalid: " + excerpt + "\nReturn one complete JSON object now: {\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{}\"}}]}. No prose or partial JSON."
+                Content = "The previous tool-call JSON was invalid. Return exactly one complete JSON object now. Available tool names: " + toolNames + ". The function.name value must be one real tool name from the list. Use this shape: {\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"" + exampleToolName + "\",\"arguments\":{}}}]}. No prose or partial JSON."
             }
         ]).ToArray();
 
@@ -1806,13 +1808,32 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             .ToArray();
 
         var repairRequest = request.WithMessages(messages, warnings);
-        repairRequest.ForceToolCallJson = false;
+        repairRequest.ForceToolCallJson = true;
         repairRequest.ToolChoiceMode = repairRequest.ToolChoiceMode == InferenceToolChoiceMode.Auto
             ? InferenceToolChoiceMode.Required
             : repairRequest.ToolChoiceMode;
         repairRequest.Temperature = 0;
         repairRequest.MaxTokens = Math.Min(repairRequest.MaxTokens ?? ToolRetryMaxTokens, ToolRetryMaxTokens);
         return repairRequest;
+    }
+
+    private static string BuildToolNamesList(InferenceRequest request)
+    {
+        var names = request.Tools
+            .Select(x => x.Function?.Name)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return names.Length == 0 ? "(none)" : string.Join(", ", names);
+    }
+
+    private static string? GetFirstToolName(InferenceRequest request)
+    {
+        return request.Tools
+            .Select(x => x.Function?.Name)
+            .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
     }
 
     private static string BuildInvalidToolCallFallback(string invalidOutput)

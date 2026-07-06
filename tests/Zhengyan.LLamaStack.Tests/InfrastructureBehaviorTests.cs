@@ -60,6 +60,14 @@ public sealed class InfrastructureBehaviorTests
             modifiers: null)
         ?? throw new InvalidOperationException("BuildToolInstruction method was not found.");
 
+    private static readonly MethodInfo AddToolProtocolRetryNudgeMethod =
+        typeof(LLamaInferenceService).GetMethod("AddToolProtocolRetryNudge", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("AddToolProtocolRetryNudge method was not found.");
+
+    private static readonly MethodInfo AddToolProtocolRepairNudgeMethod =
+        typeof(LLamaInferenceService).GetMethod("AddToolProtocolRepairNudge", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("AddToolProtocolRepairNudge method was not found.");
+
     [Fact]
     public async Task MemoryStore_PersistsAndUpdatesResponseTasks()
     {
@@ -365,6 +373,36 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
+    public void ToolProtocolRetryNudge_IncludesRealToolNames()
+    {
+        var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
+
+        var retry = AddToolProtocolRetryNudge(request);
+        var nudge = retry.Messages[retry.Messages.Count - 1];
+
+        Assert.True(retry.ForceToolCallJson);
+        Assert.Equal(0, retry.Temperature);
+        Assert.Contains("lookup_weather", nudge.Content);
+        Assert.Contains("skill_list", nudge.Content);
+        Assert.DoesNotContain("tool_name", nudge.Content);
+    }
+
+    [Fact]
+    public void ToolProtocolRepairNudge_UsesGrammarAndRealToolNames()
+    {
+        var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
+
+        var repair = AddToolProtocolRepairNudge(request, "{\"");
+        var nudge = repair.Messages[repair.Messages.Count - 1];
+
+        Assert.True(repair.ForceToolCallJson);
+        Assert.Equal(0, repair.Temperature);
+        Assert.Contains("lookup_weather", nudge.Content);
+        Assert.Contains("skill_list", nudge.Content);
+        Assert.DoesNotContain("\"name\":\"tool_name\"", nudge.Content);
+    }
+
+    [Fact]
     public void ToolCallGrammar_CanBeParsedByLLamaSharp()
     {
         var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
@@ -652,6 +690,18 @@ public sealed class InfrastructureBehaviorTests
     {
         object?[] parameters = [request, includeToolDefinitions];
         return (string)BuildToolInstructionMethod.Invoke(null, parameters)!;
+    }
+
+    private static InferenceRequest AddToolProtocolRetryNudge(InferenceRequest request)
+    {
+        object?[] parameters = [request];
+        return (InferenceRequest)AddToolProtocolRetryNudgeMethod.Invoke(null, parameters)!;
+    }
+
+    private static InferenceRequest AddToolProtocolRepairNudge(InferenceRequest request, string invalidOutput)
+    {
+        object?[] parameters = [request, invalidOutput];
+        return (InferenceRequest)AddToolProtocolRepairNudgeMethod.Invoke(null, parameters)!;
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory
