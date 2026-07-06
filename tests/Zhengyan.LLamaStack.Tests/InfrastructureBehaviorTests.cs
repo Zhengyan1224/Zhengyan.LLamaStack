@@ -26,6 +26,10 @@ public sealed class InfrastructureBehaviorTests
         typeof(LLamaInferenceService).GetMethod("BuildToolCallGrammar", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("BuildToolCallGrammar method was not found.");
 
+    private static readonly MethodInfo BuildToolResultNonAnswerFallbackMethod =
+        typeof(LLamaInferenceService).GetMethod("BuildToolResultNonAnswerFallback", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("BuildToolResultNonAnswerFallback method was not found.");
+
     [Fact]
     public async Task MemoryStore_PersistsAndUpdatesResponseTasks()
     {
@@ -313,6 +317,29 @@ public sealed class InfrastructureBehaviorTests
         Assert.NotNull(grammar);
     }
 
+    [Fact]
+    public void ToolResultFallback_ReportsFailedToolResult()
+    {
+        var request = new InferenceRequest
+        {
+            Messages =
+            [
+                new InferenceMessage
+                {
+                    Role = "tool",
+                    Content = """{"ok":false,"command":"curl -s 'https://wttr.in/Fuzhou'","exitCode":3,"stdout":"","stderr":""}""",
+                    ToolCallId = "call_1"
+                }
+            ]
+        };
+
+        var fallback = BuildToolResultNonAnswerFallback(request);
+
+        Assert.Contains("工具调用失败", fallback);
+        Assert.Contains("退出码：3", fallback);
+        Assert.DoesNotContain("<think>", fallback);
+    }
+
     private static ResponseTaskInfo CreateTask(string id)
     {
         return new ResponseTaskInfo
@@ -411,6 +438,12 @@ public sealed class InfrastructureBehaviorTests
     {
         object?[] parameters = [request];
         return (string)BuildToolCallGrammarMethod.Invoke(null, parameters)!;
+    }
+
+    private static string BuildToolResultNonAnswerFallback(InferenceRequest request)
+    {
+        object?[] parameters = [request];
+        return (string)BuildToolResultNonAnswerFallbackMethod.Invoke(null, parameters)!;
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory

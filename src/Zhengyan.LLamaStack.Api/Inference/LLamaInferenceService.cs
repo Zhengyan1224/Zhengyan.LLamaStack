@@ -258,7 +258,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 toolCalls = TryExtractToolCalls(text, request, out cleanText);
             }
 
-            if (toolCalls.Count == 0 && string.IsNullOrWhiteSpace(cleanText) && HasToolResultMessage(request))
+            if (toolCalls.Count == 0 && HasToolResultMessage(request) && IsNonAnswer(cleanText))
             {
                 var retryRequest = AddToolResultContinuationNudge(request);
                 createdText.Clear();
@@ -271,9 +271,9 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 text = createdText.ToString();
                 toolCalls = TryExtractToolCalls(text, request, out cleanText);
 
-                if (toolCalls.Count == 0 && string.IsNullOrWhiteSpace(cleanText))
+                if (toolCalls.Count == 0 && IsNonAnswer(cleanText))
                 {
-                    cleanText = BuildEmptyToolResultFallback(request);
+                    cleanText = BuildToolResultNonAnswerFallback(request);
                 }
             }
 
@@ -1576,11 +1576,17 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         ]).ToArray();
 
         var warnings = request.CompatibilityWarnings
-            .Concat(["Model returned an empty response after a tool result; retried once with a continuation instruction."])
+            .Concat(["Model returned a non-answer after a tool result; retried once with a continuation instruction."])
             .Distinct(StringComparer.Ordinal)
             .ToArray();
 
         return request.WithMessages(messages, warnings);
+    }
+
+    private static bool IsNonAnswer(string text)
+    {
+        var trimmed = text.Trim();
+        return trimmed.Length == 0 || ContainsOnlyMarkupTagsAndWhitespace(trimmed);
     }
 
     private static bool ShouldRetryToolProtocol(InferenceRequest request, string cleanText)
@@ -1654,6 +1660,77 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             ? InferenceToolChoiceMode.Required
             : retryRequest.ToolChoiceMode;
         return retryRequest;
+    }
+
+    private static string BuildToolResultNonAnswerFallback(InferenceRequest request)
+    {
+        var toolMessage = request.Messages.LastOrDefault(message =>
+            string.Equals(message.Role, "tool", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(message.Role, "function", StringComparison.OrdinalIgnoreCase));
+
+        if (toolMessage is null || string.IsNullOrWhiteSpace(toolMessage.Content))
+        {
+            return "工具调用后模型没有生成回复。请稍后重试，或检查工具返回内容是否为空。";
+        }
+
+        var content = toolMessage.Content.Trim();
+        try
+        {
+            using var document = JsonDocument.Parse(content);
+            var root = document.RootElement;
+            var ok = TryGetBoolean(root, "ok");
+            var command = TryGetString(root, "command");
+            var exitCode = TryGetInt32(root, "exitCode");
+            var timedOut = TryGetBoolean(root, "timedOut");
+            var stdout = TryGetString(root, "stdout");
+            var stderr = TryGetString(root, "stderr");
+
+            if (ok == true && !string.IsNullOrWhiteSpace(stdout))
+            {
+                return "工具已经返回结果，但模型没有生成最终回复。工具输出如下：\n" + TruncateForFallback(stdout);
+            }
+
+            var builder = new StringBuilder("工具调用失败，所以这次没能拿到可用结果。");
+            if (!string.IsNullOrWhiteSpace(command))
+            {
+                builder.AppendLine();
+                builder.Append("命令：").Append(command);
+            }
+
+            if (exitCode is not null)
+            {
+                builder.AppendLine();
+                builder.Append("退出码：").Append(exitCode.Value);
+            }
+
+            if (timedOut == true)
+            {
+                builder.AppendLine();
+                builder.Append("状态：执行超时");
+            }
+
+            if (!string.IsNullOrWhiteSpace(stderr))
+            {
+                builder.AppendLine();
+                builder.Append("错误输出：").Append(TruncateForFallback(stderr));
+            }
+            else if (!string.IsNullOrWhiteSpace(stdout))
+            {
+                builder.AppendLine();
+                builder.Append("工具输出：").Append(TruncateForFallback(stdout));
+            }
+            else
+            {
+                builder.AppendLine();
+                builder.Append("工具没有返回 stdout/stderr。");
+            }
+
+            return builder.ToString();
+        }
+        catch (JsonException)
+        {
+            return "工具返回了结果，但模型没有生成最终回复。工具输出如下：\n" + TruncateForFallback(content);
+        }
     }
 
     private static string BuildEmptyToolResultFallback(InferenceRequest request)
