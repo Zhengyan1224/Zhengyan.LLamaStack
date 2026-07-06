@@ -1306,7 +1306,9 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         {
             MaxTokens = request.MaxTokens ?? model.DefaultMaxTokens,
             AntiPrompts = antiPrompts,
-            SamplingPipeline = pipeline
+            SamplingPipeline = pipeline,
+            OverflowStrategy = ContextOverflowStrategy.TruncateAndReprefill,
+            ContextTruncationPercentage = 0.2f
         };
     }
 
@@ -1367,13 +1369,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private InferenceRequest ApplyTruncation(InferenceRequest request, LoadedModel loaded, ModelRuntime model)
     {
-        if (!string.Equals(request.Truncation, "auto", StringComparison.OrdinalIgnoreCase))
+        if (!ShouldAutoTruncate(request))
         {
             return request;
         }
 
         var ctxSize = (int)(model.Options.ContextSize ?? 4096);
-        var headroom = Math.Min(2048, ctxSize / 5);
+        var requestedOutputTokens = Math.Clamp(request.MaxTokens ?? model.Options.DefaultMaxTokens, 64, Math.Max(64, ctxSize / 2));
+        var headroom = Math.Clamp(requestedOutputTokens + 128, ctxSize / 5, Math.Max(ctxSize / 3, 256));
         var maxPromptTokens = ctxSize - headroom;
         var truncated = request.Messages.ToList();
 
@@ -1395,6 +1398,11 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
 
         return request.WithMessages(truncated);
+    }
+
+    private static bool ShouldAutoTruncate(InferenceRequest request)
+    {
+        return !string.Equals(request.Truncation, "disabled", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool RemoveLeastImportantMessage(List<InferenceMessage> messages)
@@ -1535,7 +1543,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         if (request.Tools.Count > 0 && request.ToolChoiceMode != InferenceToolChoiceMode.None)
         {
-            var toolInstruction = BuildToolInstruction(request);
+            var toolInstruction = BuildToolInstruction(request, includeToolDefinitions: !PromptAlreadyContainsToolDefinitions(request));
             var systemIndex = messages.FindIndex(x => x.Role == "system");
             if (systemIndex >= 0)
             {
@@ -1959,15 +1967,59 @@ ws ::= [ \t\n\r]*
             .Replace("\t", "\\t", StringComparison.Ordinal);
     }
 
-    private static string BuildToolInstruction(InferenceRequest request)
+    private static bool PromptAlreadyContainsToolDefinitions(InferenceRequest request)
     {
-        var options = OpenAiJson.CreateOptions();
-        var toolJson = JsonSerializer.Serialize(request.Tools, options);
+        if (request.Tools.Count == 0)
+        {
+            return false;
+        }
+
+        var functionNames = request.Tools
+            .Select(x => x.Function?.Name)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (functionNames.Length == 0)
+        {
+            return false;
+        }
+
+        var systemContent = string.Join(Environment.NewLine, request.Messages
+            .Where(x => string.Equals(x.Role, "system", StringComparison.OrdinalIgnoreCase))
+            .Select(x => x.Content ?? string.Empty));
+
+        if (!systemContent.Contains("Available tools are provided as JSON", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!systemContent.Contains("\"type\"", StringComparison.OrdinalIgnoreCase) ||
+            !systemContent.Contains("\"function\"", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return functionNames.All(name => systemContent.Contains(name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string BuildToolInstruction(InferenceRequest request, bool includeToolDefinitions = true)
+    {
         var builder = new StringBuilder();
         builder.AppendLine("Use tools whenever the user's request needs current, external, local project, file, command, memory, skill, calculation, or other registered capabilities.");
         builder.AppendLine("For those requests, do not answer from model memory and do not ask the user to perform the lookup.");
-        builder.AppendLine("Available tools are provided as JSON:");
-        builder.AppendLine(toolJson);
+        if (includeToolDefinitions)
+        {
+            var options = OpenAiJson.CreateOptions();
+            var toolJson = JsonSerializer.Serialize(request.Tools, options);
+            builder.AppendLine("Available tools are provided as JSON:");
+            builder.AppendLine(toolJson);
+        }
+        else
+        {
+            builder.AppendLine("Available tool definitions were already provided earlier in the system message. Use only those registered tool names and schemas.");
+        }
+
         if (!string.IsNullOrWhiteSpace(request.ToolChoiceDescription))
         {
             builder.AppendLine("Tool choice: " + request.ToolChoiceDescription);

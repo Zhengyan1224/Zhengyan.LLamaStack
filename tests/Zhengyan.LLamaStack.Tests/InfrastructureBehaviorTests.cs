@@ -1,6 +1,7 @@
 using System.Net;
 using System.Reflection;
 using System.Text.Json;
+using LLama.Common;
 using LLama.Sampling;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Options;
@@ -37,6 +38,27 @@ public sealed class InfrastructureBehaviorTests
     private static readonly MethodInfo BuildInvalidToolCallFallbackMethod =
         typeof(LLamaInferenceService).GetMethod("BuildInvalidToolCallFallback", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("BuildInvalidToolCallFallback method was not found.");
+
+    private static readonly MethodInfo CreateInferenceParamsMethod =
+        typeof(LLamaInferenceService).GetMethod("CreateInferenceParams", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("CreateInferenceParams method was not found.");
+
+    private static readonly MethodInfo ShouldAutoTruncateMethod =
+        typeof(LLamaInferenceService).GetMethod("ShouldAutoTruncate", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("ShouldAutoTruncate method was not found.");
+
+    private static readonly MethodInfo PromptAlreadyContainsToolDefinitionsMethod =
+        typeof(LLamaInferenceService).GetMethod("PromptAlreadyContainsToolDefinitions", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("PromptAlreadyContainsToolDefinitions method was not found.");
+
+    private static readonly MethodInfo BuildToolInstructionMethod =
+        typeof(LLamaInferenceService).GetMethod(
+            "BuildToolInstruction",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: [typeof(InferenceRequest), typeof(bool)],
+            modifiers: null)
+        ?? throw new InvalidOperationException("BuildToolInstruction method was not found.");
 
     [Fact]
     public async Task MemoryStore_PersistsAndUpdatesResponseTasks()
@@ -367,6 +389,53 @@ public sealed class InfrastructureBehaviorTests
         Assert.DoesNotContain("<think>", fallback);
     }
 
+    [Fact]
+    public void InferenceParams_UsesTruncateAndReprefillOverflowStrategy()
+    {
+        var model = new LLamaModelRuntimeOptions
+        {
+            DefaultMaxTokens = 256
+        };
+
+        var parameters = CreateInferenceParams(model, new InferenceRequest());
+
+        Assert.Equal(ContextOverflowStrategy.TruncateAndReprefill, parameters.OverflowStrategy);
+        Assert.Equal(0.2f, parameters.ContextTruncationPercentage);
+    }
+
+    [Fact]
+    public void AutoTruncation_DefaultsOnUnlessExplicitlyDisabled()
+    {
+        Assert.True(ShouldAutoTruncate(new InferenceRequest()));
+        Assert.True(ShouldAutoTruncate(new InferenceRequest { Truncation = "auto" }));
+        Assert.False(ShouldAutoTruncate(new InferenceRequest { Truncation = "disabled" }));
+    }
+
+    [Fact]
+    public void ToolInstruction_DoesNotDuplicateAlreadyProvidedToolDefinitions()
+    {
+        var request = CreateToolInferenceRequest("memory_search", "skill_list");
+        request.Messages =
+        [
+            new InferenceMessage
+            {
+                Role = "system",
+                Content = """
+                    Available tools are provided as JSON:
+                    [{"type":"function","function":{"name":"memory_search","parameters":{}}},{"type":"function","function":{"name":"skill_list","parameters":{}}}]
+                    """
+            }
+        ];
+
+        Assert.True(PromptAlreadyContainsToolDefinitions(request));
+
+        var instruction = BuildToolInstruction(request, includeToolDefinitions: false);
+
+        Assert.DoesNotContain("[{\"type\":\"function\"", instruction);
+        Assert.Contains("already provided", instruction);
+        Assert.Contains("tool_calls", instruction);
+    }
+
     private static ResponseTaskInfo CreateTask(string id)
     {
         return new ResponseTaskInfo
@@ -483,6 +552,30 @@ public sealed class InfrastructureBehaviorTests
     {
         object?[] parameters = [invalidOutput];
         return (string)BuildInvalidToolCallFallbackMethod.Invoke(null, parameters)!;
+    }
+
+    private static InferenceParams CreateInferenceParams(LLamaModelRuntimeOptions model, InferenceRequest request)
+    {
+        object?[] parameters = [model, request];
+        return (InferenceParams)CreateInferenceParamsMethod.Invoke(null, parameters)!;
+    }
+
+    private static bool ShouldAutoTruncate(InferenceRequest request)
+    {
+        object?[] parameters = [request];
+        return (bool)ShouldAutoTruncateMethod.Invoke(null, parameters)!;
+    }
+
+    private static bool PromptAlreadyContainsToolDefinitions(InferenceRequest request)
+    {
+        object?[] parameters = [request];
+        return (bool)PromptAlreadyContainsToolDefinitionsMethod.Invoke(null, parameters)!;
+    }
+
+    private static string BuildToolInstruction(InferenceRequest request, bool includeToolDefinitions)
+    {
+        object?[] parameters = [request, includeToolDefinitions];
+        return (string)BuildToolInstructionMethod.Invoke(null, parameters)!;
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory
