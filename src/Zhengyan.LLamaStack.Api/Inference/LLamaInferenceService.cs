@@ -256,6 +256,25 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 request = retryRequest;
                 text = createdText.ToString();
                 toolCalls = TryExtractToolCalls(text, request, out cleanText);
+
+                if (toolCalls.Count == 0 && IsInvalidToolProtocolRetryOutput(cleanText))
+                {
+                    var repairRequest = AddToolProtocolRepairNudge(request, cleanText);
+                    createdText.Clear();
+                    await foreach (var token in StreamTextAsync(repairRequest, loaded, model, cancellationToken))
+                    {
+                        createdText.Append(token);
+                    }
+
+                    request = repairRequest;
+                    text = createdText.ToString();
+                    toolCalls = TryExtractToolCalls(text, request, out cleanText);
+
+                    if (toolCalls.Count == 0 && IsInvalidToolProtocolRetryOutput(cleanText))
+                    {
+                        cleanText = BuildInvalidToolCallFallback(cleanText);
+                    }
+                }
             }
 
             if (toolCalls.Count == 0 && HasToolResultMessage(request) && IsNonAnswer(cleanText))
@@ -1607,6 +1626,19 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return text.Length == 0 || ContainsOnlyMarkupTagsAndWhitespace(text);
     }
 
+    private static bool IsInvalidToolProtocolRetryOutput(string cleanText)
+    {
+        var text = cleanText.Trim();
+        if (text.Length == 0 || ContainsOnlyMarkupTagsAndWhitespace(text))
+        {
+            return true;
+        }
+
+        return text.StartsWith('{') ||
+            text.StartsWith('[') ||
+            text.StartsWith("<dw_tool_call>", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool ContainsOnlyMarkupTagsAndWhitespace(string text)
     {
         var sawTag = false;
@@ -1659,7 +1691,42 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         retryRequest.ToolChoiceMode = retryRequest.ToolChoiceMode == InferenceToolChoiceMode.Auto
             ? InferenceToolChoiceMode.Required
             : retryRequest.ToolChoiceMode;
+        retryRequest.Temperature = 0;
         return retryRequest;
+    }
+
+    private static InferenceRequest AddToolProtocolRepairNudge(InferenceRequest request, string invalidOutput)
+    {
+        var excerpt = TruncateForFallback(invalidOutput);
+        var messages = request.Messages.Concat(
+        [
+            new InferenceMessage
+            {
+                Role = "user",
+                Content = "The previous assistant output was incomplete or invalid tool-call JSON: " + excerpt + "\nReturn a complete tool call now. Respond only with a complete JSON object in this shape: {\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{}\"}}]}. Do not output reasoning, Markdown, prose, or a partial JSON fragment."
+            }
+        ]).ToArray();
+
+        var warnings = request.CompatibilityWarnings
+            .Concat(["Model returned incomplete tool-call JSON; retried once without constrained decoding."])
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        var repairRequest = request.WithMessages(messages, warnings);
+        repairRequest.ForceToolCallJson = false;
+        repairRequest.ToolChoiceMode = repairRequest.ToolChoiceMode == InferenceToolChoiceMode.Auto
+            ? InferenceToolChoiceMode.Required
+            : repairRequest.ToolChoiceMode;
+        repairRequest.Temperature = 0;
+        return repairRequest;
+    }
+
+    private static string BuildInvalidToolCallFallback(string invalidOutput)
+    {
+        var excerpt = TruncateForFallback(invalidOutput);
+        return string.IsNullOrWhiteSpace(excerpt)
+            ? "模型没有生成有效的工具调用，因此无法继续执行这次查询。请稍后重试，或调整可用工具/提示词后再试。"
+            : "模型没有生成有效的工具调用，因此无法继续执行这次查询。模型返回的无效片段如下：\n" + excerpt;
     }
 
     private static string BuildToolResultNonAnswerFallback(InferenceRequest request)

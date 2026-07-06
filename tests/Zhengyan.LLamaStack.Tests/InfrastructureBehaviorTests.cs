@@ -30,6 +30,14 @@ public sealed class InfrastructureBehaviorTests
         typeof(LLamaInferenceService).GetMethod("BuildToolResultNonAnswerFallback", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("BuildToolResultNonAnswerFallback method was not found.");
 
+    private static readonly MethodInfo IsInvalidToolProtocolRetryOutputMethod =
+        typeof(LLamaInferenceService).GetMethod("IsInvalidToolProtocolRetryOutput", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("IsInvalidToolProtocolRetryOutput method was not found.");
+
+    private static readonly MethodInfo BuildInvalidToolCallFallbackMethod =
+        typeof(LLamaInferenceService).GetMethod("BuildInvalidToolCallFallback", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("BuildInvalidToolCallFallback method was not found.");
+
     [Fact]
     public async Task MemoryStore_PersistsAndUpdatesResponseTasks()
     {
@@ -324,6 +332,19 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
+    public void ToolProtocolRetry_TreatsPartialJsonAsInvalid()
+    {
+        Assert.True(IsInvalidToolProtocolRetryOutput("{"));
+        Assert.True(IsInvalidToolProtocolRetryOutput("""{"tool_calls":["""));
+        Assert.False(IsInvalidToolProtocolRetryOutput("I cannot call a tool."));
+
+        var fallback = BuildInvalidToolCallFallback("{");
+
+        Assert.Contains("模型没有生成有效的工具调用", fallback);
+        Assert.NotEqual("{", fallback.Trim());
+    }
+
+    [Fact]
     public void ToolResultFallback_ReportsFailedToolResult()
     {
         var request = new InferenceRequest
@@ -450,6 +471,18 @@ public sealed class InfrastructureBehaviorTests
     {
         object?[] parameters = [request];
         return (string)BuildToolResultNonAnswerFallbackMethod.Invoke(null, parameters)!;
+    }
+
+    private static bool IsInvalidToolProtocolRetryOutput(string cleanText)
+    {
+        object?[] parameters = [cleanText];
+        return (bool)IsInvalidToolProtocolRetryOutputMethod.Invoke(null, parameters)!;
+    }
+
+    private static string BuildInvalidToolCallFallback(string invalidOutput)
+    {
+        object?[] parameters = [invalidOutput];
+        return (string)BuildInvalidToolCallFallbackMethod.Invoke(null, parameters)!;
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory
