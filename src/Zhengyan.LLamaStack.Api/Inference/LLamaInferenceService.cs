@@ -285,7 +285,19 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
                     if (toolCalls.Count == 0 && IsInvalidToolProtocolRetryOutput(cleanText))
                     {
-                        cleanText = BuildInvalidToolCallFallback(cleanText);
+                        toolCalls = TryBuildToolProtocolRecoveryCall(request);
+                        if (toolCalls.Count > 0)
+                        {
+                            cleanText = string.Empty;
+                            request = request.WithCompatibilityWarnings(request.CompatibilityWarnings
+                                .Concat(["Model failed to produce valid tool-call JSON; recovered with a registered tool-discovery call."])
+                                .Distinct(StringComparer.Ordinal)
+                                .ToArray());
+                        }
+                        else
+                        {
+                            cleanText = BuildInvalidToolCallFallback(cleanText);
+                        }
                     }
                 }
             }
@@ -1866,6 +1878,70 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return Math.Clamp(maxTokens ?? ToolRetryMaxTokens, ToolRetryMinimumTokens, ToolRetryMaxTokens);
     }
 
+    private static IReadOnlyList<OpenAiToolCall> TryBuildToolProtocolRecoveryCall(InferenceRequest request)
+    {
+        if (request.Tools.Count == 0 || request.ToolChoiceMode == InferenceToolChoiceMode.None)
+        {
+            return [];
+        }
+
+        if (request.ToolChoiceMode == InferenceToolChoiceMode.Function &&
+            !string.IsNullOrWhiteSpace(request.ToolChoiceName) &&
+            IsRegisteredToolName(request, request.ToolChoiceName))
+        {
+            return [CreateToolCall(request.ToolChoiceName, "{}")];
+        }
+
+        var skillList = request.Tools
+            .Select(tool => tool.Function?.Name)
+            .FirstOrDefault(name => string.Equals(name, "skill_list", StringComparison.OrdinalIgnoreCase));
+
+        if (!string.IsNullOrWhiteSpace(skillList))
+        {
+            return [CreateToolCall(skillList, "{}")];
+        }
+
+        if (request.ToolChoiceMode == InferenceToolChoiceMode.Required)
+        {
+            var noArgumentTool = request.Tools.FirstOrDefault(ToolAllowsEmptyArguments);
+            if (!string.IsNullOrWhiteSpace(noArgumentTool?.Function?.Name))
+            {
+                return [CreateToolCall(noArgumentTool.Function.Name, "{}")];
+            }
+        }
+
+        return [];
+    }
+
+    private static bool IsRegisteredToolName(InferenceRequest request, string name)
+    {
+        return request.Tools.Any(tool =>
+            string.Equals(tool.Type, "function", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(tool.Function?.Name, name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool ToolAllowsEmptyArguments(OpenAiTool tool)
+    {
+        if (!string.Equals(tool.Type, "function", StringComparison.OrdinalIgnoreCase) ||
+            tool.Function is null)
+        {
+            return false;
+        }
+
+        var parameters = tool.Function.Parameters;
+        return parameters is null ||
+            parameters.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined ||
+            !HasRequiredParameters(parameters.Value);
+    }
+
+    private static bool HasRequiredParameters(JsonElement parameters)
+    {
+        return parameters.ValueKind == JsonValueKind.Object &&
+            parameters.TryGetProperty("required", out var required) &&
+            required.ValueKind == JsonValueKind.Array &&
+            required.GetArrayLength() > 0;
+    }
+
     private static string BuildToolNamesList(InferenceRequest request)
     {
         var names = request.Tools
@@ -2270,7 +2346,7 @@ ws ::= [ \t\n\r]*
             return [];
         }
 
-        var textProtocolCalls = TryExtractDwToolCalls(cleanText, request);
+        var textProtocolCalls = TryExtractTaggedToolCalls(cleanText, request);
         if (textProtocolCalls.Count > 0)
         {
             cleanText = string.Empty;
@@ -2391,11 +2467,19 @@ ws ::= [ \t\n\r]*
         };
     }
 
-    private static IReadOnlyList<OpenAiToolCall> TryExtractDwToolCalls(string text, InferenceRequest request)
+    private static IReadOnlyList<OpenAiToolCall> TryExtractTaggedToolCalls(string text, InferenceRequest request)
     {
-        const string startTag = "<dw_tool_call>";
-        const string endTag = "</dw_tool_call>";
         var calls = new List<OpenAiToolCall>();
+        AddTaggedToolCalls(text, "dw_tool_call", calls);
+        AddTaggedToolCalls(text, "tool_call", calls);
+        AddTaggedToolCalls(text, "function_call", calls);
+        return calls.Count > 0 ? ValidateToolCalls(calls, request) : [];
+    }
+
+    private static void AddTaggedToolCalls(string text, string tagName, List<OpenAiToolCall> calls)
+    {
+        var startTag = "<" + tagName + ">";
+        var endTag = "</" + tagName + ">";
         var searchStart = 0;
 
         while (searchStart < text.Length)
@@ -2424,13 +2508,11 @@ ws ::= [ \t\n\r]*
             }
             catch (JsonException)
             {
-                return [];
+                return;
             }
 
             searchStart = end + endTag.Length;
         }
-
-        return calls.Count > 0 ? ValidateToolCalls(calls, request) : [];
     }
 
     private static bool TryReadTextProtocolToolCall(JsonElement root, out OpenAiToolCall call)
@@ -2451,7 +2533,8 @@ ws ::= [ \t\n\r]*
         }
 
         var arguments = "{}";
-        if (root.TryGetProperty("arguments", out var argumentsElement) &&
+        if ((root.TryGetProperty("arguments", out var argumentsElement) ||
+                root.TryGetProperty("parameters", out argumentsElement)) &&
             argumentsElement.ValueKind != JsonValueKind.Null &&
             argumentsElement.ValueKind != JsonValueKind.Undefined)
         {

@@ -68,6 +68,10 @@ public sealed class InfrastructureBehaviorTests
         typeof(LLamaInferenceService).GetMethod("AddToolProtocolRepairNudge", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("AddToolProtocolRepairNudge method was not found.");
 
+    private static readonly MethodInfo TryBuildToolProtocolRecoveryCallMethod =
+        typeof(LLamaInferenceService).GetMethod("TryBuildToolProtocolRecoveryCall", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("TryBuildToolProtocolRecoveryCall method was not found.");
+
     [Fact]
     public async Task MemoryStore_PersistsAndUpdatesResponseTasks()
     {
@@ -272,6 +276,42 @@ public sealed class InfrastructureBehaviorTests
         var call = Assert.Single(toolCalls);
         Assert.Equal("skill_list", call.Function.Name);
         Assert.Equal("""{"includeContent":true}""", call.Function.Arguments);
+    }
+
+    [Fact]
+    public void ToolCallExtraction_ParsesCommonToolCallTags()
+    {
+        var request = CreateToolInferenceRequest("skill_run_command");
+
+        var toolCalls = ExtractToolCalls(
+            """
+            <tool_call>
+            {"name":"skill_run_command","arguments":{"command":"echo hello"}}
+            </tool_call>
+            """,
+            request,
+            out var cleanText);
+
+        Assert.Empty(cleanText);
+        var call = Assert.Single(toolCalls);
+        Assert.Equal("skill_run_command", call.Function.Name);
+        Assert.Equal("""{"command":"echo hello"}""", call.Function.Arguments);
+    }
+
+    [Fact]
+    public void ToolCallExtraction_ParsesTaggedToolCallParametersAlias()
+    {
+        var request = CreateToolInferenceRequest("skill_run_command");
+
+        var toolCalls = ExtractToolCalls(
+            """<tool_call>{"name":"skill_run_command","parameters":{"command":"echo hello"}}</tool_call>""",
+            request,
+            out var cleanText);
+
+        Assert.Empty(cleanText);
+        var call = Assert.Single(toolCalls);
+        Assert.Equal("skill_run_command", call.Function.Name);
+        Assert.Equal("""{"command":"echo hello"}""", call.Function.Arguments);
     }
 
     [Fact]
@@ -484,6 +524,42 @@ public sealed class InfrastructureBehaviorTests
 
         Assert.Contains("模型没有生成有效的工具调用", fallback);
         Assert.NotEqual("{", fallback.Trim());
+    }
+
+    [Fact]
+    public void ToolProtocolRecovery_UsesRegisteredSkillListWhenAvailable()
+    {
+        var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
+
+        var calls = TryBuildToolProtocolRecoveryCall(request);
+
+        var call = Assert.Single(calls);
+        Assert.Equal("skill_list", call.Function.Name);
+        Assert.Equal("{}", call.Function.Arguments);
+    }
+
+    [Fact]
+    public void ToolProtocolRecovery_DoesNotGuessPureAutoCustomTool()
+    {
+        var request = CreateToolInferenceRequest("lookup_weather");
+
+        var calls = TryBuildToolProtocolRecoveryCall(request);
+
+        Assert.Empty(calls);
+    }
+
+    [Fact]
+    public void ToolProtocolRecovery_HonorsSpecificFunctionChoice()
+    {
+        var request = CreateToolInferenceRequest("lookup_weather");
+        request.ToolChoiceMode = InferenceToolChoiceMode.Function;
+        request.ToolChoiceName = "lookup_weather";
+
+        var calls = TryBuildToolProtocolRecoveryCall(request);
+
+        var call = Assert.Single(calls);
+        Assert.Equal("lookup_weather", call.Function.Name);
+        Assert.Equal("{}", call.Function.Arguments);
     }
 
     [Fact]
@@ -757,6 +833,12 @@ public sealed class InfrastructureBehaviorTests
     {
         object?[] parameters = [request, invalidOutput];
         return (InferenceRequest)AddToolProtocolRepairNudgeMethod.Invoke(null, parameters)!;
+    }
+
+    private static IReadOnlyList<OpenAiToolCall> TryBuildToolProtocolRecoveryCall(InferenceRequest request)
+    {
+        object?[] parameters = [request];
+        return (IReadOnlyList<OpenAiToolCall>)TryBuildToolProtocolRecoveryCallMethod.Invoke(null, parameters)!;
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory
