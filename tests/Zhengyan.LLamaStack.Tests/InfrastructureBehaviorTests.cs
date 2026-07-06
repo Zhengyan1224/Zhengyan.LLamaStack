@@ -390,7 +390,7 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
-    public void InferenceParams_UsesTruncateAndReprefillOverflowStrategy()
+    public void InferenceParams_UsesManualOverflowManagement()
     {
         var model = new LLamaModelRuntimeOptions
         {
@@ -399,8 +399,38 @@ public sealed class InfrastructureBehaviorTests
 
         var parameters = CreateInferenceParams(model, new InferenceRequest());
 
-        Assert.Equal(ContextOverflowStrategy.TruncateAndReprefill, parameters.OverflowStrategy);
-        Assert.Equal(0.2f, parameters.ContextTruncationPercentage);
+        Assert.Equal(ContextOverflowStrategy.ThrowException, parameters.OverflowStrategy);
+        Assert.Equal(256, parameters.MaxTokens);
+    }
+
+    [Fact]
+    public void InferenceParams_LimitsMaxTokensToRemainingContext()
+    {
+        var model = new LLamaModelRuntimeOptions
+        {
+            ContextSize = 4096,
+            DefaultMaxTokens = 512
+        };
+
+        var parameters = CreateInferenceParams(model, new InferenceRequest(), promptTokens: 4000);
+
+        Assert.Equal(64, parameters.MaxTokens);
+    }
+
+    [Fact]
+    public void InferenceParams_RejectsPromptThatLeavesNoCompletionBudget()
+    {
+        var model = new LLamaModelRuntimeOptions
+        {
+            ContextSize = 4096,
+            DefaultMaxTokens = 512
+        };
+
+        var exception = Assert.Throws<TargetInvocationException>(() =>
+            CreateInferenceParams(model, new InferenceRequest(), promptTokens: 4050));
+        var protocol = Assert.IsType<OpenAiProtocolException>(exception.InnerException);
+
+        Assert.Equal("context_length_exceeded", protocol.Code);
     }
 
     [Fact]
@@ -434,6 +464,25 @@ public sealed class InfrastructureBehaviorTests
         Assert.DoesNotContain("[{\"type\":\"function\"", instruction);
         Assert.Contains("already provided", instruction);
         Assert.Contains("tool_calls", instruction);
+    }
+
+    [Fact]
+    public void ToolInstruction_DoesNotDuplicateClientProvidedToolCatalog()
+    {
+        var request = CreateToolInferenceRequest("memory_search", "skill_list");
+        request.Messages =
+        [
+            new InferenceMessage
+            {
+                Role = "system",
+                Content = "\u53ef\u7528\u5de5\u5177:\n" +
+                    "- memory_search: Search long-term memory files.\n" +
+                    "- skill_list: List project skills.\n" +
+                    "\u5de5\u5177\u8c03\u7528: respond with tool_calls JSON."
+            }
+        ];
+
+        Assert.True(PromptAlreadyContainsToolDefinitions(request));
     }
 
     private static ResponseTaskInfo CreateTask(string id)
@@ -554,9 +603,9 @@ public sealed class InfrastructureBehaviorTests
         return (string)BuildInvalidToolCallFallbackMethod.Invoke(null, parameters)!;
     }
 
-    private static InferenceParams CreateInferenceParams(LLamaModelRuntimeOptions model, InferenceRequest request)
+    private static InferenceParams CreateInferenceParams(LLamaModelRuntimeOptions model, InferenceRequest request, int? promptTokens = null)
     {
-        object?[] parameters = [model, request];
+        object?[] parameters = [model, request, promptTokens];
         return (InferenceParams)CreateInferenceParamsMethod.Invoke(null, parameters)!;
     }
 

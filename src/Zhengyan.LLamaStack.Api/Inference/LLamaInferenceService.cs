@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using LLama;
 using LLama.Common;
+using LLama.Exceptions;
 using LLama.Native;
 using LLama.Sampling;
 using Microsoft.Extensions.Options;
@@ -15,6 +16,10 @@ namespace Zhengyan.LLamaStack.Api.Inference;
 
 public sealed class LLamaInferenceService : IAsyncDisposable
 {
+    private const int ContextOverflowSafetyTokens = 32;
+    private const int MinimumCompletionTokens = 16;
+    private const int ToolRetryMaxTokens = 256;
+
     private readonly LLamaStackOptions _options;
     private readonly ILogger<LLamaInferenceService> _logger;
     private readonly Dictionary<string, ModelRuntime> _models;
@@ -171,13 +176,20 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     public async Task<InferenceCompletion> CompleteAsync(InferenceRequest request, CancellationToken cancellationToken)
     {
-        var n = Math.Max(1, request.N ?? 1);
-        if (n > 1)
+        try
         {
-            return await MultiChoiceCompleteAsync(request, n, cancellationToken);
-        }
+            var n = Math.Max(1, request.N ?? 1);
+            if (n > 1)
+            {
+                return await MultiChoiceCompleteAsync(request, n, cancellationToken);
+            }
 
-        return await CompleteOnceAsync(request, cancellationToken);
+            return await CompleteOnceAsync(request, cancellationToken);
+        }
+        catch (ContextOverflowException exception)
+        {
+            throw CreateContextOverflowException(exception);
+        }
     }
 
     private async Task<InferenceCompletion> MultiChoiceCompleteAsync(InferenceRequest request, int n, CancellationToken cancellationToken)
@@ -621,8 +633,8 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         ModelRuntime model,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var (prompt, _, media, mediaCount) = BuildPromptWithCount(request, loaded, model);
-        var inferenceParams = CreateInferenceParams(model.Options, request);
+        var (prompt, promptTokens, media, mediaCount) = BuildPromptWithCount(request, loaded, model);
+        var inferenceParams = CreateInferenceParams(model.Options, request, promptTokens);
         await foreach (var token in StreamTextAsync(prompt, inferenceParams, loaded, media, mediaCount, cancellationToken))
         {
             yield return token;
@@ -652,7 +664,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         try
         {
         var (prompt, promptTokens, media, mediaCount) = BuildPromptWithCount(request, loaded, model);
-        var inferenceParams = CreateInferenceParams(model.Options, request);
+        var inferenceParams = CreateInferenceParams(model.Options, request, promptTokens);
         var completion = new StringBuilder();
         await foreach (var token in StreamTextAsync(prompt, inferenceParams, loaded, media, mediaCount, cancellationToken))
         {
@@ -787,7 +799,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         try
         {
         var (prompt, promptTokens, media, mediaCount) = BuildPromptWithCount(request, loaded, model);
-        var inferenceParams = CreateInferenceParams(model.Options, request);
+        var inferenceParams = CreateInferenceParams(model.Options, request, promptTokens);
 
         yield return ToSse(new
         {
@@ -1260,7 +1272,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return parameters;
     }
 
-    private static InferenceParams CreateInferenceParams(LLamaModelRuntimeOptions model, InferenceRequest request)
+    private static InferenceParams CreateInferenceParams(LLamaModelRuntimeOptions model, InferenceRequest request, int? promptTokens = null)
     {
         var logitBias = request.LogitBias is { Count: > 0 }
             ? request.LogitBias.ToDictionary(kv => (LLamaToken)kv.Key, kv => kv.Value)
@@ -1304,12 +1316,47 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             .Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToArray();
         return new InferenceParams
         {
-            MaxTokens = request.MaxTokens ?? model.DefaultMaxTokens,
+            MaxTokens = ResolveMaxTokens(model, request, promptTokens),
             AntiPrompts = antiPrompts,
             SamplingPipeline = pipeline,
-            OverflowStrategy = ContextOverflowStrategy.TruncateAndReprefill,
-            ContextTruncationPercentage = 0.2f
+            OverflowStrategy = ContextOverflowStrategy.ThrowException
         };
+    }
+
+    private static int ResolveMaxTokens(LLamaModelRuntimeOptions model, InferenceRequest request, int? promptTokens)
+    {
+        var requested = request.MaxTokens ?? model.DefaultMaxTokens;
+        if (requested <= 0)
+        {
+            requested = model.DefaultMaxTokens > 0 ? model.DefaultMaxTokens : 512;
+        }
+
+        if (promptTokens is null)
+        {
+            return requested;
+        }
+
+        var ctxSize = checked((int)(model.ContextSize ?? 4096));
+        var available = ctxSize - promptTokens.Value - ContextOverflowSafetyTokens;
+        if (available < MinimumCompletionTokens)
+        {
+            throw new OpenAiProtocolException(
+                StatusCodes.Status400BadRequest,
+                $"The request is too large for the configured context window. Prompt tokens: {promptTokens.Value}, context window: {ctxSize}. Reduce the system prompt, tool definitions, or conversation history, or increase LLamaStack:Models[].ContextSize.",
+                code: "context_length_exceeded",
+                param: "messages");
+        }
+
+        return Math.Min(requested, available);
+    }
+
+    private static OpenAiProtocolException CreateContextOverflowException(ContextOverflowException exception)
+    {
+        return new OpenAiProtocolException(
+            StatusCodes.Status400BadRequest,
+            "The request exceeded the configured context window during generation. Reduce the prompt/history/tool definitions, lower max_tokens, or increase LLamaStack:Models[].ContextSize. LLamaSharp detail: " + exception.Message,
+            code: "context_length_exceeded",
+            param: "messages");
     }
 
     private static void ResetExecutorState(LoadedModel loaded)
@@ -1598,7 +1645,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             new InferenceMessage
             {
                 Role = "user",
-                Content = "The previous message contains a tool result. Continue the user's original task now: answer from the tool result if possible, or call another appropriate tool with corrected arguments if the tool failed. Do not return an empty response."
+                Content = "Continue the original task from the tool result. If it failed, call a corrected tool or explain the failure. Do not return an empty response."
             }
         ]).ToArray();
 
@@ -1685,7 +1732,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             new InferenceMessage
             {
                 Role = "user",
-                Content = "The previous assistant message was not a valid final answer or a valid tool call. Continue the same user request. If the request needs current, external, local project, file, command, memory, skill, calculation, or other registered capabilities, call the appropriate available tool. Respond only with the JSON tool_calls object described above. In this retry, function.arguments may be a JSON object; the server will normalize it to the OpenAI string form."
+                Content = "Retry the same request by calling the appropriate available tool. Output only the JSON tool_calls object. No reasoning, Markdown, prose, or partial JSON."
             }
         ]).ToArray();
 
@@ -1700,6 +1747,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             ? InferenceToolChoiceMode.Required
             : retryRequest.ToolChoiceMode;
         retryRequest.Temperature = 0;
+        retryRequest.MaxTokens = Math.Min(retryRequest.MaxTokens ?? ToolRetryMaxTokens, ToolRetryMaxTokens);
         return retryRequest;
     }
 
@@ -1711,7 +1759,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             new InferenceMessage
             {
                 Role = "user",
-                Content = "The previous assistant output was incomplete or invalid tool-call JSON: " + excerpt + "\nReturn a complete tool call now. Respond only with a complete JSON object in this shape: {\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{}\"}}]}. Do not output reasoning, Markdown, prose, or a partial JSON fragment."
+                Content = "The previous tool-call JSON was invalid: " + excerpt + "\nReturn one complete JSON object now: {\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{}\"}}]}. No prose or partial JSON."
             }
         ]).ToArray();
 
@@ -1726,6 +1774,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             ? InferenceToolChoiceMode.Required
             : repairRequest.ToolChoiceMode;
         repairRequest.Temperature = 0;
+        repairRequest.MaxTokens = Math.Min(repairRequest.MaxTokens ?? ToolRetryMaxTokens, ToolRetryMaxTokens);
         return repairRequest;
     }
 
@@ -1989,18 +2038,24 @@ ws ::= [ \t\n\r]*
             .Where(x => string.Equals(x.Role, "system", StringComparison.OrdinalIgnoreCase))
             .Select(x => x.Content ?? string.Empty));
 
-        if (!systemContent.Contains("Available tools are provided as JSON", StringComparison.OrdinalIgnoreCase))
+        var hasToolCatalogMarker =
+            systemContent.Contains("Available tools", StringComparison.OrdinalIgnoreCase) ||
+            systemContent.Contains("\u53ef\u7528\u5de5\u5177", StringComparison.OrdinalIgnoreCase);
+        if (!hasToolCatalogMarker)
         {
             return false;
         }
 
-        if (!systemContent.Contains("\"type\"", StringComparison.OrdinalIgnoreCase) ||
-            !systemContent.Contains("\"function\"", StringComparison.OrdinalIgnoreCase))
+        if (!functionNames.All(name => systemContent.Contains(name, StringComparison.OrdinalIgnoreCase)))
         {
             return false;
         }
 
-        return functionNames.All(name => systemContent.Contains(name, StringComparison.OrdinalIgnoreCase));
+        return systemContent.Contains("\"function\"", StringComparison.OrdinalIgnoreCase) ||
+            systemContent.Contains("function calling", StringComparison.OrdinalIgnoreCase) ||
+            systemContent.Contains("tool_calls", StringComparison.OrdinalIgnoreCase) ||
+            systemContent.Contains("<dw_tool_call>", StringComparison.OrdinalIgnoreCase) ||
+            systemContent.Contains("\u5de5\u5177\u8c03\u7528", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildToolInstruction(InferenceRequest request, bool includeToolDefinitions = true)
