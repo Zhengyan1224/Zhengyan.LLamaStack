@@ -389,19 +389,67 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
-    public void ToolProtocolRepairNudge_UsesGrammarAndRealToolNames()
+    public void ToolProtocolRetryNudge_PrunesPreviousFailureHistory()
+    {
+        var request = CreateToolInferenceRequest("skill_run_command");
+        request.Messages =
+        [
+            new InferenceMessage { Role = "system", Content = "system prompt" },
+            new InferenceMessage { Role = "user", Content = "hello" },
+            new InferenceMessage { Role = "assistant", Content = "hello response" },
+            new InferenceMessage { Role = "user", Content = "lookup weather" },
+            new InferenceMessage { Role = "assistant", Content = "Model did not generate a valid tool call.\n{" },
+            new InferenceMessage { Role = "user", Content = "check this computer memory" },
+            new InferenceMessage { Role = "user", Content = "The previous assistant message was not a valid final answer or a valid tool call. Continue the same user request." }
+        ];
+
+        var retry = AddToolProtocolRetryNudge(request);
+
+        Assert.Equal(3, retry.Messages.Count);
+        Assert.Equal("system", retry.Messages[0].Role);
+        Assert.Equal("system prompt", retry.Messages[0].Content);
+        Assert.Equal("user", retry.Messages[1].Role);
+        Assert.Equal("check this computer memory", retry.Messages[1].Content);
+        Assert.StartsWith("Retry the same request by calling", retry.Messages[2].Content);
+        Assert.DoesNotContain(retry.Messages, message => message.Content.Contains("Model did not generate", StringComparison.Ordinal));
+        Assert.DoesNotContain(retry.Messages, message => message.Content.Contains("lookup weather", StringComparison.Ordinal));
+        Assert.DoesNotContain(retry.Messages, message => message.Content.Contains("previous assistant message", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ToolProtocolRepairNudge_DisablesGrammarAndUsesRealToolNames()
     {
         var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
 
         var repair = AddToolProtocolRepairNudge(request, "{\"");
         var nudge = repair.Messages[repair.Messages.Count - 1];
 
-        Assert.True(repair.ForceToolCallJson);
+        Assert.False(repair.ForceToolCallJson);
         Assert.Equal(0, repair.Temperature);
         Assert.Contains("lookup_weather", nudge.Content);
         Assert.Contains("skill_list", nudge.Content);
         Assert.Contains("""{"name":"lookup_weather","arguments":{}}""", nudge.Content);
         Assert.DoesNotContain("tool_calls", nudge.Content);
+    }
+
+    [Fact]
+    public void ToolProtocolRepairNudge_DropsPreviousRetryPrompt()
+    {
+        var request = CreateToolInferenceRequest("skill_run_command");
+        request.Messages =
+        [
+            new InferenceMessage { Role = "system", Content = "system prompt" },
+            new InferenceMessage { Role = "user", Content = "check this computer memory" }
+        ];
+
+        var retry = AddToolProtocolRetryNudge(request);
+        var repair = AddToolProtocolRepairNudge(retry, "{");
+
+        Assert.Equal(3, repair.Messages.Count);
+        Assert.Equal("system prompt", repair.Messages[0].Content);
+        Assert.Equal("check this computer memory", repair.Messages[1].Content);
+        Assert.StartsWith("The previous tool-call JSON was invalid.", repair.Messages[2].Content);
+        Assert.DoesNotContain(repair.Messages, message => message.Content.StartsWith("Retry the same request", StringComparison.Ordinal));
     }
 
     [Fact]

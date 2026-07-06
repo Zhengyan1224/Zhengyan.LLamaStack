@@ -19,6 +19,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     private const int ContextOverflowSafetyTokens = 32;
     private const int MinimumCompletionTokens = 16;
     private const int ToolRetryMaxTokens = 256;
+    private const int ToolRetryMinimumTokens = 64;
 
     private readonly LLamaStackOptions _options;
     private readonly ILogger<LLamaInferenceService> _logger;
@@ -1765,14 +1766,11 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     private static InferenceRequest AddToolProtocolRetryNudge(InferenceRequest request)
     {
         var toolNames = BuildToolNamesList(request);
-        var messages = request.Messages.Concat(
-        [
-            new InferenceMessage
-            {
-                Role = "user",
-                Content = "Retry the same request by calling exactly one available tool. Available tool names: " + toolNames + ". Output only one complete JSON object in this simple shape: {\"name\":\"tool_name\",\"arguments\":{}}. Choose a real tool name from the list. Use {} for arguments if unsure. No reasoning, Markdown, prose, or partial JSON."
-            }
-        ]).ToArray();
+        var messages = BuildToolProtocolRetryMessages(request, new InferenceMessage
+        {
+            Role = "user",
+            Content = "Retry the same request by calling exactly one available tool. Available tool names: " + toolNames + ". Output only one complete JSON object in this simple shape: {\"name\":\"tool_name\",\"arguments\":{}}. Choose a real tool name from the list. Use {} for arguments if unsure. No reasoning, Markdown, prose, or partial JSON."
+        });
 
         var warnings = request.CompatibilityWarnings
             .Concat(["Model returned a non-answer while tools were available; retried once with constrained tool-call JSON."])
@@ -1785,7 +1783,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             ? InferenceToolChoiceMode.Required
             : retryRequest.ToolChoiceMode;
         retryRequest.Temperature = 0;
-        retryRequest.MaxTokens = Math.Min(retryRequest.MaxTokens ?? ToolRetryMaxTokens, ToolRetryMaxTokens);
+        retryRequest.MaxTokens = ResolveToolRetryMaxTokens(retryRequest.MaxTokens);
         return retryRequest;
     }
 
@@ -1793,14 +1791,11 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         var toolNames = BuildToolNamesList(request);
         var exampleToolName = GetFirstToolName(request) ?? "tool_name";
-        var messages = request.Messages.Concat(
-        [
-            new InferenceMessage
-            {
-                Role = "user",
-                Content = "The previous tool-call JSON was invalid. Return exactly one complete JSON object now. Available tool names: " + toolNames + ". The name value must be one real tool name from the list. Use this shape: {\"name\":\"" + exampleToolName + "\",\"arguments\":{}}. No prose or partial JSON."
-            }
-        ]).ToArray();
+        var messages = BuildToolProtocolRetryMessages(request, new InferenceMessage
+        {
+            Role = "user",
+            Content = "The previous tool-call JSON was invalid. Return exactly one complete JSON object now. Available tool names: " + toolNames + ". The name value must be one real tool name from the list. Use this shape: {\"name\":\"" + exampleToolName + "\",\"arguments\":{}}. No prose or partial JSON."
+        });
 
         var warnings = request.CompatibilityWarnings
             .Concat(["Model returned incomplete tool-call JSON; retried once without constrained decoding."])
@@ -1808,13 +1803,61 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             .ToArray();
 
         var repairRequest = request.WithMessages(messages, warnings);
-        repairRequest.ForceToolCallJson = true;
+        repairRequest.ForceToolCallJson = false;
         repairRequest.ToolChoiceMode = repairRequest.ToolChoiceMode == InferenceToolChoiceMode.Auto
             ? InferenceToolChoiceMode.Required
             : repairRequest.ToolChoiceMode;
         repairRequest.Temperature = 0;
-        repairRequest.MaxTokens = Math.Min(repairRequest.MaxTokens ?? ToolRetryMaxTokens, ToolRetryMaxTokens);
+        repairRequest.MaxTokens = ResolveToolRetryMaxTokens(repairRequest.MaxTokens);
         return repairRequest;
+    }
+
+    private static IReadOnlyList<InferenceMessage> BuildToolProtocolRetryMessages(
+        InferenceRequest request,
+        InferenceMessage nudgeMessage)
+    {
+        var messages = new List<InferenceMessage>();
+        messages.AddRange(request.Messages.Where(message => IsSystemRole(message.Role)));
+
+        var latestTask = FindLatestUserTaskMessage(request) ?? FindLatestTaskMessage(request);
+        if (latestTask is not null)
+        {
+            messages.Add(latestTask);
+        }
+
+        messages.Add(nudgeMessage);
+        return messages;
+    }
+
+    private static InferenceMessage? FindLatestUserTaskMessage(InferenceRequest request)
+    {
+        return request.Messages.LastOrDefault(message =>
+            string.Equals(message.Role, "user", StringComparison.OrdinalIgnoreCase) &&
+            !IsToolProtocolNudge(message.Content));
+    }
+
+    private static InferenceMessage? FindLatestTaskMessage(InferenceRequest request)
+    {
+        return request.Messages.LastOrDefault(message =>
+            !IsSystemRole(message.Role) &&
+            !IsToolProtocolNudge(message.Content));
+    }
+
+    private static bool IsToolProtocolNudge(string content)
+    {
+        return content.StartsWith("Retry the same request by calling", StringComparison.Ordinal) ||
+            content.StartsWith("The previous tool-call JSON was invalid.", StringComparison.Ordinal) ||
+            content.StartsWith("The previous assistant message was not a valid final answer", StringComparison.Ordinal);
+    }
+
+    private static bool IsSystemRole(string role)
+    {
+        return string.Equals(role, "system", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int ResolveToolRetryMaxTokens(int? maxTokens)
+    {
+        return Math.Clamp(maxTokens ?? ToolRetryMaxTokens, ToolRetryMinimumTokens, ToolRetryMaxTokens);
     }
 
     private static string BuildToolNamesList(InferenceRequest request)
