@@ -359,6 +359,30 @@ public sealed class OpenAiPostgresStore : IOpenAiStore
                 """;
             await cmd5.ExecuteNonQueryAsync(cancellationToken);
 
+            await using var cmd6 = connection.CreateCommand();
+            cmd6.CommandText =
+                """
+                CREATE TABLE IF NOT EXISTS response_tasks (
+                    id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    source_response_id TEXT NULL,
+                    result_response_id TEXT NULL,
+                    error_message TEXT NULL,
+                    created_at BIGINT NOT NULL,
+                    completed_at BIGINT NULL
+                );
+                """;
+            await cmd6.ExecuteNonQueryAsync(cancellationToken);
+
+            await using var cmd7 = connection.CreateCommand();
+            cmd7.CommandText =
+                """
+                CREATE INDEX IF NOT EXISTS idx_response_tasks_created_id
+                ON response_tasks (created_at DESC, id ASC);
+                """;
+            await cmd7.ExecuteNonQueryAsync(cancellationToken);
+
             _schemaReady = true;
         }
         finally
@@ -437,28 +461,138 @@ public sealed class OpenAiPostgresStore : IOpenAiStore
         return reader.IsDBNull(index) ? default : Deserialize<T>(reader.GetString(index));
     }
 
-    public Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken)
+    public async Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Postgres store. Use Memory store instead.");
+        await EnsureSchemaAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT INTO response_tasks
+                (id, type, status, source_response_id, result_response_id, error_message, created_at, completed_at)
+            VALUES
+                ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (id) DO UPDATE SET
+                type = EXCLUDED.type,
+                status = EXCLUDED.status,
+                source_response_id = EXCLUDED.source_response_id,
+                result_response_id = EXCLUDED.result_response_id,
+                error_message = EXCLUDED.error_message,
+                created_at = EXCLUDED.created_at,
+                completed_at = EXCLUDED.completed_at;
+            """;
+        command.Parameters.AddWithValue("$1", task.Id);
+        command.Parameters.AddWithValue("$2", task.Type);
+        command.Parameters.AddWithValue("$3", SerializeStatus(task.Status));
+        command.Parameters.AddWithValue("$4", (object?)task.SourceResponseId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$5", (object?)task.ResultResponseId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$6", (object?)task.ErrorMessage ?? DBNull.Value);
+        command.Parameters.AddWithValue("$7", task.CreatedAt);
+        command.Parameters.AddWithValue("$8", (object?)task.CompletedAt ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken)
+    public async Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Postgres store. Use Memory store instead.");
+        await EnsureSchemaAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT id, type, status, source_response_id, result_response_id, error_message, created_at, completed_at
+            FROM response_tasks
+            WHERE id = $1;
+            """;
+        command.Parameters.AddWithValue("$1", id);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadResponseTask(reader) : null;
     }
 
-    public Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default)
+    public async Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default)
     {
-        throw new NotSupportedException("Response task management is not supported in Postgres store. Use Memory store instead.");
+        await EnsureSchemaAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE response_tasks
+            SET status = $1,
+                result_response_id = COALESCE($2, result_response_id),
+                error_message = COALESCE($3, error_message),
+                completed_at = COALESCE($4, completed_at)
+            WHERE id = $5;
+            """;
+        command.Parameters.AddWithValue("$1", SerializeStatus(status));
+        command.Parameters.AddWithValue("$2", (object?)resultResponseId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$3", (object?)errorMessage ?? DBNull.Value);
+        command.Parameters.AddWithValue("$4", status is ResponseTaskStatus.Completed or ResponseTaskStatus.Failed
+            ? DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            : DBNull.Value);
+        command.Parameters.AddWithValue("$5", id);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken)
+    public async Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Postgres store. Use Memory store instead.");
+        await EnsureSchemaAsync(cancellationToken);
+        var all = new List<ResponseTaskInfo>();
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT id, type, status, source_response_id, result_response_id, error_message, created_at, completed_at
+            FROM response_tasks
+            ORDER BY created_at DESC, id ASC;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            all.Add(ReadResponseTask(reader));
+        }
+
+        var result = OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.CreatedAt, limit, after, before);
+        return new StoredListResult<ResponseTaskInfo>(result.Items, result.HasMore);
     }
 
     private static string? GetNullableString(IDataRecord reader, int index)
     {
         return reader.IsDBNull(index) ? null : reader.GetString(index);
+    }
+
+    private static ResponseTaskInfo ReadResponseTask(IDataRecord reader)
+    {
+        return new ResponseTaskInfo
+        {
+            Id = reader.GetString(0),
+            Type = reader.GetString(1),
+            Status = DeserializeStatus(reader.GetString(2)),
+            SourceResponseId = GetNullableString(reader, 3),
+            ResultResponseId = GetNullableString(reader, 4),
+            ErrorMessage = GetNullableString(reader, 5),
+            CreatedAt = reader.GetInt64(6),
+            CompletedAt = reader.IsDBNull(7) ? null : reader.GetInt64(7)
+        };
+    }
+
+    private static string SerializeStatus(ResponseTaskStatus status)
+    {
+        return status switch
+        {
+            ResponseTaskStatus.Running => "running",
+            ResponseTaskStatus.Completed => "completed",
+            ResponseTaskStatus.Failed => "failed",
+            _ => "pending"
+        };
+    }
+
+    private static ResponseTaskStatus DeserializeStatus(string status)
+    {
+        return status.ToLowerInvariant() switch
+        {
+            "running" => ResponseTaskStatus.Running,
+            "completed" => ResponseTaskStatus.Completed,
+            "failed" => ResponseTaskStatus.Failed,
+            _ => ResponseTaskStatus.Pending
+        };
     }
 }

@@ -24,9 +24,13 @@ public sealed class OpenApiKeyMiddleware
             return;
         }
 
-        if (!context.Request.Headers.TryGetValue("Authorization", out var authHeader))
+        var headerName = string.IsNullOrWhiteSpace(_options.ApiKeyHeader)
+            ? "Authorization"
+            : _options.ApiKeyHeader;
+
+        if (!context.Request.Headers.TryGetValue(headerName, out var authHeader))
         {
-            await WriteUnauthorized(context, "Missing Authorization header.");
+            await WriteUnauthorized(context, $"Missing {headerName} header.");
             return;
         }
 

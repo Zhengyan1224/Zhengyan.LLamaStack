@@ -1,5 +1,7 @@
 using System.Buffers.Text;
+using System.Net;
 using System.Net.Mime;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
@@ -56,6 +58,7 @@ public sealed class OpenAiRequestMapper
         }
 
         var tools = MergeChatTools(request.Tools, request.Functions);
+        var toolChoice = ParseToolChoice(request.ToolChoice ?? request.FunctionCall);
         var warnings = new List<string>();
         AddChatCompatibilityWarnings(request, warnings);
         return new InferenceRequest
@@ -63,7 +66,9 @@ public sealed class OpenAiRequestMapper
             RequestedModel = request.Model,
             Messages = messages,
             Tools = tools,
-            ToolChoiceDescription = DescribeToolChoice(request.ToolChoice ?? request.FunctionCall),
+            ToolChoiceDescription = toolChoice.Description,
+            ToolChoiceMode = toolChoice.Mode,
+            ToolChoiceName = toolChoice.Name,
             N = Math.Max(1, request.N ?? 1),
             MaxTokens = request.MaxCompletionTokens ?? request.MaxTokens,
             Temperature = ToSingle(request.Temperature),
@@ -112,13 +117,16 @@ public sealed class OpenAiRequestMapper
         }
 
         ValidateUnsupportedResponsesFields(request);
+        var toolChoice = ParseToolChoice(request.ToolChoice);
         var warnings = new List<string>();
         return new InferenceRequest
         {
             RequestedModel = request.Model,
             Messages = messages,
             Tools = request.Tools ?? [],
-            ToolChoiceDescription = DescribeToolChoice(request.ToolChoice),
+            ToolChoiceDescription = toolChoice.Description,
+            ToolChoiceMode = toolChoice.Mode,
+            ToolChoiceName = toolChoice.Name,
             MaxToolCalls = request.MaxToolCalls,
             MaxTokens = ApplyReasoningMaxTokens(ToSingle(request.Temperature), request.MaxOutputTokens, request.Reasoning),
             Temperature = ApplyReasoningTemperature(ToSingle(request.Temperature), request.Reasoning),
@@ -151,12 +159,14 @@ public sealed class OpenAiRequestMapper
 
         if (message.ToolCalls is { Count: > 0 })
         {
-            content = AppendLine(content, "Assistant tool calls: " + JsonSerializer.Serialize(message.ToolCalls, OpenAiJson.CreateOptions()));
+            var toolCallsJson = JsonSerializer.Serialize(new { tool_calls = message.ToolCalls }, OpenAiJson.CreateOptions());
+            content = string.IsNullOrWhiteSpace(content) ? toolCallsJson : AppendLine(content, toolCallsJson);
         }
 
         if (message.FunctionCall is not null)
         {
-            content = AppendLine(content, "Assistant function call: " + JsonSerializer.Serialize(message.FunctionCall, OpenAiJson.CreateOptions()));
+            var functionCallJson = JsonSerializer.Serialize(new { function_call = message.FunctionCall }, OpenAiJson.CreateOptions());
+            content = string.IsNullOrWhiteSpace(content) ? functionCallJson : AppendLine(content, functionCallJson);
         }
 
         return new InferenceMessage
@@ -340,6 +350,7 @@ public sealed class OpenAiRequestMapper
                 throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "Remote media URLs are disabled by configuration.", code: "remote_media_disabled");
             }
 
+            await EnsureRemoteMediaHostAllowedAsync(uri, cancellationToken);
             var client = _httpClientFactory.CreateClient(MediaHttpClientName);
             using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             response.EnsureSuccessStatusCode();
@@ -349,12 +360,14 @@ public sealed class OpenAiRequestMapper
                 throw new OpenAiProtocolException(StatusCodes.Status413PayloadTooLarge, "Media payload is larger than configured MaxMediaBytes.", code: "media_too_large");
             }
 
-            var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+            var bytes = await ReadRemoteMediaBytesAsync(response.Content, cancellationToken);
             ValidateMediaSize(bytes.Length);
+            var mimeType = response.Content.Headers.ContentType?.MediaType ?? GuessMimeType(bytes, expectedKind);
+            ValidateMediaKind(mimeType, expectedKind);
             return new InferenceMedia
             {
                 Source = uri.ToString(),
-                MimeType = response.Content.Headers.ContentType?.MediaType ?? GuessMimeType(bytes, expectedKind),
+                MimeType = mimeType,
                 Bytes = bytes
             };
         }
@@ -398,6 +411,104 @@ public sealed class OpenAiRequestMapper
         ValidateMediaKind(mimeType, expectedKind);
         ValidateMediaSize(bytes.Length);
         return new InferenceMedia { Source = "data-url", MimeType = mimeType, Bytes = bytes };
+    }
+
+    private async Task<byte[]> ReadRemoteMediaBytesAsync(HttpContent content, CancellationToken cancellationToken)
+    {
+        await using var stream = await content.ReadAsStreamAsync(cancellationToken);
+        using var memory = new MemoryStream();
+        var buffer = new byte[81920];
+        long total = 0;
+
+        while (true)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
+            if (read == 0)
+            {
+                break;
+            }
+
+            total += read;
+            if (total > _options.MaxMediaBytes)
+            {
+                throw new OpenAiProtocolException(StatusCodes.Status413PayloadTooLarge, "Media payload is larger than configured MaxMediaBytes.", code: "media_too_large");
+            }
+
+            memory.Write(buffer, 0, read);
+        }
+
+        return memory.ToArray();
+    }
+
+    private static async Task EnsureRemoteMediaHostAllowedAsync(Uri uri, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(uri.Host) ||
+            string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "Remote media URL host is not allowed.", code: "remote_media_host_not_allowed");
+        }
+
+        if (IPAddress.TryParse(uri.Host, out var literal))
+        {
+            if (IsPrivateOrLocalAddress(literal))
+            {
+                throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "Remote media URL host is not allowed.", code: "remote_media_host_not_allowed");
+            }
+
+            return;
+        }
+
+        IPAddress[] addresses;
+        try
+        {
+            addresses = await Dns.GetHostAddressesAsync(uri.Host, cancellationToken);
+        }
+        catch (Exception exception) when (exception is SocketException or ArgumentException)
+        {
+            throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, $"Remote media URL host could not be resolved: {uri.Host}", code: "remote_media_host_unresolved");
+        }
+
+        if (addresses.Length == 0 || addresses.Any(IsPrivateOrLocalAddress))
+        {
+            throw new OpenAiProtocolException(StatusCodes.Status400BadRequest, "Remote media URL host is not allowed.", code: "remote_media_host_not_allowed");
+        }
+    }
+
+    private static bool IsPrivateOrLocalAddress(IPAddress address)
+    {
+        if (address.IsIPv4MappedToIPv6)
+        {
+            address = address.MapToIPv4();
+        }
+
+        if (IPAddress.IsLoopback(address) ||
+            address.Equals(IPAddress.Any) ||
+            address.Equals(IPAddress.IPv6Any) ||
+            address.Equals(IPAddress.Broadcast))
+        {
+            return true;
+        }
+
+        var bytes = address.GetAddressBytes();
+        if (address.AddressFamily == AddressFamily.InterNetwork)
+        {
+            return bytes[0] == 10
+                || bytes[0] == 127
+                || bytes[0] == 0
+                || (bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127)
+                || (bytes[0] == 169 && bytes[1] == 254)
+                || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)
+                || (bytes[0] == 192 && bytes[1] == 168);
+        }
+
+        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            return address.IsIPv6LinkLocal
+                || address.IsIPv6SiteLocal
+                || (bytes[0] & 0xFE) == 0xFC;
+        }
+
+        return true;
     }
 
     private void ValidateMediaKind(string mimeType, string expectedKind)
@@ -597,17 +708,57 @@ public sealed class OpenAiRequestMapper
         return string.Equals(GetString(format, "type"), "json_schema", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string? DescribeToolChoice(JsonElement? toolChoice)
+    private static ParsedToolChoice ParseToolChoice(JsonElement? toolChoice)
     {
         if (toolChoice is null || toolChoice.Value.ValueKind == JsonValueKind.Null)
         {
-            return null;
+            return new ParsedToolChoice(InferenceToolChoiceMode.Auto, null, null);
         }
 
-        return toolChoice.Value.ValueKind == JsonValueKind.String
-            ? toolChoice.Value.GetString()
-            : toolChoice.Value.GetRawText();
+        if (toolChoice.Value.ValueKind == JsonValueKind.String)
+        {
+            var value = toolChoice.Value.GetString();
+            return value?.ToLowerInvariant() switch
+            {
+                "none" => new ParsedToolChoice(InferenceToolChoiceMode.None, null, value),
+                "required" => new ParsedToolChoice(InferenceToolChoiceMode.Required, null, value),
+                _ => new ParsedToolChoice(InferenceToolChoiceMode.Auto, null, value)
+            };
+        }
+
+        if (toolChoice.Value.ValueKind != JsonValueKind.Object)
+        {
+            return new ParsedToolChoice(InferenceToolChoiceMode.Auto, null, toolChoice.Value.GetRawText());
+        }
+
+        var functionName = ReadToolChoiceFunctionName(toolChoice.Value);
+        if (!string.IsNullOrWhiteSpace(functionName))
+        {
+            return new ParsedToolChoice(InferenceToolChoiceMode.Function, functionName, toolChoice.Value.GetRawText());
+        }
+
+        return new ParsedToolChoice(InferenceToolChoiceMode.Auto, null, toolChoice.Value.GetRawText());
     }
+
+    private static string? ReadToolChoiceFunctionName(JsonElement toolChoice)
+    {
+        if (toolChoice.TryGetProperty("function", out var functionElement) &&
+            functionElement.ValueKind == JsonValueKind.Object &&
+            functionElement.TryGetProperty("name", out var functionName) &&
+            functionName.ValueKind == JsonValueKind.String)
+        {
+            return functionName.GetString();
+        }
+
+        if (toolChoice.TryGetProperty("name", out var nameElement) && nameElement.ValueKind == JsonValueKind.String)
+        {
+            return nameElement.GetString();
+        }
+
+        return null;
+    }
+
+    private sealed record ParsedToolChoice(InferenceToolChoiceMode Mode, string? Name, string? Description);
 
     private static IReadOnlyDictionary<string, string>? ParseMetadata(JsonElement? metadata)
     {

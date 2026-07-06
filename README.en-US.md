@@ -1,4 +1,4 @@
-# Zhengyan.LLamaStack
+﻿# Zhengyan.LLamaStack
 
 English | [Simplified Chinese](README.md)
 
@@ -66,16 +66,16 @@ The current version covers `chat/completions`, `responses`, `embeddings`, SSE st
   - Responses API `input`
   - `image_url` / `input_image`
   - `input_audio`
-- Supports media loading from data URLs, remote URLs, and optionally local file paths.
-- Supports SSE streaming.
+- Supports media loading from data URLs, guarded remote URLs, and optionally local file paths.
+- Supports SSE streaming. Tool-enabled streaming is buffered and then emitted as SSE with the same response shape as non-streaming calls.
 - Supports Chat/Responses storage (Memory/SQLite/PostgreSQL/Redis) with full management endpoints.
-- Parses and executes `tools` and legacy `functions`.
-- Built-in tools (`calculator`, `current_time`) auto-executed in a multi-turn loop; supports tool registry, hot-loading, timeout, and permission controls.
+- Parses `tools` and legacy `functions` and returns model-emitted calls in OpenAI-compatible response fields.
+- Tool calls are protocol-only: the server tells the client which function to call and with what JSON arguments; clients execute tools and send results back.
 - Converts model-emitted tool-call JSON into OpenAI-compatible `tool_calls` / `function_call` response fields.
 - Supports optional `mmproj` / MTMD multimodal projection models.
 - Per-model configurable concurrency (`MaxConcurrency`), shared weights, isolated context/executor instances; runtime dynamic pool resizing, request queuing, real-time cancellation, and VRAM protection.
 - Independent embedding model registration and vector extraction with `Dimensions` truncation support.
-- Structured outputs: JSON Schema → GBNF Grammar constrained decoding + strict mode validation.
+- Structured outputs: JSON Schema 鈫?GBNF Grammar constrained decoding + strict mode validation.
 - Past-Responses management (`previous_response_id` context continuation, `conversation` sessions, `compact` compression, `background` execution).
 - API Key authentication and CORS configuration.
 
@@ -86,16 +86,20 @@ The current version covers `chat/completions`, `responses`, `embeddings`, SSE st
 |-- README.md
 |-- README.en-US.md
 |-- Zhengyan.LLamaStack.slnx
-`-- src/
-    `-- Zhengyan.LLamaStack.Api/
-        |-- Endpoints/
-        |-- Inference/
-        |-- Infrastructure/
-        |-- OpenAi/
-        |-- Options/
-        |-- Program.cs
-        |-- appsettings.json
-        `-- Zhengyan.LLamaStack.Api.csproj
+|-- src/
+|   |-- Zhengyan.LLamaStack.Api/
+|   |   |-- Endpoints/
+|   |   |-- Inference/
+|   |   |-- Infrastructure/
+|   |   |-- OpenAi/
+|   |   |-- Options/
+|   |   |-- Storage/
+|   |   |-- Program.cs
+|   |   `-- appsettings.json
+|   |-- Zhengyan.OpenAIModels/
+|   `-- Zhengyan.ChatUI.Desktop/
+`-- tests/
+    `-- Zhengyan.LLamaStack.Tests/
 ```
 
 ## Requirements
@@ -261,7 +265,7 @@ The configuration section is `LLamaStack`. The recommended configuration style i
 | `DefaultTopP` | Default top_p. |
 | `DefaultTopK` | Default top_k. |
 | `AntiPrompts` | LLamaSharp anti-prompts used to stop generation. |
-| `AllowRemoteMedia` | Allow remote image/audio URLs. |
+| `AllowRemoteMedia` | Allow remote image/audio URLs. Remote URLs are blocked for localhost/private/link-local/CGNAT targets, redirects are disabled, and downloads are limited by `MaxMediaBytes`. |
 | `AllowLocalMediaPaths` | Allow request bodies to reference local media paths. Keep disabled in production unless needed. |
 | `MaxMediaBytes` | Maximum bytes per media input. |
 | `MaxVramBytes` | VRAM budget limit in bytes. `0` means unlimited. Checked before model loading and pool resize. |
@@ -464,13 +468,17 @@ Invoke-RestMethod http://localhost:5062/v1/responses `
 
 The management layer supports multiple storage backends via `LLamaStack:Store:Provider`:
 - `Memory` (default, in-process, lost on restart)
-- `Sqlite` — set `LLamaStack:Store:SqlitePath`
-- `Postgres` — set `LLamaStack:Store:ConnectionString`
-- `Redis` — set `LLamaStack:Store:ConnectionString`
+- `Sqlite` 鈥?set `LLamaStack:Store:SqlitePath`
+- `Postgres` 鈥?set `LLamaStack:Store:ConnectionString`
+- `Redis` 鈥?set `LLamaStack:Store:ConnectionString`
 
 ### Tool Calling
 
-The service ships with two built-in tools — `calculator` and `current_time` — which are automatically executed in a multi-turn loop for both Chat Completions and Responses. Unknown tools are returned to the client as-is without execution.
+Streaming requests that include tools are buffered and then emitted as SSE final output, so `stream: true` and `stream: false` keep the same response shape.
+
+Tool calling is protocol-only. The service injects request-provided `tools` / legacy `functions` into the model prompt, parses model-emitted tool-call JSON, and returns standard OpenAI-compatible `tool_calls` / `function_call` output. The client is responsible for executing the tool and sending the tool result back in a follow-up request.
+
+The server only accepts tool calls for functions declared in the current request. `tool_choice: "none"` suppresses tool-call extraction, a specific function choice restricts calls to that function, and `parallel_tool_calls: false` returns at most one call.
 
 Request body structure for the `calculator` tool:
 
@@ -736,8 +744,9 @@ Then configure:
 | Text message/content parsing | Implemented. |
 | Image and audio input parsing | Implemented at request level; requires `MmprojPath`. |
 | `tools` / `functions` request parsing | Implemented. |
-| Tool-call execution | `calculator` and `current_time` built-in tools executed in a multi-turn loop; `parallel_tool_calls` supported; tool registry (`IToolRegistry`), hot-load, timeout, permission control, and output validation. |
-| `response_format` / JSON mode | Fully implemented: JSON Schema → GBNF Grammar constrained decoding + strict mode (`ValidateJsonOutput`) recursive validation. |
+| Tool-call protocol | `tools` / legacy `functions` are parsed; model-emitted calls are returned as OpenAI-compatible `tool_calls` / `function_call` output for the client to execute. `tool_choice` and `parallel_tool_calls` are enforced during extraction. |
+| Strict JSON validation | Strict schema validation failures return an OpenAI-format error instead of silently accepting invalid model output. |
+| `response_format` / JSON mode | Fully implemented: JSON Schema 鈫?GBNF Grammar constrained decoding + strict mode (`ValidateJsonOutput`) recursive validation. |
 | usage token counts | Fully implemented: streaming includes real-time token counts, non-streaming provides exact counts. |
 | Multi-model registry and `model` routing | Implemented, with legacy single-model configuration compatibility. |
 | Model capability declarations | Implemented for `/v1/models` and request preflight validation. |
@@ -750,7 +759,7 @@ Then configure:
 | API key authentication | Optional Bearer token middleware implemented (`LLamaStack:Auth`). |
 | CORS | Optional cross-origin configuration implemented (`LLamaStack:Cors`). |
 | Embedding model registration | Via `LLamaStack:EmbeddingModels[]` config; supports `Dimensions`, `MaxConcurrency`, GPU layers, etc. |
-| Concurrent inference | Two-tier concurrency control: `ModelRequestQueue` (FIFO) → `ModelRuntime` (SemaphoreSlim pool). Dynamic pool resize, request queuing, real-time cancellation (`ResponseExecutionTracker`), and VRAM protection (`MaxVramBytes`). |
+| Concurrent inference | Two-tier concurrency control: `ModelRequestQueue` (FIFO) 鈫?`ModelRuntime` (SemaphoreSlim pool). Dynamic pool resize, request queuing, real-time cancellation (`ResponseExecutionTracker`), and VRAM protection (`MaxVramBytes`). |
 | Storage backends | Supports Memory, SQLite, PostgreSQL, and Redis providers. |
 
 ### Missing for Full OpenAI Protocol Coverage
@@ -775,14 +784,14 @@ Then configure:
 
 ### Suggested Iteration Order
 
-1. ✅ Completed multi-model registration, `model` routing, and model capability declarations.
-2. ✅ Completed Chat Completions and Responses protocol field parsing, degradation, and echoing.
-3. ✅ Completed Chat/Response store and management endpoints (with durable backends).
-4. ✅ Completed durable store, background task state machine, real cancellation, and model-driven compact.
-5. ✅ Completed structured outputs (JSON Schema → GBNF Grammar + strict validation).
-6. ✅ Completed Embedding API (independent registration, dimension declaration, vector extraction).
-7. ✅ Completed concurrent inference enhancements (dynamic pool resize, queuing, cancellation, VRAM protection).
-8. ✅ Completed tool-calling enhancements (registry, hot-load, timeout, permissions, output validation).
+1. 鉁?Completed multi-model registration, `model` routing, and model capability declarations.
+2. 鉁?Completed Chat Completions and Responses protocol field parsing, degradation, and echoing.
+3. 鉁?Completed Chat/Response store and management endpoints (with durable backends).
+4. 鉁?Completed durable store, background task state machine, real cancellation, and model-driven compact.
+5. 鉁?Completed structured outputs (JSON Schema 鈫?GBNF Grammar + strict validation).
+6. 鉁?Completed Embedding API (independent registration, dimension declaration, vector extraction).
+7. 鉁?Completed concurrent inference enhancements (dynamic pool resize, queuing, cancellation, VRAM protection).
+8. 鉁?Completed tool-calling enhancements (registry, hot-load, timeout, permissions, output validation).
 9. Add Files / Uploads and Vector Stores.
 10. Add Audio, Images, Moderations, and other independent capabilities.
 11. Add rate limiting, metrics, and production deployment scaffolding.
@@ -793,7 +802,9 @@ Then configure:
 ```powershell
 dotnet restore Zhengyan.LLamaStack.slnx
 dotnet build Zhengyan.LLamaStack.slnx -v minimal
+dotnet test Zhengyan.LLamaStack.slnx -v minimal
 dotnet run --project src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj
+dotnet run --project src\Zhengyan.ChatUI.Desktop\Zhengyan.ChatUI.Desktop.csproj
 ```
 
 ## References

@@ -11,8 +11,10 @@ public sealed class OpenAiRedisStore : IOpenAiStore
 {
     private const string ChatCompletionsSortedSet = "chat:completions:by_created";
     private const string ResponsesSortedSet = "responses:by_created";
+    private const string ResponseTasksSortedSet = "response:tasks:by_created";
     private const string ChatCompletionPrefix = "chat:completion:";
     private const string ResponsePrefix = "response:";
+    private const string ResponseTaskPrefix = "response:task:";
 
     private readonly ConnectionMultiplexer _redis;
     private readonly IDatabase _db;
@@ -65,7 +67,9 @@ public sealed class OpenAiRedisStore : IOpenAiStore
     {
         cancellationToken.ThrowIfCancellationRequested();
         var safeLimit = Math.Clamp(limit, 1, 100);
-        var ids = await FetchSortedIdsAsync(ChatCompletionsSortedSet, safeLimit, after, before);
+        var ids = await FetchSortedIdsAsync(ChatCompletionsSortedSet, safeLimit + 1, after, before);
+        var hasMore = ids.Count > safeLimit;
+        ids = ids.Take(safeLimit).ToList();
         var all = new List<StoredChatCompletion>();
         foreach (var id in ids)
         {
@@ -76,7 +80,6 @@ public sealed class OpenAiRedisStore : IOpenAiStore
             }
         }
 
-        var hasMore = ids.Count > safeLimit;
         return new StoredListResult<StoredChatCompletion>(all, hasMore);
     }
 
@@ -195,7 +198,9 @@ public sealed class OpenAiRedisStore : IOpenAiStore
     {
         cancellationToken.ThrowIfCancellationRequested();
         var safeLimit = Math.Clamp(limit, 1, 100);
-        var ids = await FetchSortedIdsAsync(ResponsesSortedSet, safeLimit, after, before);
+        var ids = await FetchSortedIdsAsync(ResponsesSortedSet, safeLimit + 1, after, before);
+        var hasMore = ids.Count > safeLimit;
+        ids = ids.Take(safeLimit).ToList();
         var all = new List<StoredResponse>();
         foreach (var id in ids)
         {
@@ -206,7 +211,6 @@ public sealed class OpenAiRedisStore : IOpenAiStore
             }
         }
 
-        var hasMore = ids.Count > safeLimit;
         return new StoredListResult<StoredResponse>(all, hasMore);
     }
 
@@ -342,23 +346,125 @@ public sealed class OpenAiRedisStore : IOpenAiStore
         return json is null ? default : JsonSerializer.Deserialize<T>(json, OpenAiJson.CreateOptions());
     }
 
-    public Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken)
+    public async Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Redis store. Use Memory store instead.");
+        cancellationToken.ThrowIfCancellationRequested();
+        var key = ResponseTaskPrefix + task.Id;
+        var entries = new HashEntry[]
+        {
+            new("id", task.Id),
+            new("type", task.Type),
+            new("status", SerializeStatus(task.Status)),
+            new("source_response_id", task.SourceResponseId ?? string.Empty),
+            new("result_response_id", task.ResultResponseId ?? string.Empty),
+            new("error_message", task.ErrorMessage ?? string.Empty),
+            new("created_at", task.CreatedAt.ToString()),
+            new("completed_at", task.CompletedAt?.ToString() ?? string.Empty)
+        };
+
+        var tran = _db.CreateTransaction();
+        _ = tran.HashSetAsync(key, entries);
+        _ = tran.SortedSetAddAsync(ResponseTasksSortedSet, task.Id, task.CreatedAt);
+        await tran.ExecuteAsync();
     }
 
-    public Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken)
+    public async Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Redis store. Use Memory store instead.");
+        cancellationToken.ThrowIfCancellationRequested();
+        var key = ResponseTaskPrefix + id;
+        var entries = await _db.HashGetAllAsync(key);
+        if (entries.Length == 0) return null;
+
+        var dict = entries.ToDictionary(e => (string)e.Name!, e => (string?)e.Value);
+        return new ResponseTaskInfo
+        {
+            Id = GetString(dict, "id"),
+            Type = GetString(dict, "type"),
+            Status = DeserializeStatus(GetString(dict, "status")),
+            SourceResponseId = GetStringOrNull(dict, "source_response_id"),
+            ResultResponseId = GetStringOrNull(dict, "result_response_id"),
+            ErrorMessage = GetStringOrNull(dict, "error_message"),
+            CreatedAt = GetLong(dict, "created_at"),
+            CompletedAt = GetNullableLong(dict, "completed_at")
+        };
     }
 
-    public Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default)
+    public async Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default)
     {
-        throw new NotSupportedException("Response task management is not supported in Redis store. Use Memory store instead.");
+        cancellationToken.ThrowIfCancellationRequested();
+        var key = ResponseTaskPrefix + id;
+        var exists = await _db.KeyExistsAsync(key);
+        if (!exists) return;
+
+        var entries = new List<HashEntry>
+        {
+            new("status", SerializeStatus(status))
+        };
+
+        if (resultResponseId is not null)
+        {
+            entries.Add(new HashEntry("result_response_id", resultResponseId));
+        }
+
+        if (errorMessage is not null)
+        {
+            entries.Add(new HashEntry("error_message", errorMessage));
+        }
+
+        if (status is ResponseTaskStatus.Completed or ResponseTaskStatus.Failed)
+        {
+            entries.Add(new HashEntry("completed_at", DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString()));
+        }
+
+        await _db.HashSetAsync(key, entries.ToArray());
     }
 
-    public Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken)
+    public async Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Redis store. Use Memory store instead.");
+        cancellationToken.ThrowIfCancellationRequested();
+        var safeLimit = Math.Clamp(limit, 1, 100);
+        var ids = await FetchSortedIdsAsync(ResponseTasksSortedSet, safeLimit + 1, after, before);
+        var hasMore = ids.Count > safeLimit;
+        ids = ids.Take(safeLimit).ToList();
+
+        var all = new List<ResponseTaskInfo>();
+        foreach (var id in ids)
+        {
+            var task = await GetResponseTaskAsync(id, cancellationToken);
+            if (task is not null)
+            {
+                all.Add(task);
+            }
+        }
+
+        return new StoredListResult<ResponseTaskInfo>(all, hasMore);
+    }
+
+    private static long? GetNullableLong(IReadOnlyDictionary<string, string?> dict, string key)
+    {
+        var value = GetStringOrNull(dict, key);
+        return long.TryParse(value, out var result) ? result : null;
+    }
+
+    private static string SerializeStatus(ResponseTaskStatus status)
+    {
+        return status switch
+        {
+            ResponseTaskStatus.Running => "running",
+            ResponseTaskStatus.Completed => "completed",
+            ResponseTaskStatus.Failed => "failed",
+            _ => "pending"
+        };
+    }
+
+    private static ResponseTaskStatus DeserializeStatus(string status)
+    {
+        return status.ToLowerInvariant() switch
+        {
+            "running" => ResponseTaskStatus.Running,
+            "completed" => ResponseTaskStatus.Completed,
+            "failed" => ResponseTaskStatus.Failed,
+            _ => ResponseTaskStatus.Pending
+        };
     }
 }

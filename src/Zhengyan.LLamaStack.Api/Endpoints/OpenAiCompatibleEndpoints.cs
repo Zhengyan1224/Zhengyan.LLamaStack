@@ -109,7 +109,7 @@ public static class OpenAiCompatibleEndpoints
 
     private static void LogRequest<T>(ILogger logger, string endpoint, T request)
     {
-        var json = JsonSerializer.Serialize(request, _logJsonOptions);
+        var json = SerializeForLog(request);
         logger.LogDebug("[{Endpoint}] Request: {Json}", endpoint, json);
     }
 
@@ -123,7 +123,7 @@ public static class OpenAiCompatibleEndpoints
             try
             {
                 var parsed = JsonSerializer.Deserialize<JsonElement>(json, _logJsonOptions);
-                var reSerialized = JsonSerializer.Serialize(parsed, _logJsonOptions);
+                var reSerialized = SerializeForLog(parsed);
                 logger.LogDebug("[{Endpoint}] SSE: data: {Json}", endpoint, reSerialized);
                 return;
             }
@@ -136,13 +136,112 @@ public static class OpenAiCompatibleEndpoints
 
     private static void LogResponse<T>(ILogger logger, string endpoint, int statusCode, T value)
     {
-        var json = JsonSerializer.Serialize(value, _logJsonOptions);
+        var json = SerializeForLog(value);
         logger.LogDebug("[{Endpoint}] {StatusCode} {Json}", endpoint, statusCode, json);
     }
 
     private static void LogResponse(ILogger logger, string endpoint, int statusCode, string body)
     {
-        logger.LogDebug("[{Endpoint}] {StatusCode} {Body}", endpoint, statusCode, body);
+        logger.LogDebug("[{Endpoint}] {StatusCode} {Body}", endpoint, statusCode, RedactLogBody(body));
+    }
+
+    private static string SerializeForLog<T>(T value)
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(value, _logJsonOptions);
+            using var document = JsonDocument.Parse(json);
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
+            {
+                WriteRedactedJson(writer, document.RootElement);
+            }
+
+            return Encoding.UTF8.GetString(stream.ToArray());
+        }
+        catch
+        {
+            return RedactLogBody(value?.ToString() ?? string.Empty);
+        }
+    }
+
+    private static string RedactLogBody(string body)
+    {
+        return body.Length <= 512 ? body : $"[redacted body length {body.Length}]";
+    }
+
+    private static void WriteRedactedJson(Utf8JsonWriter writer, JsonElement element, string? propertyName = null)
+    {
+        if (ShouldRedactProperty(propertyName))
+        {
+            writer.WriteStringValue(element.ValueKind switch
+            {
+                JsonValueKind.String => $"[redacted string length {element.GetString()?.Length ?? 0}]",
+                JsonValueKind.Array => $"[redacted array length {element.GetArrayLength()}]",
+                JsonValueKind.Object => "[redacted object]",
+                _ => "[redacted]"
+            });
+            return;
+        }
+
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in element.EnumerateObject())
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteRedactedJson(writer, property.Value, property.Name);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in element.EnumerateArray())
+                {
+                    WriteRedactedJson(writer, item);
+                }
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.String:
+                var value = element.GetString() ?? string.Empty;
+                writer.WriteStringValue(value.Length <= 512 ? value : $"[redacted string length {value.Length}]");
+                break;
+            case JsonValueKind.Number:
+                element.WriteTo(writer);
+                break;
+            case JsonValueKind.True:
+                writer.WriteBooleanValue(true);
+                break;
+            case JsonValueKind.False:
+                writer.WriteBooleanValue(false);
+                break;
+            case JsonValueKind.Null:
+            case JsonValueKind.Undefined:
+                writer.WriteNullValue();
+                break;
+        }
+    }
+
+    private static bool ShouldRedactProperty(string? propertyName)
+    {
+        return propertyName is not null &&
+            (string.Equals(propertyName, "messages", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "content", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "input", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "prompt", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "instructions", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "output", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "output_text", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "text", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "delta", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "embedding", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "image_url", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "audio_url", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "data", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "url", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "api_key", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(propertyName, "authorization", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task<IResult> HandleEmbeddingsAsync(

@@ -341,6 +341,26 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
                 ON responses (previous_response_id);
                 """,
                 cancellationToken);
+            await ExecuteNonQueryAsync(connection,
+                """
+                CREATE TABLE IF NOT EXISTS response_tasks (
+                    id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    source_response_id TEXT NULL,
+                    result_response_id TEXT NULL,
+                    error_message TEXT NULL,
+                    created_at INTEGER NOT NULL,
+                    completed_at INTEGER NULL
+                );
+                """,
+                cancellationToken);
+            await ExecuteNonQueryAsync(connection,
+                """
+                CREATE INDEX IF NOT EXISTS idx_response_tasks_created_id
+                ON response_tasks (created_at DESC, id ASC);
+                """,
+                cancellationToken);
 
             _schemaReady = true;
         }
@@ -455,28 +475,130 @@ public sealed class OpenAiSqliteStore : IOpenAiStore
         return reader.IsDBNull(index) ? default : Deserialize<T>(reader.GetString(index));
     }
 
-    public Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken)
+    public async Task AddResponseTaskAsync(ResponseTaskInfo task, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Sqlite store. Use Memory store instead.");
+        await EnsureSchemaAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT OR REPLACE INTO response_tasks
+                (id, type, status, source_response_id, result_response_id, error_message, created_at, completed_at)
+            VALUES
+                ($id, $type, $status, $source_response_id, $result_response_id, $error_message, $created_at, $completed_at);
+            """;
+        AddParameter(command, "$id", task.Id);
+        AddParameter(command, "$type", task.Type);
+        AddParameter(command, "$status", SerializeStatus(task.Status));
+        AddParameter(command, "$source_response_id", task.SourceResponseId);
+        AddParameter(command, "$result_response_id", task.ResultResponseId);
+        AddParameter(command, "$error_message", task.ErrorMessage);
+        AddParameter(command, "$created_at", task.CreatedAt);
+        AddParameter(command, "$completed_at", task.CompletedAt);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken)
+    public async Task<ResponseTaskInfo?> GetResponseTaskAsync(string id, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Sqlite store. Use Memory store instead.");
+        await EnsureSchemaAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT id, type, status, source_response_id, result_response_id, error_message, created_at, completed_at
+            FROM response_tasks
+            WHERE id = $id;
+            """;
+        AddParameter(command, "$id", id);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadResponseTask(reader) : null;
     }
 
-    public Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default)
+    public async Task UpdateResponseTaskAsync(string id, ResponseTaskStatus status, string? resultResponseId = null, string? errorMessage = null, CancellationToken cancellationToken = default)
     {
-        throw new NotSupportedException("Response task management is not supported in Sqlite store. Use Memory store instead.");
+        await EnsureSchemaAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE response_tasks
+            SET status = $status,
+                result_response_id = COALESCE($result_response_id, result_response_id),
+                error_message = COALESCE($error_message, error_message),
+                completed_at = COALESCE($completed_at, completed_at)
+            WHERE id = $id;
+            """;
+        AddParameter(command, "$id", id);
+        AddParameter(command, "$status", SerializeStatus(status));
+        AddParameter(command, "$result_response_id", resultResponseId);
+        AddParameter(command, "$error_message", errorMessage);
+        AddParameter(command, "$completed_at", status is ResponseTaskStatus.Completed or ResponseTaskStatus.Failed
+            ? DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            : null);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken)
+    public async Task<StoredListResult<ResponseTaskInfo>> ListResponseTasksAsync(int limit, string? after, string? before, CancellationToken cancellationToken)
     {
-        throw new NotSupportedException("Response task management is not supported in Sqlite store. Use Memory store instead.");
+        await EnsureSchemaAsync(cancellationToken);
+        var all = new List<ResponseTaskInfo>();
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT id, type, status, source_response_id, result_response_id, error_message, created_at, completed_at
+            FROM response_tasks
+            ORDER BY created_at DESC, id ASC;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            all.Add(ReadResponseTask(reader));
+        }
+
+        var result = OpenAiStoreHelpers.ApplyCursor(all, x => x.Id, x => x.CreatedAt, limit, after, before);
+        return new StoredListResult<ResponseTaskInfo>(result.Items, result.HasMore);
     }
 
     private static string? GetNullableString(IDataRecord reader, int index)
     {
         return reader.IsDBNull(index) ? null : reader.GetString(index);
+    }
+
+    private static ResponseTaskInfo ReadResponseTask(IDataRecord reader)
+    {
+        return new ResponseTaskInfo
+        {
+            Id = reader.GetString(0),
+            Type = reader.GetString(1),
+            Status = DeserializeStatus(reader.GetString(2)),
+            SourceResponseId = GetNullableString(reader, 3),
+            ResultResponseId = GetNullableString(reader, 4),
+            ErrorMessage = GetNullableString(reader, 5),
+            CreatedAt = reader.GetInt64(6),
+            CompletedAt = reader.IsDBNull(7) ? null : reader.GetInt64(7)
+        };
+    }
+
+    private static string SerializeStatus(ResponseTaskStatus status)
+    {
+        return status switch
+        {
+            ResponseTaskStatus.Running => "running",
+            ResponseTaskStatus.Completed => "completed",
+            ResponseTaskStatus.Failed => "failed",
+            _ => "pending"
+        };
+    }
+
+    private static ResponseTaskStatus DeserializeStatus(string status)
+    {
+        return status.ToLowerInvariant() switch
+        {
+            "running" => ResponseTaskStatus.Running,
+            "completed" => ResponseTaskStatus.Completed,
+            "failed" => ResponseTaskStatus.Failed,
+            _ => ResponseTaskStatus.Pending
+        };
     }
 }

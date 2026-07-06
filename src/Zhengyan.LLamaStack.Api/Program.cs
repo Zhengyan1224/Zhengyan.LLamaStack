@@ -11,7 +11,14 @@ using Zhengyan.LLamaStack.Api.Storage;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.Configure<LLamaStackOptions>(builder.Configuration.GetSection(LLamaStackOptions.SectionName));
-builder.Services.AddHttpClient(OpenAiRequestMapper.MediaHttpClientName);
+builder.Services.AddCors();
+builder.Services.AddHttpClient(OpenAiRequestMapper.MediaHttpClientName, client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(15);
+}).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+{
+    AllowAutoRedirect = false
+});
 builder.Services.AddSingleton<OpenAiRequestMapper>();
 builder.Services.AddSingleton<IOpenAiStore>(sp =>
 {
@@ -23,19 +30,6 @@ builder.Services.AddSingleton<IOpenAiStore>(sp =>
         "redis" => new OpenAiRedisStore(options),
         _ => new OpenAiMemoryStore()
     };
-});
-builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
-builder.Services.AddSingleton<CalculatorTool>();
-builder.Services.AddSingleton<CurrentTimeTool>();
-builder.Services.AddSingleton<ToolExecutor>(sp =>
-{
-    var registry = sp.GetRequiredService<IToolRegistry>();
-    foreach (var tool in sp.GetServices<IAgentTool>())
-    {
-        registry.Register(tool);
-    }
-
-    return new ToolExecutor(registry);
 });
 builder.Services.AddSingleton<ModelQueueManager>();
 builder.Services.AddSingleton<LLamaInferenceService>();

@@ -8,6 +8,14 @@ public enum InferenceEndpointKind
     Responses
 }
 
+public enum InferenceToolChoiceMode
+{
+    Auto,
+    None,
+    Required,
+    Function
+}
+
 public sealed class InferenceRequest
 {
     public string? RequestedModel { get; set; }
@@ -17,6 +25,10 @@ public sealed class InferenceRequest
     public IReadOnlyList<OpenAiTool> Tools { get; set; } = [];
 
     public string? ToolChoiceDescription { get; set; }
+
+    public InferenceToolChoiceMode ToolChoiceMode { get; set; } = InferenceToolChoiceMode.Auto;
+
+    public string? ToolChoiceName { get; set; }
 
     public int? N { get; set; }
 
@@ -68,6 +80,8 @@ public sealed class InferenceRequest
 
     public IReadOnlyDictionary<int, float>? LogitBias { get; set; }
 
+    public bool ForceToolCallJson { get; set; }
+
     public int ChoiceIndex { get; set; }
 
     public IReadOnlyList<string> CompatibilityWarnings { get; set; } = [];
@@ -102,6 +116,8 @@ public sealed class InferenceRequest
         target.Messages = Messages;
         target.Tools = Tools;
         target.ToolChoiceDescription = ToolChoiceDescription;
+        target.ToolChoiceMode = ToolChoiceMode;
+        target.ToolChoiceName = ToolChoiceName;
         target.N = N;
         target.MaxToolCalls = MaxToolCalls;
         target.MaxTokens = MaxTokens;
@@ -127,6 +143,7 @@ public sealed class InferenceRequest
         target.ReasoningEffort = ReasoningEffort;
         target.Prompt = Prompt;
         target.LogitBias = LogitBias;
+        target.ForceToolCallJson = ForceToolCallJson;
         target.ChoiceIndex = ChoiceIndex;
         target.CompatibilityWarnings = CompatibilityWarnings;
     }
@@ -166,8 +183,6 @@ public sealed class InferenceCompletion
 
     public IReadOnlyList<OpenAiToolCall> ToolCalls { get; init; } = [];
 
-    public IReadOnlyList<ToolRound> ToolRounds { get; init; } = [];
-
     public IReadOnlyList<InferenceChoice> Choices { get; init; } = [];
 
     public string FinishReason { get; init; } = "stop";
@@ -200,13 +215,6 @@ public sealed class InferenceChoice
     public string FinishReason { get; init; } = "stop";
 
     public int CompletionTokens { get; init; }
-}
-
-public sealed class ToolRound
-{
-    public IReadOnlyList<OpenAiToolCall> ToolCalls { get; init; } = [];
-
-    public IReadOnlyList<ToolResult> Results { get; init; } = [];
 }
 
 public sealed record ModelMemoryInfo(long WeightBytes, long ContextBytes, long TotalBytes, bool IsLoaded);

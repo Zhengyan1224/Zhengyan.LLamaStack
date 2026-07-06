@@ -1,64 +1,52 @@
 # Zhengyan.ChatUI.Desktop
 
-`Zhengyan.ChatUI.Desktop` 是基于 Avalonia 的桌面对话客户端。它面向本机长期调试场景，适合用图形界面测试 `Zhengyan.McpHost` 的模型切换、流式输出、多模态输入、推理过程和附加 JSON。
+Avalonia desktop client for manually testing `Zhengyan.LLamaStack.Api`.
 
-## 启动
+## Run
 
 ```powershell
-dotnet run --project Zhengyan.ChatUI.Desktop\Zhengyan.ChatUI.Desktop.csproj
+dotnet run --project src\Zhengyan.ChatUI.Desktop\Zhengyan.ChatUI.Desktop.csproj
 ```
 
-默认连接：
+Default server endpoint:
 
 ```text
-http://localhost:9083/mcphost/api/v1
+http://localhost:5062/v1
 ```
 
-## 主要功能
+## Features
 
-- 配置 Host 地址、API Key、模型、max tokens、temperature、top_p。
-- 调用 `/models/config` 加载 Agent/模型列表。
-- 调用 `/models/switch?id=<index>` 切换 `McpHost` 当前模型。
-- 在 Chat Completions 和 Responses 两种 API 模式之间切换。
-- 流式显示助手输出。
-- 单独展示 Thinking/Reasoning。
-- 展示 Additional Properties，例如工具调用结果、附加 JSON 等。
-- 支持图片 URL 和本地图片文件。
-- 保存本地设置。
+- Configure server endpoint, API key, model, max tokens, temperature, and top_p.
+- Load models from `GET /v1/models`.
+- Switch between `/v1/chat/completions` and `/v1/responses`.
+- Display SSE streaming output.
+- Display thinking/reasoning text when it is present in streamed payloads.
+- Show additional response properties as formatted JSON.
+- Add image URL or local image attachments.
+- Persist local UI settings.
 
-## 使用流程
+## Settings File
 
-1. 启动 `Zhengyan.McpHost`。
-2. 启动 Desktop UI。
-3. 确认 Server Endpoint 为 `http://localhost:9083/mcphost/api/v1`。
-4. 设置 API Key。
-5. 点击加载模型，选择需要的 Agent。
-6. 按需要切换 `Use Responses API`。
-7. 输入消息，附加图片后发送。
-
-## 配置文件
-
-配置保存在：
+Settings are stored at:
 
 ```text
 %LocalAppData%\Zhengyan.ChatUI.Desktop\settings.json
 ```
 
-保存字段：
+Stored fields:
 
 ```text
 ServerEndpoint
 ApiKey
-Model
-MaxTokens
+SelectedModel
+MaxCompletionTokens
 Temperature
 TopP
 UseResponsesApi
 ```
 
-## 适用场景
+## Notes
 
-- 调试 `McpHost` 的 Agent 配置。
-- 验证非流式/流式 reasoning 是否显示正确。
-- 验证多模态请求在 Chat Completions 和 Responses 两种格式下是否正常。
-- 观察工具调用后的 Additional Properties。
+- The client expects an OpenAI-compatible `/v1` endpoint.
+- Local images are converted to data URLs before sending.
+- The desktop client is a debugging tool; production auth, rate limiting, and request auditing belong on the API service.

@@ -19,13 +19,11 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     private readonly ILogger<LLamaInferenceService> _logger;
     private readonly Dictionary<string, ModelRuntime> _models;
     private readonly Dictionary<string, EmbeddingModelRuntime> _embeddingRuntimes;
-    private readonly ToolExecutor? _toolExecutor;
 
-    public LLamaInferenceService(IOptions<LLamaStackOptions> options, ILogger<LLamaInferenceService> logger, ToolExecutor? toolExecutor = null)
+    public LLamaInferenceService(IOptions<LLamaStackOptions> options, ILogger<LLamaInferenceService> logger)
     {
         _options = options.Value;
         _logger = logger;
-        _toolExecutor = toolExecutor;
         _models = _options.GetModelRegistrations()
             .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => new ModelRuntime(x.First()), StringComparer.OrdinalIgnoreCase);
@@ -179,12 +177,12 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             return await MultiChoiceCompleteAsync(request, n, cancellationToken);
         }
 
-        return await CompleteWithToolLoopAsync(request, cancellationToken);
+        return await CompleteOnceAsync(request, cancellationToken);
     }
 
     private async Task<InferenceCompletion> MultiChoiceCompleteAsync(InferenceRequest request, int n, CancellationToken cancellationToken)
     {
-        var first = await CompleteWithToolLoopAsync(request, cancellationToken);
+        var first = await CompleteOnceAsync(request, cancellationToken);
         var choices = new List<InferenceChoice>
         {
             new()
@@ -198,7 +196,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         for (var i = 1; i < n; i++)
         {
-            var choice = await CompleteWithToolLoopAsync(request.WithChoiceIndex(i), cancellationToken);
+            var choice = await CompleteOnceAsync(request.WithChoiceIndex(i), cancellationToken);
             choices.Add(new InferenceChoice
             {
                 Index = i,
@@ -225,63 +223,9 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         };
     }
 
-    private async Task<InferenceCompletion> CompleteWithToolLoopAsync(InferenceRequest request, CancellationToken cancellationToken)
+    private async Task<InferenceCompletion> CompleteOnceAsync(InferenceRequest request, CancellationToken cancellationToken)
     {
-        var maxRounds = Math.Max(1, request.MaxToolCalls ?? 10);
-        var currentMessages = request.Messages.ToList();
-        var toolRounds = new List<ToolRound>();
-
-        InferenceCompletion? completion = null;
-        var currentRequest = request;
-
-        for (var round = 0; round < maxRounds; round++)
-        {
-            completion = await SingleCompleteAsync(currentRequest, cancellationToken);
-
-            if (completion.ToolCalls.Count == 0)
-            {
-                break;
-            }
-
-            if (_toolExecutor is null || !_toolExecutor.CanExecute(completion.ToolCalls))
-            {
-                break;
-            }
-
-            var parallel = request.ParallelToolCalls == true;
-            var results = await _toolExecutor.ExecuteAsync(completion.ToolCalls, cancellationToken, parallel);
-            toolRounds.Add(new ToolRound
-            {
-                ToolCalls = completion.ToolCalls,
-                Results = results
-            });
-
-            currentMessages = _toolExecutor.BuildToolResultMessages(
-                completion.ToolCalls, results, currentMessages).ToList();
-
-            var warnings = currentRequest.CompatibilityWarnings
-                .Concat([$"Tool call round {round + 1}: `{string.Join(", ", completion.ToolCalls.Select(x => x.Function.Name))}` executed."])
-                .Distinct(StringComparer.Ordinal)
-                .ToArray();
-
-            currentRequest = currentRequest.WithMessages(currentMessages, warnings);
-        }
-
-        return new InferenceCompletion
-        {
-            Id = completion?.Id ?? CreateCompletionId("chatcmpl"),
-            Model = completion?.Model ?? ResolveRuntime(request.RequestedModel).Options.Id,
-            Text = completion?.Text ?? string.Empty,
-            ToolCalls = toolRounds.Count > 0 ? toolRounds.Last().ToolCalls : (completion?.ToolCalls ?? []),
-            ToolRounds = toolRounds,
-            PromptTokens = completion?.PromptTokens ?? 0,
-            CompletionTokens = completion?.CompletionTokens ?? 0,
-            Metadata = request.Metadata,
-            User = request.User,
-            ServiceTier = request.ServiceTier,
-            Store = request.Store,
-            CompatibilityWarnings = currentRequest.CompatibilityWarnings
-        };
+        return await SingleCompleteAsync(request, cancellationToken);
     }
 
     private async Task<InferenceCompletion> SingleCompleteAsync(InferenceRequest request, CancellationToken cancellationToken)
@@ -290,15 +234,48 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
         {
-        request = ApplyTruncation(request, loaded, model);
-        var createdText = new StringBuilder();
+            request = ApplyTruncation(request, loaded, model);
+            var createdText = new StringBuilder();
             await foreach (var token in StreamTextAsync(request, loaded, model, cancellationToken))
             {
                 createdText.Append(token);
             }
 
             var text = createdText.ToString();
-            var toolCalls = TryExtractToolCalls(text, request.Tools, out var cleanText);
+            var toolCalls = TryExtractToolCalls(text, request, out var cleanText);
+
+            if (toolCalls.Count == 0 && ShouldRetryToolProtocol(request, cleanText))
+            {
+                var retryRequest = AddToolProtocolRetryNudge(request);
+                createdText.Clear();
+                await foreach (var token in StreamTextAsync(retryRequest, loaded, model, cancellationToken))
+                {
+                    createdText.Append(token);
+                }
+
+                request = retryRequest;
+                text = createdText.ToString();
+                toolCalls = TryExtractToolCalls(text, request, out cleanText);
+            }
+
+            if (toolCalls.Count == 0 && string.IsNullOrWhiteSpace(cleanText) && HasToolResultMessage(request))
+            {
+                var retryRequest = AddToolResultContinuationNudge(request);
+                createdText.Clear();
+                await foreach (var token in StreamTextAsync(retryRequest, loaded, model, cancellationToken))
+                {
+                    createdText.Append(token);
+                }
+
+                request = retryRequest;
+                text = createdText.ToString();
+                toolCalls = TryExtractToolCalls(text, request, out cleanText);
+
+                if (toolCalls.Count == 0 && string.IsNullOrWhiteSpace(cleanText))
+                {
+                    cleanText = BuildEmptyToolResultFallback(request);
+                }
+            }
 
             if (request.StrictJsonSchema && toolCalls.Count == 0 && !string.IsNullOrWhiteSpace(request.JsonSchema) && !string.IsNullOrWhiteSpace(cleanText))
             {
@@ -308,7 +285,12 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 }
                 catch (JsonException ex)
                 {
-                    _logger.LogWarning("Strict JSON Schema validation failed: {Error}. Text: {Text}", ex.Message, cleanText);
+                    _logger.LogWarning("Strict JSON Schema validation failed: {Error}", ex.Message);
+                    throw new OpenAiProtocolException(
+                        StatusCodes.Status422UnprocessableEntity,
+                        $"Model output did not satisfy the requested strict JSON schema: {ex.Message}",
+                        code: "json_schema_validation_failed",
+                        param: "response_format");
                 }
             }
 
@@ -636,6 +618,16 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         long? created,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        if (request.Tools.Count > 0)
+        {
+            await foreach (var evt in StreamBufferedChatCompletionAsync(request, responseId, includeUsage, store, created, cancellationToken))
+            {
+                yield return evt;
+            }
+
+            yield break;
+        }
+
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
@@ -667,7 +659,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
 
         var generatedText = completion.ToString();
-        var toolCalls = TryExtractToolCalls(generatedText, request.Tools, out _);
+        var toolCalls = TryExtractToolCalls(generatedText, request, out _);
         var finishReason = toolCalls.Count > 0 ? "tool_calls" : "stop";
         if (toolCalls.Count > 0)
         {
@@ -761,6 +753,16 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         long? created,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        if (request.Tools.Count > 0)
+        {
+            await foreach (var evt in StreamBufferedResponsesCompletionAsync(request, responseId, includeUsage, store, created, cancellationToken))
+            {
+                yield return evt;
+            }
+
+            yield break;
+        }
+
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
@@ -796,7 +798,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
 
         var generatedText = completion.ToString();
-        var toolCalls = TryExtractToolCalls(generatedText, request.Tools, out var cleanText);
+        var toolCalls = TryExtractToolCalls(generatedText, request, out var cleanText);
         yield return ToSse(new
         {
             type = "response.output_text.done",
@@ -877,6 +879,211 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         finally
         {
             ReleaseLoadedModel(model, loaded);
+        }
+    }
+
+    private async IAsyncEnumerable<string> StreamBufferedChatCompletionAsync(
+        InferenceRequest request,
+        string responseId,
+        bool includeUsage,
+        IOpenAiStore? store,
+        long? created,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var completion = await CompleteAsync(request, cancellationToken);
+        var createdAt = created ?? UnixNow();
+        var hasToolCalls = completion.ToolCalls.Count > 0 && string.IsNullOrWhiteSpace(completion.Text);
+
+        if (!string.IsNullOrEmpty(completion.Text))
+        {
+            yield return ToSse(new
+            {
+                id = responseId,
+                @object = "chat.completion.chunk",
+                created = createdAt,
+                model = completion.Model,
+                choices = new[]
+                {
+                    new
+                    {
+                        index = 0,
+                        delta = new { content = completion.Text },
+                        finish_reason = (string?)null
+                    }
+                }
+            });
+        }
+
+        if (hasToolCalls)
+        {
+            yield return ToSse(new
+            {
+                id = responseId,
+                @object = "chat.completion.chunk",
+                created = createdAt,
+                model = completion.Model,
+                choices = new[]
+                {
+                    new
+                    {
+                        index = 0,
+                        delta = new { tool_calls = ToStreamingToolCallDeltas(completion.ToolCalls) },
+                        finish_reason = (string?)null
+                    }
+                }
+            });
+        }
+
+        yield return ToSse(new
+        {
+            id = responseId,
+            @object = "chat.completion.chunk",
+            created = createdAt,
+            model = completion.Model,
+            choices = new[]
+            {
+                new
+                {
+                    index = 0,
+                    delta = new { },
+                    finish_reason = hasToolCalls ? "tool_calls" : completion.FinishReason
+                }
+            }
+        });
+
+        if (includeUsage)
+        {
+            yield return ToSse(new
+            {
+                id = responseId,
+                @object = "chat.completion.chunk",
+                created = createdAt,
+                model = completion.Model,
+                choices = Array.Empty<object>(),
+                usage = new
+                {
+                    prompt_tokens = completion.PromptTokens,
+                    completion_tokens = completion.CompletionTokens,
+                    total_tokens = completion.TotalTokens
+                }
+            });
+        }
+
+        if (store is not null && request.Store == true)
+        {
+            await store.AddChatCompletionAsync(responseId, createdAt, request, completion, cancellationToken);
+        }
+    }
+
+    private static object[] ToStreamingToolCallDeltas(IReadOnlyList<OpenAiToolCall> toolCalls)
+    {
+        return toolCalls.Select((toolCall, index) => new
+        {
+            index,
+            id = toolCall.Id,
+            type = toolCall.Type,
+            function = new
+            {
+                name = toolCall.Function.Name,
+                arguments = toolCall.Function.Arguments
+            }
+        }).Cast<object>().ToArray();
+    }
+
+    private async IAsyncEnumerable<string> StreamBufferedResponsesCompletionAsync(
+        InferenceRequest request,
+        string responseId,
+        bool includeUsage,
+        IOpenAiStore? store,
+        long? created,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var createdAt = created ?? UnixNow();
+        yield return ToSse(new
+        {
+            type = "response.created",
+            response = new
+            {
+                id = responseId,
+                @object = "response",
+                created_at = createdAt,
+                status = "in_progress",
+                model = request.RequestedModel ?? DefaultModelId
+            }
+        });
+
+        var completion = await CompleteAsync(request, cancellationToken);
+
+        if (!string.IsNullOrEmpty(completion.Text))
+        {
+            yield return ToSse(new
+            {
+                type = "response.output_text.delta",
+                item_id = "msg_" + responseId,
+                output_index = 0,
+                content_index = 0,
+                delta = completion.Text
+            });
+        }
+
+        yield return ToSse(new
+        {
+            type = "response.output_text.done",
+            item_id = "msg_" + responseId,
+            output_index = 0,
+            content_index = 0,
+            text = completion.Text
+        });
+
+        foreach (var toolCall in completion.ToolCalls)
+        {
+            yield return ToSse(new
+            {
+                type = "response.output_item.done",
+                output_index = 1,
+                item = new
+                {
+                    id = toolCall.Id,
+                    type = "function_call",
+                    status = "completed",
+                    call_id = toolCall.Id,
+                    name = toolCall.Function.Name,
+                    arguments = toolCall.Function.Arguments
+                }
+            });
+        }
+
+        if (includeUsage)
+        {
+            yield return ToSse(new
+            {
+                type = "response.usage.delta",
+                response_id = responseId,
+                usage = new
+                {
+                    input_tokens = completion.PromptTokens,
+                    output_tokens = completion.CompletionTokens,
+                    total_tokens = completion.TotalTokens
+                }
+            });
+        }
+
+        yield return ToSse(new
+        {
+            type = "response.completed",
+            response = new
+            {
+                id = responseId,
+                @object = "response",
+                created_at = createdAt,
+                status = "completed",
+                model = completion.Model
+            }
+        });
+
+        if (store is not null && request.Store != false)
+        {
+            await store.AddResponseAsync(responseId, createdAt, request, completion, cancellationToken);
         }
     }
 
@@ -1041,7 +1248,11 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             : null;
 
         string? grammar = null;
-        if (!string.IsNullOrWhiteSpace(request.JsonSchema))
+        if (request.ForceToolCallJson)
+        {
+            grammar = BuildToolCallGrammar(request);
+        }
+        else if (!string.IsNullOrWhiteSpace(request.JsonSchema))
         {
             try
             {
@@ -1273,6 +1484,14 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         foreach (var requestMessage in request.Messages)
         {
             var content = requestMessage.Content ?? string.Empty;
+
+            var normalizedRole = NormalizeTemplateRole(requestMessage.Role);
+            if (string.Equals(normalizedRole, "tool", StringComparison.OrdinalIgnoreCase))
+            {
+                messages.Add(("user", FormatToolResultForPrompt(requestMessage, content)));
+                continue;
+            }
+
             if (requestMessage.Media.Count > 0)
             {
                 foreach (var item in requestMessage.Media)
@@ -1292,10 +1511,10 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 content = $"tool_call_id: {requestMessage.ToolCallId}{Environment.NewLine}{content}";
             }
 
-            messages.Add((NormalizeTemplateRole(requestMessage.Role), content));
+            messages.Add((normalizedRole, content));
         }
 
-        if (request.Tools.Count > 0)
+        if (request.Tools.Count > 0 && request.ToolChoiceMode != InferenceToolChoiceMode.None)
         {
             var toolInstruction = BuildToolInstruction(request);
             var systemIndex = messages.FindIndex(x => x.Role == "system");
@@ -1317,29 +1536,322 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return messages;
     }
 
+    private static string FormatToolResultForPrompt(InferenceMessage message, string content)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("Tool result received.");
+        if (!string.IsNullOrWhiteSpace(message.ToolCallId))
+        {
+            builder.AppendLine("tool_call_id: " + message.ToolCallId);
+        }
+
+        if (!string.IsNullOrWhiteSpace(message.Name))
+        {
+            builder.AppendLine("tool_name: " + message.Name);
+        }
+
+        builder.AppendLine("tool_output:");
+        builder.AppendLine(content);
+        builder.AppendLine();
+        builder.AppendLine("Continue the user's original task now. If this result is successful, answer the user. If it failed, call another appropriate tool with corrected arguments or explain the failure. Do not return an empty message.");
+        return builder.ToString().TrimEnd();
+    }
+
+    private static bool HasToolResultMessage(InferenceRequest request)
+    {
+        return request.Messages.Any(message =>
+            string.Equals(message.Role, "tool", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(message.Role, "function", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static InferenceRequest AddToolResultContinuationNudge(InferenceRequest request)
+    {
+        var messages = request.Messages.Concat(
+        [
+            new InferenceMessage
+            {
+                Role = "user",
+                Content = "The previous message contains a tool result. Continue the user's original task now: answer from the tool result if possible, or call another appropriate tool with corrected arguments if the tool failed. Do not return an empty response."
+            }
+        ]).ToArray();
+
+        var warnings = request.CompatibilityWarnings
+            .Concat(["Model returned an empty response after a tool result; retried once with a continuation instruction."])
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        return request.WithMessages(messages, warnings);
+    }
+
+    private static bool ShouldRetryToolProtocol(InferenceRequest request, string cleanText)
+    {
+        if (request.Tools.Count == 0 ||
+            request.ToolChoiceMode == InferenceToolChoiceMode.None ||
+            HasToolResultMessage(request))
+        {
+            return false;
+        }
+
+        if (request.ToolChoiceMode is InferenceToolChoiceMode.Required or InferenceToolChoiceMode.Function)
+        {
+            return true;
+        }
+
+        var text = cleanText.Trim();
+        return text.Length == 0 || ContainsOnlyMarkupTagsAndWhitespace(text);
+    }
+
+    private static bool ContainsOnlyMarkupTagsAndWhitespace(string text)
+    {
+        var sawTag = false;
+        var index = 0;
+
+        while (index < text.Length)
+        {
+            if (char.IsWhiteSpace(text[index]))
+            {
+                index++;
+                continue;
+            }
+
+            if (text[index] != '<')
+            {
+                return false;
+            }
+
+            var close = text.IndexOf('>', index + 1);
+            if (close < 0)
+            {
+                return false;
+            }
+
+            sawTag = true;
+            index = close + 1;
+        }
+
+        return sawTag;
+    }
+
+    private static InferenceRequest AddToolProtocolRetryNudge(InferenceRequest request)
+    {
+        var messages = request.Messages.Concat(
+        [
+            new InferenceMessage
+            {
+                Role = "user",
+                Content = "The previous assistant message was not a valid final answer or a valid tool call. Continue the same user request. If the request needs current, external, local project, file, command, memory, skill, calculation, or other registered capabilities, call the appropriate available tool. Respond only with the JSON tool_calls object described above. In this retry, function.arguments may be a JSON object; the server will normalize it to the OpenAI string form."
+            }
+        ]).ToArray();
+
+        var warnings = request.CompatibilityWarnings
+            .Concat(["Model returned a non-answer while tools were available; retried once with constrained tool-call JSON."])
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        var retryRequest = request.WithMessages(messages, warnings);
+        retryRequest.ForceToolCallJson = true;
+        retryRequest.ToolChoiceMode = retryRequest.ToolChoiceMode == InferenceToolChoiceMode.Auto
+            ? InferenceToolChoiceMode.Required
+            : retryRequest.ToolChoiceMode;
+        return retryRequest;
+    }
+
+    private static string BuildEmptyToolResultFallback(InferenceRequest request)
+    {
+        var toolMessage = request.Messages.LastOrDefault(message =>
+            string.Equals(message.Role, "tool", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(message.Role, "function", StringComparison.OrdinalIgnoreCase));
+
+        if (toolMessage is null || string.IsNullOrWhiteSpace(toolMessage.Content))
+        {
+            return "工具调用后模型没有生成回复。请稍后重试，或检查工具返回内容是否为空。";
+        }
+
+        var content = toolMessage.Content.Trim();
+        try
+        {
+            using var document = JsonDocument.Parse(content);
+            var root = document.RootElement;
+            var ok = TryGetBoolean(root, "ok");
+            var command = TryGetString(root, "command");
+            var exitCode = TryGetInt32(root, "exitCode");
+            var timedOut = TryGetBoolean(root, "timedOut");
+            var stdout = TryGetString(root, "stdout");
+            var stderr = TryGetString(root, "stderr");
+
+            if (ok == true && !string.IsNullOrWhiteSpace(stdout))
+            {
+                return "工具已经返回结果，但模型没有生成最终回复。工具输出如下：\n" + TruncateForFallback(stdout);
+            }
+
+            var builder = new StringBuilder("工具调用失败，所以这次没能拿到可用结果。");
+            if (!string.IsNullOrWhiteSpace(command))
+            {
+                builder.AppendLine();
+                builder.Append("命令：").Append(command);
+            }
+
+            if (exitCode is not null)
+            {
+                builder.AppendLine();
+                builder.Append("退出码：").Append(exitCode.Value);
+            }
+
+            if (timedOut == true)
+            {
+                builder.AppendLine();
+                builder.Append("状态：执行超时");
+            }
+
+            if (!string.IsNullOrWhiteSpace(stderr))
+            {
+                builder.AppendLine();
+                builder.Append("错误输出：").Append(TruncateForFallback(stderr));
+            }
+            else if (!string.IsNullOrWhiteSpace(stdout))
+            {
+                builder.AppendLine();
+                builder.Append("工具输出：").Append(TruncateForFallback(stdout));
+            }
+            else
+            {
+                builder.AppendLine();
+                builder.Append("工具没有返回 stdout/stderr。");
+            }
+
+            return builder.ToString();
+        }
+        catch (JsonException)
+        {
+            return "工具返回了结果，但模型没有生成最终回复。工具输出如下：\n" + TruncateForFallback(content);
+        }
+    }
+
+    private static string TruncateForFallback(string value)
+    {
+        value = value.Trim();
+        const int maxLength = 1200;
+        return value.Length <= maxLength ? value : value[..maxLength] + "...";
+    }
+
+    private static string? TryGetString(JsonElement element, string propertyName)
+    {
+        return element.ValueKind == JsonValueKind.Object &&
+            element.TryGetProperty(propertyName, out var property) &&
+            property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : null;
+    }
+
+    private static bool? TryGetBoolean(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty(propertyName, out var property))
+        {
+            return null;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => null
+        };
+    }
+
+    private static int? TryGetInt32(JsonElement element, string propertyName)
+    {
+        return element.ValueKind == JsonValueKind.Object &&
+            element.TryGetProperty(propertyName, out var property) &&
+            property.ValueKind == JsonValueKind.Number &&
+            property.TryGetInt32(out var value)
+            ? value
+            : null;
+    }
+
+    private static string BuildToolCallGrammar(InferenceRequest request)
+    {
+        var functionNames = request.Tools
+            .Where(tool => string.Equals(tool.Type, "function", StringComparison.OrdinalIgnoreCase))
+            .Select(tool => tool.Function?.Name)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (request.ToolChoiceMode == InferenceToolChoiceMode.Function &&
+            !string.IsNullOrWhiteSpace(request.ToolChoiceName) &&
+            functionNames.Contains(request.ToolChoiceName, StringComparer.Ordinal))
+        {
+            functionNames = [request.ToolChoiceName];
+        }
+
+        var toolNameRule = functionNames.Length == 0
+            ? "string"
+            : string.Join(" | ", functionNames.Select(name => $"\"\\\"{EscapeGbnfString(name)}\\\"\""));
+
+        return $$"""
+root ::= ws "\{" ws "\"tool_calls\"" ws ":" ws "\[" ws tool-call (ws "," ws tool-call)* ws "\]" ws "\}" ws
+tool-call ::= "\{" ws "\"id\"" ws ":" ws string "," ws "\"type\"" ws ":" ws "\"function\"" "," ws "\"function\"" ws ":" ws function-call ws "\}"
+function-call ::= "\{" ws "\"name\"" ws ":" ws tool-name "," ws "\"arguments\"" ws ":" ws object ws "\}"
+tool-name ::= {{toolNameRule}}
+value ::= object | array | string | number | "true" ws | "false" ws | "null" ws
+object ::= "\{" ws (string ":" ws value ("," ws string ":" ws value)*)? ws "\}" ws
+array ::= "\[" ws (value ("," ws value)*)? ws "\]" ws
+string ::= "\"" string-char* "\"" ws
+string-char ::= [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])
+number ::= ("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
+ws ::= [ \t\n\r]*
+""";
+    }
+
+    private static string EscapeGbnfString(string value)
+    {
+        return value
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal)
+            .Replace("\n", "\\n", StringComparison.Ordinal)
+            .Replace("\r", "\\r", StringComparison.Ordinal)
+            .Replace("\t", "\\t", StringComparison.Ordinal);
+    }
+
     private static string BuildToolInstruction(InferenceRequest request)
     {
         var options = OpenAiJson.CreateOptions();
         var toolJson = JsonSerializer.Serialize(request.Tools, options);
         var builder = new StringBuilder();
-        builder.AppendLine("You can call tools when needed. Available tools are provided as JSON:");
+        builder.AppendLine("Use tools whenever the user's request needs current, external, local project, file, command, memory, skill, calculation, or other registered capabilities.");
+        builder.AppendLine("For those requests, do not answer from model memory and do not ask the user to perform the lookup.");
+        builder.AppendLine("Available tools are provided as JSON:");
         builder.AppendLine(toolJson);
         if (!string.IsNullOrWhiteSpace(request.ToolChoiceDescription))
         {
             builder.AppendLine("Tool choice: " + request.ToolChoiceDescription);
         }
 
+        if (request.ToolChoiceMode == InferenceToolChoiceMode.Function && !string.IsNullOrWhiteSpace(request.ToolChoiceName))
+        {
+            builder.AppendLine($"Only call the `{request.ToolChoiceName}` tool.");
+        }
+        else if (request.ToolChoiceMode == InferenceToolChoiceMode.Required)
+        {
+            builder.AppendLine("You must call one of the available tools.");
+        }
+
         if (request.ParallelToolCalls == true)
         {
-            builder.AppendLine("You may call multiple tools at once. Respond only with JSON in this exact shape:");
+            builder.AppendLine("You may call multiple tools at once. When calling tools, do not output reasoning, Markdown, prose, or any text outside JSON. The first non-whitespace character must be `{`. Respond only with JSON in this exact shape:");
             builder.AppendLine("""{"tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"tool_name","arguments":"{\"arg\":\"value\"}"}},{"id":"call_<unique>","type":"function","function":{"name":"another_tool","arguments":"{\"arg\":\"value\"}"}}]}""");
         }
         else
         {
-            builder.AppendLine("When calling a tool, respond only with JSON in this exact shape:");
+            builder.AppendLine("When calling a tool, do not output reasoning, Markdown, prose, or any text outside JSON. The first non-whitespace character must be `{`. Respond only with JSON in this exact shape:");
             builder.AppendLine("""{"tool_calls":[{"id":"call_<unique>","type":"function","function":{"name":"tool_name","arguments":"{\"arg\":\"value\"}"}}]}""");
         }
-        builder.AppendLine("If no tool is needed, answer normally.");
+        builder.AppendLine("""If you already produced a <dw_tool_call>{"name":"tool_name","arguments":{}}</dw_tool_call> text-protocol call, output the equivalent JSON tool_calls object instead.""");
+        builder.AppendLine("When a tool result is provided, continue the task. If the tool succeeded, answer the user from the tool result. If it failed, call another appropriate tool with corrected arguments or explain the failure. Never return an empty message after a tool result.");
+        builder.AppendLine("When using shell commands, quote URLs or arguments that contain shell metacharacters such as `&`.");
+        builder.AppendLine("If the request can be answered without any registered tool, answer normally.");
         if (request.ForceJson)
         {
             builder.AppendLine("If answering normally, return valid JSON only.");
@@ -1398,56 +1910,57 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private static IReadOnlyList<OpenAiToolCall> TryExtractToolCalls(
         string generated,
-        IReadOnlyList<OpenAiTool> requestTools,
+        InferenceRequest request,
         out string cleanText)
     {
         cleanText = generated.Trim();
-        if (requestTools.Count == 0)
+        if (request.Tools.Count == 0 || request.ToolChoiceMode == InferenceToolChoiceMode.None)
         {
             return [];
         }
 
-        var json = ExtractJsonObject(cleanText);
-        if (json is null)
+        var textProtocolCalls = TryExtractDwToolCalls(cleanText, request);
+        if (textProtocolCalls.Count > 0)
         {
-            return [];
+            cleanText = string.Empty;
+            return textProtocolCalls;
         }
 
+        foreach (var json in ExtractJsonObjects(cleanText))
+        {
+            var valid = TryParseToolCallsFromJson(json, request);
+            if (valid.Count > 0)
+            {
+                cleanText = string.Empty;
+                return valid;
+            }
+        }
+
+        return [];
+    }
+
+    private static IReadOnlyList<OpenAiToolCall> TryParseToolCallsFromJson(string json, InferenceRequest request)
+    {
         try
         {
             using var document = JsonDocument.Parse(json);
-            if (document.RootElement.TryGetProperty("tool_calls", out var toolCallsElement) && toolCallsElement.ValueKind == JsonValueKind.Array)
+            var root = document.RootElement;
+
+            if (root.TryGetProperty("tool_calls", out var toolCallsElement) && toolCallsElement.ValueKind == JsonValueKind.Array)
             {
-                var calls = JsonSerializer.Deserialize<List<OpenAiToolCall>>(toolCallsElement.GetRawText(), OpenAiJson.CreateOptions()) ?? [];
-                if (calls.Count > 0)
-                {
-                    var valid = ValidateToolCalls(calls, requestTools);
-                    if (valid.Count > 0)
-                    {
-                        cleanText = string.Empty;
-                        return valid;
-                    }
-                }
+                var calls = ParseToolCallArray(toolCallsElement);
+                return calls.Count > 0 ? ValidateToolCalls(calls, request) : [];
             }
 
-            if (document.RootElement.TryGetProperty("function_call", out var functionCallElement) && functionCallElement.ValueKind == JsonValueKind.Object)
+            if (root.TryGetProperty("function_call", out var functionCallElement) && functionCallElement.ValueKind == JsonValueKind.Object)
             {
-                var call = JsonSerializer.Deserialize<OpenAiFunctionCall>(functionCallElement.GetRawText(), OpenAiJson.CreateOptions());
-                if (call is not null)
-                {
-                    var toolCall = new OpenAiToolCall
-                    {
-                        Id = "call_" + Guid.NewGuid().ToString("N"),
-                        Type = "function",
-                        Function = call
-                    };
-                    var single = ValidateToolCalls([toolCall], requestTools);
-                    if (single.Count > 0)
-                    {
-                        cleanText = string.Empty;
-                        return single;
-                    }
-                }
+                var call = ParseFunctionCall(functionCallElement);
+                return call is null ? [] : ValidateToolCalls([CreateToolCall(call.Name, call.Arguments)], request);
+            }
+
+            if (TryReadTextProtocolToolCall(root, out var textProtocolCall))
+            {
+                return ValidateToolCalls([textProtocolCall], request);
             }
         }
         catch (JsonException)
@@ -1458,13 +1971,171 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return [];
     }
 
+    private static IReadOnlyList<OpenAiToolCall> ParseToolCallArray(JsonElement toolCallsElement)
+    {
+        var calls = new List<OpenAiToolCall>();
+
+        foreach (var item in toolCallsElement.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object ||
+                !item.TryGetProperty("function", out var functionElement) ||
+                functionElement.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var function = ParseFunctionCall(functionElement);
+            if (function is null)
+            {
+                continue;
+            }
+
+            var id = item.TryGetProperty("id", out var idElement) && idElement.ValueKind == JsonValueKind.String
+                ? idElement.GetString()
+                : null;
+            var type = item.TryGetProperty("type", out var typeElement) && typeElement.ValueKind == JsonValueKind.String
+                ? typeElement.GetString()
+                : null;
+
+            calls.Add(new OpenAiToolCall
+            {
+                Id = string.IsNullOrWhiteSpace(id) ? "call_" + Guid.NewGuid().ToString("N") : id!,
+                Type = string.IsNullOrWhiteSpace(type) ? "function" : type!,
+                Function = function
+            });
+        }
+
+        return calls;
+    }
+
+    private static OpenAiFunctionCall? ParseFunctionCall(JsonElement functionElement)
+    {
+        if (functionElement.ValueKind != JsonValueKind.Object ||
+            !functionElement.TryGetProperty("name", out var nameElement) ||
+            nameElement.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        var name = nameElement.GetString();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return null;
+        }
+
+        var arguments = "{}";
+        if (functionElement.TryGetProperty("arguments", out var argumentsElement) &&
+            argumentsElement.ValueKind != JsonValueKind.Null &&
+            argumentsElement.ValueKind != JsonValueKind.Undefined)
+        {
+            arguments = argumentsElement.ValueKind == JsonValueKind.String
+                ? argumentsElement.GetString() ?? "{}"
+                : argumentsElement.GetRawText();
+        }
+
+        return new OpenAiFunctionCall
+        {
+            Name = name,
+            Arguments = string.IsNullOrWhiteSpace(arguments) ? "{}" : arguments
+        };
+    }
+
+    private static IReadOnlyList<OpenAiToolCall> TryExtractDwToolCalls(string text, InferenceRequest request)
+    {
+        const string startTag = "<dw_tool_call>";
+        const string endTag = "</dw_tool_call>";
+        var calls = new List<OpenAiToolCall>();
+        var searchStart = 0;
+
+        while (searchStart < text.Length)
+        {
+            var start = text.IndexOf(startTag, searchStart, StringComparison.OrdinalIgnoreCase);
+            if (start < 0)
+            {
+                break;
+            }
+
+            var contentStart = start + startTag.Length;
+            var end = text.IndexOf(endTag, contentStart, StringComparison.OrdinalIgnoreCase);
+            if (end < 0)
+            {
+                break;
+            }
+
+            var json = text[contentStart..end].Trim();
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                if (TryReadTextProtocolToolCall(document.RootElement, out var call))
+                {
+                    calls.Add(call);
+                }
+            }
+            catch (JsonException)
+            {
+                return [];
+            }
+
+            searchStart = end + endTag.Length;
+        }
+
+        return calls.Count > 0 ? ValidateToolCalls(calls, request) : [];
+    }
+
+    private static bool TryReadTextProtocolToolCall(JsonElement root, out OpenAiToolCall call)
+    {
+        call = new OpenAiToolCall();
+
+        if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("name", out var nameElement) ||
+            nameElement.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        var name = nameElement.GetString();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var arguments = "{}";
+        if (root.TryGetProperty("arguments", out var argumentsElement) &&
+            argumentsElement.ValueKind != JsonValueKind.Null &&
+            argumentsElement.ValueKind != JsonValueKind.Undefined)
+        {
+            arguments = argumentsElement.ValueKind == JsonValueKind.String
+                ? argumentsElement.GetString() ?? "{}"
+                : argumentsElement.GetRawText();
+        }
+
+        call = CreateToolCall(name, arguments);
+        return true;
+    }
+
+    private static OpenAiToolCall CreateToolCall(string name, string arguments)
+    {
+        return new OpenAiToolCall
+        {
+            Id = "call_" + Guid.NewGuid().ToString("N"),
+            Type = "function",
+            Function = new OpenAiFunctionCall
+            {
+                Name = name,
+                Arguments = string.IsNullOrWhiteSpace(arguments) ? "{}" : arguments
+            }
+        };
+    }
+
     private static IReadOnlyList<OpenAiToolCall> ValidateToolCalls(
         IReadOnlyList<OpenAiToolCall> calls,
-        IReadOnlyList<OpenAiTool> requestTools)
+        InferenceRequest request)
     {
         var valid = new List<OpenAiToolCall>();
-        var schemaIndex = requestTools
-            .Where(t => t.Function is not null)
+        var schemaIndex = request.Tools
+            .Where(t => string.Equals(t.Type, "function", StringComparison.OrdinalIgnoreCase) && t.Function is not null)
+            .GroupBy(t => t.Function!.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
             .ToDictionary(t => t.Function!.Name, StringComparer.OrdinalIgnoreCase);
 
         foreach (var call in calls)
@@ -1476,13 +2147,23 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
             if (!schemaIndex.TryGetValue(call.Function.Name, out var toolDef))
             {
-                valid.Add(call);
+                continue;
+            }
+
+            if (request.ToolChoiceMode == InferenceToolChoiceMode.Function &&
+                !string.Equals(call.Function.Name, request.ToolChoiceName, StringComparison.OrdinalIgnoreCase))
+            {
                 continue;
             }
 
             if (toolDef.Function?.Parameters is null || toolDef.Function.Parameters.Value.ValueKind != JsonValueKind.Object)
             {
                 valid.Add(call);
+                if (request.ParallelToolCalls != true)
+                {
+                    break;
+                }
+
                 continue;
             }
 
@@ -1491,6 +2172,10 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             if (argsValid)
             {
                 valid.Add(call);
+                if (request.ParallelToolCalls != true)
+                {
+                    break;
+                }
             }
         }
 
@@ -1673,11 +2358,61 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         };
     }
 
-    private static string? ExtractJsonObject(string text)
+    private static IEnumerable<string> ExtractJsonObjects(string text)
     {
-        var start = text.IndexOf('{');
-        var end = text.LastIndexOf('}');
-        return start >= 0 && end > start ? text[start..(end + 1)] : null;
+        var start = -1;
+        var depth = 0;
+        var inString = false;
+        var escaped = false;
+
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == '\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == '"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inString = true;
+                continue;
+            }
+
+            if (ch == '{')
+            {
+                if (depth == 0)
+                {
+                    start = i;
+                }
+
+                depth++;
+                continue;
+            }
+
+            if (ch == '}' && depth > 0)
+            {
+                depth--;
+                if (depth == 0 && start >= 0)
+                {
+                    yield return text[start..(i + 1)];
+                    start = -1;
+                }
+            }
+        }
     }
 
     private static int CountOccurrences(string text, string marker)
@@ -1728,7 +2463,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     public int GetModelMaxConcurrency(string? modelId)
     {
-        return ResolveRuntime(modelId).Options.MaxConcurrency;
+        return ResolveRuntime(modelId).MaxConcurrency;
     }
 
     public ModelMemoryInfo GetModelMemoryInfo(string? modelId)
@@ -1889,6 +2624,8 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         public bool IsLoaded => _loaded;
 
+        public int MaxConcurrency => _loaded ? _allInstances.Count : Options.MaxConcurrency;
+
         public long EstimatedWeightBytes { get; private set; }
 
         public long EstimatedContextBytes { get; private set; }
@@ -1910,7 +2647,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 _allInstances.Add(inst);
                 _available.Enqueue(inst);
             }
-            _instanceSemaphore = new SemaphoreSlim(instances.Count, instances.Count);
+            _instanceSemaphore = new SemaphoreSlim(instances.Count);
             _loaded = true;
         }
 
@@ -1979,32 +2716,34 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                         }
                     }
 
-                    _instanceSemaphore?.Dispose();
-                    _instanceSemaphore = new SemaphoreSlim(newMaxConcurrency, newMaxConcurrency);
+                    _instanceSemaphore!.Release(addCount);
                 }
                 else
                 {
                     var removeCount = currentCount - newMaxConcurrency;
-                    _loaded = false;
-
                     var toRecycle = new List<LoadedModel>();
-                    lock (_lock)
+
+                    for (var i = 0; i < removeCount; i++)
                     {
-                        while (_available.Count > 0 && toRecycle.Count < removeCount)
+                        await _instanceSemaphore!.WaitAsync(ct);
+                        lock (_lock)
                         {
-                            toRecycle.Add(_available.Dequeue());
+                            if (_available.Count == 0)
+                            {
+                                _instanceSemaphore.Release();
+                                throw new InvalidOperationException("Could not shrink the model pool because no idle instance was available.");
+                            }
+
+                            var inst = _available.Dequeue();
+                            _allInstances.Remove(inst);
+                            toRecycle.Add(inst);
                         }
                     }
 
                     foreach (var inst in toRecycle)
                     {
-                        _allInstances.Remove(inst);
                         inst.Dispose();
                     }
-
-                    _instanceSemaphore?.Dispose();
-                    _instanceSemaphore = new SemaphoreSlim(newMaxConcurrency, newMaxConcurrency);
-                    _loaded = true;
                 }
             }
             finally
@@ -2108,6 +2847,8 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         public bool IsLoaded => _loaded;
 
+        public int MaxConcurrency => _loaded ? _allInstances.Count : Options.MaxConcurrency;
+
         public long EstimatedWeightBytes { get; private set; }
 
         public long EstimatedContextBytes { get; private set; }
@@ -2129,7 +2870,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 _allInstances.Add(inst);
                 _available.Enqueue(inst);
             }
-            _instanceSemaphore = new SemaphoreSlim(instances.Count, instances.Count);
+            _instanceSemaphore = new SemaphoreSlim(instances.Count);
             _loaded = true;
         }
 
@@ -2207,32 +2948,33 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                         }
                     }
 
-                    _instanceSemaphore?.Dispose();
-                    _instanceSemaphore = new SemaphoreSlim(newMaxConcurrency, newMaxConcurrency);
+                    _instanceSemaphore!.Release(addCount);
                 }
                 else
                 {
                     var removeCount = currentCount - newMaxConcurrency;
-                    _loaded = false;
-
                     var toRecycle = new List<EmbeddingLoadedModel>();
-                    lock (_lock)
+                    for (var i = 0; i < removeCount; i++)
                     {
-                        while (_available.Count > 0 && toRecycle.Count < removeCount)
+                        await _instanceSemaphore!.WaitAsync(ct);
+                        lock (_lock)
                         {
-                            toRecycle.Add(_available.Dequeue());
+                            if (_available.Count == 0)
+                            {
+                                _instanceSemaphore.Release();
+                                throw new InvalidOperationException("Could not shrink the embedding pool because no idle instance was available.");
+                            }
+
+                            var inst = _available.Dequeue();
+                            _allInstances.Remove(inst);
+                            toRecycle.Add(inst);
                         }
                     }
 
                     foreach (var inst in toRecycle)
                     {
-                        _allInstances.Remove(inst);
                         inst.Dispose();
                     }
-
-                    _instanceSemaphore?.Dispose();
-                    _instanceSemaphore = new SemaphoreSlim(newMaxConcurrency, newMaxConcurrency);
-                    _loaded = true;
                 }
             }
             finally

@@ -4,4 +4,7 @@
     <Project Path="src/Zhengyan.LLamaStack.Api/Zhengyan.LLamaStack.Api.csproj" />
     <Project Path="src/Zhengyan.OpenAIModels/Zhengyan.OpenAIModels.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Zhengyan.LLamaStack.Tests/Zhengyan.LLamaStack.Tests.csproj" />
+  </Folder>
 </Solution>
