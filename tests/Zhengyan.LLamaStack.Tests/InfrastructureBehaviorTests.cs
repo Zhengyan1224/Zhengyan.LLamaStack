@@ -268,6 +268,25 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
+    public void ToolCallExtraction_DoesNotDropDeclaredToolWhenArgumentsMissSchema()
+    {
+        var request = new InferenceRequest
+        {
+            Tools = [CreateRequiredFunctionTool("lookup_weather", "city")]
+        };
+
+        var toolCalls = ExtractToolCalls(
+            """{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup_weather","arguments":{}}}]}""",
+            request,
+            out var cleanText);
+
+        Assert.Empty(cleanText);
+        var call = Assert.Single(toolCalls);
+        Assert.Equal("lookup_weather", call.Function.Name);
+        Assert.Equal("{}", call.Function.Arguments);
+    }
+
+    [Fact]
     public void ToolProtocolRetry_RetriesBareMarkupNonAnswer()
     {
         var request = CreateToolInferenceRequest("lookup_weather");
@@ -289,7 +308,7 @@ public sealed class InfrastructureBehaviorTests
     {
         var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
 
-        using var grammar = new Grammar(BuildToolCallGrammar(request), "root");
+        var grammar = new Grammar(BuildToolCallGrammar(request), "root");
 
         Assert.NotNull(grammar);
     }
@@ -334,6 +353,29 @@ public sealed class InfrastructureBehaviorTests
               "type": "object",
               "properties": {},
               "required": []
+            }
+            """);
+
+        return new OpenAiTool
+        {
+            Type = "function",
+            Function = new OpenAiFunction
+            {
+                Name = name,
+                Parameters = parameters.RootElement.Clone()
+            }
+        };
+    }
+
+    private static OpenAiTool CreateRequiredFunctionTool(string name, params string[] required)
+    {
+        using var parameters = JsonDocument.Parse($$"""
+            {
+              "type": "object",
+              "properties": {
+                "{{required[0]}}": { "type": "string" }
+              },
+              "required": [{{string.Join(",", required.Select(x => $"\"{x}\""))}}]
             }
             """);
 

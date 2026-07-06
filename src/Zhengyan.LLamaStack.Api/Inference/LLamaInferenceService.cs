@@ -2156,107 +2156,14 @@ ws ::= [ \t\n\r]*
                 continue;
             }
 
-            if (toolDef.Function?.Parameters is null || toolDef.Function.Parameters.Value.ValueKind != JsonValueKind.Object)
+            valid.Add(call);
+            if (request.ParallelToolCalls != true)
             {
-                valid.Add(call);
-                if (request.ParallelToolCalls != true)
-                {
-                    break;
-                }
-
-                continue;
-            }
-
-            var schema = toolDef.Function.Parameters.Value;
-            var argsValid = ValidateArgumentsAgainstSchema(call.Function.Arguments, schema);
-            if (argsValid)
-            {
-                valid.Add(call);
-                if (request.ParallelToolCalls != true)
-                {
-                    break;
-                }
+                break;
             }
         }
 
         return valid;
-    }
-
-    private static bool ValidateArgumentsAgainstSchema(string argumentsJson, JsonElement schema)
-    {
-        if (string.IsNullOrWhiteSpace(argumentsJson))
-        {
-            return false;
-        }
-
-        JsonDocument argsDoc;
-        try
-        {
-            argsDoc = JsonDocument.Parse(argumentsJson);
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-
-        using (argsDoc)
-        {
-            var args = argsDoc.RootElement;
-            if (args.ValueKind != JsonValueKind.Object)
-            {
-                return false;
-            }
-
-            if (!schema.TryGetProperty("required", out var requiredElement) || requiredElement.ValueKind != JsonValueKind.Array)
-            {
-                return true;
-            }
-
-            foreach (var required in requiredElement.EnumerateArray())
-            {
-                if (required.ValueKind != JsonValueKind.String)
-                {
-                    continue;
-                }
-
-                var propName = required.GetString();
-                if (string.IsNullOrWhiteSpace(propName))
-                {
-                    continue;
-                }
-
-                if (!args.TryGetProperty(propName, out _))
-                {
-                    return false;
-                }
-            }
-
-            if (!schema.TryGetProperty("properties", out var propsElement) || propsElement.ValueKind != JsonValueKind.Object)
-            {
-                return true;
-            }
-
-            foreach (var prop in propsElement.EnumerateObject())
-            {
-                if (!args.TryGetProperty(prop.Name, out var argValue))
-                {
-                    continue;
-                }
-
-                if (!prop.Value.TryGetProperty("type", out var typeElement) || typeElement.ValueKind != JsonValueKind.String)
-                {
-                    continue;
-                }
-
-                var expectedType = typeElement.GetString();
-                if (!IsJsonTypeCompatible(argValue, expectedType))
-                {
-                    return false;
-                }
-            }
-        }
-
-        return true;
     }
 
     private static void ValidateJsonOutput(string text, string jsonSchemaJson)
