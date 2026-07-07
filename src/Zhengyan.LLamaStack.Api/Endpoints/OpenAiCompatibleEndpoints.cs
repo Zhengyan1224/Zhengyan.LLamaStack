@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Unicode;
+using LLama.Exceptions;
 using Microsoft.Extensions.Logging;
 using Zhengyan.LLamaStack.Api.Inference;
 using Zhengyan.LLamaStack.Api.Infrastructure;
@@ -367,11 +368,36 @@ public static class OpenAiCompatibleEndpoints
 
                     var includeUsage = request.StreamOptions?.IncludeUsage == true;
                     var timestamp = UnixNow();
-                    await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, includeUsage, store, timestamp, cancellationToken))
+                    try
                     {
-                        LogSseEvent(logger, "POST /v1/chat/completions", evt);
-                        await httpContext.Response.WriteAsync(evt, cancellationToken);
-                        await httpContext.Response.Body.FlushAsync(cancellationToken);
+                        await foreach (var evt in inference.StreamChatEventsAsync(inferenceRequest, responseId, includeUsage, store, timestamp, cancellationToken))
+                        {
+                            LogSseEvent(logger, "POST /v1/chat/completions", evt);
+                            await httpContext.Response.WriteAsync(evt, cancellationToken);
+                            await httpContext.Response.Body.FlushAsync(cancellationToken);
+                        }
+                    }
+                    catch (ContextOverflowException exception)
+                    {
+                        await WriteStreamingErrorAsync(
+                            logger,
+                            "POST /v1/chat/completions",
+                            responseId,
+                            httpContext,
+                            CreateContextOverflowProtocolException(exception),
+                            cancellationToken);
+                        return Results.Empty;
+                    }
+                    catch (OpenAiProtocolException exception)
+                    {
+                        await WriteStreamingErrorAsync(
+                            logger,
+                            "POST /v1/chat/completions",
+                            responseId,
+                            httpContext,
+                            exception,
+                            cancellationToken);
+                        return Results.Empty;
                     }
 
                     var doneEvent = "data: [DONE]\n\n";
@@ -405,6 +431,48 @@ public static class OpenAiCompatibleEndpoints
         {
             return ToError(logger, "POST /v1/chat/completions", exception);
         }
+    }
+
+    private static async Task WriteStreamingErrorAsync(
+        ILogger logger,
+        string endpoint,
+        string responseId,
+        HttpContext httpContext,
+        OpenAiProtocolException exception,
+        CancellationToken cancellationToken)
+    {
+        var envelope = new OpenAiErrorEnvelope
+        {
+            Error = new OpenAiError
+            {
+                Message = exception.Message,
+                Type = exception.Type,
+                Code = exception.Code,
+                Param = exception.Param
+            }
+        };
+
+        LogResponse(logger, endpoint, exception.StatusCode, envelope);
+        var errorEvent = ToSse(envelope);
+        LogSseEvent(logger, endpoint, errorEvent);
+        await httpContext.Response.WriteAsync(errorEvent, cancellationToken);
+        await httpContext.Response.Body.FlushAsync(cancellationToken);
+
+        var doneEvent = "data: [DONE]\n\n";
+        logger.LogDebug("[{Endpoint}] SSE: {Event}", endpoint, doneEvent.TrimEnd());
+        await httpContext.Response.WriteAsync(doneEvent, cancellationToken);
+        await httpContext.Response.Body.FlushAsync(cancellationToken);
+
+        logger.LogDebug("[{Endpoint}] Streaming finished with error for {ResponseId}", endpoint, responseId);
+    }
+
+    private static OpenAiProtocolException CreateContextOverflowProtocolException(ContextOverflowException exception)
+    {
+        return new OpenAiProtocolException(
+            StatusCodes.Status400BadRequest,
+            "The request exceeded the configured context window during generation. Reduce the prompt/history/tool definitions, lower max_tokens, or increase LLamaStack:Models[].ContextSize. LLamaSharp detail: " + exception.Message,
+            code: "context_length_exceeded",
+            param: "messages");
     }
 
     private static async Task<IResult> HandleResponsesAsync(

@@ -305,19 +305,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             if (toolCalls.Count == 0 && HasTerminalToolResultMessage(request) && IsToolResultContinuationFailure(cleanText))
             {
                 var toolResultRequest = request;
-                var retryRequest = AddToolResultContinuationNudge(toolResultRequest);
-                createdText.Clear();
-                await foreach (var token in StreamTextAsync(retryRequest, loaded, model, cancellationToken))
-                {
-                    createdText.Append(token);
-                }
-
-                request = retryRequest;
-                text = createdText.ToString();
-                toolCalls = TryExtractToolCalls(text, request, out cleanText);
-
-                if (toolCalls.Count == 0 &&
-                    toolResultRequest.Tools.Count > 0 &&
+                if (toolResultRequest.Tools.Count > 0 &&
                     toolResultRequest.ToolChoiceMode != InferenceToolChoiceMode.None &&
                     HasIntermediateToolResultMessage(toolResultRequest) &&
                     IsToolResultContinuationFailure(cleanText))
@@ -345,6 +333,33 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                                 .ToArray());
                         }
                     }
+                }
+                else
+                {
+                    var retryRequest = AddToolResultContinuationNudge(toolResultRequest);
+                    createdText.Clear();
+                    await foreach (var token in StreamTextAsync(retryRequest, loaded, model, cancellationToken))
+                    {
+                        createdText.Append(token);
+                    }
+
+                    request = retryRequest;
+                    text = createdText.ToString();
+                    toolCalls = TryExtractToolCalls(text, request, out cleanText);
+                }
+
+                if (toolCalls.Count == 0 && IsToolResultContinuationFailure(cleanText))
+                {
+                    var answerRequest = AddToolResultAnswerNudge(toolResultRequest);
+                    createdText.Clear();
+                    await foreach (var token in StreamTextAsync(answerRequest, loaded, model, cancellationToken))
+                    {
+                        createdText.Append(token);
+                    }
+
+                    request = answerRequest;
+                    text = createdText.ToString();
+                    toolCalls = TryExtractToolCalls(text, request, out cleanText);
                 }
 
                 if (toolCalls.Count == 0 && IsToolResultContinuationFailure(cleanText))
@@ -1468,7 +1483,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         var ctxSize = (int)(model.Options.ContextSize ?? 4096);
         var requestedOutputTokens = Math.Clamp(request.MaxTokens ?? model.Options.DefaultMaxTokens, 64, Math.Max(64, ctxSize / 2));
-        var headroom = Math.Clamp(requestedOutputTokens + 128, ctxSize / 5, Math.Max(ctxSize / 3, 256));
+        var headroom = Math.Clamp(requestedOutputTokens + 512, ctxSize / 3, Math.Max(ctxSize / 2, 512));
         var maxPromptTokens = ctxSize - headroom;
         var truncated = request.Messages.ToList();
 
@@ -1524,7 +1539,13 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         if (candidates.Length == 0)
         {
-            return false;
+            candidates = nonSystemIndices
+                .Where((_, i) => i != keepLast)
+                .ToArray();
+            if (candidates.Length == 0)
+            {
+                return false;
+            }
         }
 
         var removeScore = candidates
@@ -1800,21 +1821,72 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private static InferenceRequest AddToolResultContinuationNudge(InferenceRequest request)
     {
-        var messages = request.Messages.Concat(
-        [
-            new InferenceMessage
-            {
-                Role = "user",
-                Content = "Continue the original task from the tool result. If it failed, call a corrected tool or explain the failure. Do not return an empty response."
-            }
-        ]).ToArray();
+        var messages = BuildToolResultContinuationMessages(request, new InferenceMessage
+        {
+            Role = "user",
+            Content = "Continue the original task from the tool result. If the tool result succeeded, answer the user from it. If it failed, either call one corrected registered tool or give the user a brief natural-language explanation of the failure. Do not return an empty response."
+        });
 
         var warnings = request.CompatibilityWarnings
-            .Concat(["Model returned a non-answer after a tool result; retried once with a continuation instruction."])
+            .Concat(["Model returned a non-answer after a tool result; retried once with a compact continuation prompt."])
             .Distinct(StringComparer.Ordinal)
             .ToArray();
 
-        return request.WithMessages(messages, warnings);
+        var retryRequest = request.WithMessages(messages, warnings);
+        retryRequest.Temperature = 0;
+        retryRequest.MaxTokens = ResolveToolRetryMaxTokens(retryRequest.MaxTokens);
+        return retryRequest;
+    }
+
+    private static InferenceRequest AddToolResultAnswerNudge(InferenceRequest request)
+    {
+        var messages = BuildToolResultContinuationMessages(request, new InferenceMessage
+        {
+            Role = "user",
+            Content = "Write the final user-facing answer now using only the previous tool result. If the tool failed or returned no useful data, explain that naturally and briefly. Do not call another tool. Do not output JSON, Markdown code fences, or an empty message."
+        });
+
+        var warnings = request.CompatibilityWarnings
+            .Concat(["Model returned a non-answer after a tool result; retried once with a compact final-answer prompt."])
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        var answerRequest = request.WithMessages(messages, warnings);
+        answerRequest.Tools = [];
+        answerRequest.ToolChoiceMode = InferenceToolChoiceMode.None;
+        answerRequest.ToolChoiceName = null;
+        answerRequest.ForceToolCallJson = false;
+        answerRequest.ForceJson = false;
+        answerRequest.Temperature = 0;
+        answerRequest.MaxTokens = Math.Clamp(answerRequest.MaxTokens ?? 256, 64, 512);
+        return answerRequest;
+    }
+
+    private static IReadOnlyList<InferenceMessage> BuildToolResultContinuationMessages(
+        InferenceRequest request,
+        InferenceMessage nudgeMessage)
+    {
+        var messages = new List<InferenceMessage>();
+        var systemMessage = request.Messages.FirstOrDefault(message => IsSystemRole(message.Role));
+        if (systemMessage is not null)
+        {
+            messages.Add(systemMessage);
+        }
+
+        var latestTask = FindLatestUserTaskMessage(request) ?? FindLatestTaskMessage(request);
+        if (latestTask is not null)
+        {
+            messages.Add(latestTask);
+        }
+
+        var toolResult = GetLastToolResultMessage(request);
+        if (toolResult is not null)
+        {
+            messages.Add(toolResult);
+        }
+
+        messages.Add(nudgeMessage);
+        return messages;
     }
 
     private static InferenceRequest AddToolResultToolCallNudge(InferenceRequest request)
@@ -2045,6 +2117,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             content.StartsWith("The previous tool-call JSON was invalid.", StringComparison.Ordinal) ||
             content.StartsWith("The previous tool result is intermediate", StringComparison.Ordinal) ||
             content.StartsWith("Continue the original task from the tool result.", StringComparison.Ordinal) ||
+            content.StartsWith("Write the final user-facing answer now", StringComparison.Ordinal) ||
             content.StartsWith("The previous assistant message was not a valid final answer", StringComparison.Ordinal);
     }
 

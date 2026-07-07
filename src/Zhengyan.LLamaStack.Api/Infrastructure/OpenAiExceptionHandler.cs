@@ -1,4 +1,5 @@
 using System.Text.Json;
+using LLama.Exceptions;
 using Microsoft.AspNetCore.Diagnostics;
 using Zhengyan.LLamaStack.Api.OpenAi;
 
@@ -27,6 +28,26 @@ public sealed class OpenAiExceptionHandler : IExceptionHandler
                     Type = protocol.Type,
                     Code = protocol.Code,
                     Param = protocol.Param
+                }
+            };
+            await httpContext.Response.WriteAsync(
+                JsonSerializer.Serialize(envelope, OpenAiJson.CreateOptions()),
+                cancellationToken);
+            return true;
+        }
+
+        if (exception is ContextOverflowException contextOverflow)
+        {
+            httpContext.Response.StatusCode = StatusCodes.Status400BadRequest;
+            httpContext.Response.ContentType = "application/json; charset=utf-8";
+            var envelope = new OpenAiErrorEnvelope
+            {
+                Error = new OpenAiError
+                {
+                    Message = "The request exceeded the configured context window during generation. Reduce the prompt/history/tool definitions, lower max_tokens, or increase LLamaStack:Models[].ContextSize. LLamaSharp detail: " + contextOverflow.Message,
+                    Type = "invalid_request_error",
+                    Code = "context_length_exceeded",
+                    Param = "messages"
                 }
             };
             await httpContext.Response.WriteAsync(
