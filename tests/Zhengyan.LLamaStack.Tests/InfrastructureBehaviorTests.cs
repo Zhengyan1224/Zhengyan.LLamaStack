@@ -27,17 +27,9 @@ public sealed class InfrastructureBehaviorTests
         typeof(LLamaInferenceService).GetMethod("BuildToolCallGrammar", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("BuildToolCallGrammar method was not found.");
 
-    private static readonly MethodInfo BuildToolResultNonAnswerFallbackMethod =
-        typeof(LLamaInferenceService).GetMethod("BuildToolResultNonAnswerFallback", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("BuildToolResultNonAnswerFallback method was not found.");
-
     private static readonly MethodInfo IsInvalidToolProtocolRetryOutputMethod =
         typeof(LLamaInferenceService).GetMethod("IsInvalidToolProtocolRetryOutput", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("IsInvalidToolProtocolRetryOutput method was not found.");
-
-    private static readonly MethodInfo BuildInvalidToolCallFallbackMethod =
-        typeof(LLamaInferenceService).GetMethod("BuildInvalidToolCallFallback", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("BuildInvalidToolCallFallback method was not found.");
 
     private static readonly MethodInfo CreateInferenceParamsMethod =
         typeof(LLamaInferenceService).GetMethod("CreateInferenceParams", BindingFlags.NonPublic | BindingFlags.Static)
@@ -76,25 +68,9 @@ public sealed class InfrastructureBehaviorTests
         typeof(LLamaInferenceService).GetMethod("AddToolResultAnswerNudge", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("AddToolResultAnswerNudge method was not found.");
 
-    private static readonly MethodInfo TryBuildToolProtocolRecoveryCallMethod =
-        typeof(LLamaInferenceService).GetMethod("TryBuildToolProtocolRecoveryCall", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("TryBuildToolProtocolRecoveryCall method was not found.");
-
-    private static readonly MethodInfo AddToolResultToolCallNudgeMethod =
-        typeof(LLamaInferenceService).GetMethod("AddToolResultToolCallNudge", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("AddToolResultToolCallNudge method was not found.");
-
-    private static readonly MethodInfo HasIntermediateToolResultMessageMethod =
-        typeof(LLamaInferenceService).GetMethod("HasIntermediateToolResultMessage", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("HasIntermediateToolResultMessage method was not found.");
-
     private static readonly MethodInfo IsToolResultContinuationFailureMethod =
         typeof(LLamaInferenceService).GetMethod("IsToolResultContinuationFailure", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("IsToolResultContinuationFailure method was not found.");
-
-    private static readonly MethodInfo TryBuildIntermediateToolResultRecoveryCallMethod =
-        typeof(LLamaInferenceService).GetMethod("TryBuildIntermediateToolResultRecoveryCall", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("TryBuildIntermediateToolResultRecoveryCall method was not found.");
 
     [Fact]
     public async Task MemoryStore_PersistsAndUpdatesResponseTasks()
@@ -287,30 +263,14 @@ public sealed class InfrastructureBehaviorTests
     }
 
     [Fact]
-    public void ToolCallExtraction_ParsesDwToolCallTextProtocol()
-    {
-        var request = CreateToolInferenceRequest("skill_list");
-
-        var toolCalls = ExtractToolCalls(
-            """<dw_tool_call>{"name":"skill_list","arguments":{"includeContent":true}}</dw_tool_call>""",
-            request,
-            out var cleanText);
-
-        Assert.Empty(cleanText);
-        var call = Assert.Single(toolCalls);
-        Assert.Equal("skill_list", call.Function.Name);
-        Assert.Equal("""{"includeContent":true}""", call.Function.Arguments);
-    }
-
-    [Fact]
     public void ToolCallExtraction_ParsesCommonToolCallTags()
     {
-        var request = CreateToolInferenceRequest("skill_run_command");
+        var request = CreateToolInferenceRequest("run_command");
 
         var toolCalls = ExtractToolCalls(
             """
             <tool_call>
-            {"name":"skill_run_command","arguments":{"command":"echo hello"}}
+            {"name":"run_command","arguments":{"command":"echo hello"}}
             </tool_call>
             """,
             request,
@@ -318,23 +278,23 @@ public sealed class InfrastructureBehaviorTests
 
         Assert.Empty(cleanText);
         var call = Assert.Single(toolCalls);
-        Assert.Equal("skill_run_command", call.Function.Name);
+        Assert.Equal("run_command", call.Function.Name);
         Assert.Equal("""{"command":"echo hello"}""", call.Function.Arguments);
     }
 
     [Fact]
     public void ToolCallExtraction_ParsesTaggedToolCallParametersAlias()
     {
-        var request = CreateToolInferenceRequest("skill_run_command");
+        var request = CreateToolInferenceRequest("run_command");
 
         var toolCalls = ExtractToolCalls(
-            """<tool_call>{"name":"skill_run_command","parameters":{"command":"echo hello"}}</tool_call>""",
+            """<tool_call>{"name":"run_command","parameters":{"command":"echo hello"}}</tool_call>""",
             request,
             out var cleanText);
 
         Assert.Empty(cleanText);
         var call = Assert.Single(toolCalls);
-        Assert.Equal("skill_run_command", call.Function.Name);
+        Assert.Equal("run_command", call.Function.Name);
         Assert.Equal("""{"command":"echo hello"}""", call.Function.Arguments);
     }
 
@@ -346,7 +306,7 @@ public sealed class InfrastructureBehaviorTests
         var toolCalls = ExtractToolCalls(
             """
             <think>{"not_a_tool":true}</think>
-            {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup_weather","arguments":"{\"city\":\"Fuzhou\"}"}}]}
+            {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup_weather","arguments":"{\"city\":\"Paris\"}"}}]}
             """,
             request,
             out var cleanText);
@@ -354,7 +314,7 @@ public sealed class InfrastructureBehaviorTests
         Assert.Empty(cleanText);
         var call = Assert.Single(toolCalls);
         Assert.Equal("lookup_weather", call.Function.Name);
-        Assert.Equal("""{"city":"Fuzhou"}""", call.Function.Arguments);
+        Assert.Equal("""{"city":"Paris"}""", call.Function.Arguments);
     }
 
     [Fact]
@@ -363,14 +323,14 @@ public sealed class InfrastructureBehaviorTests
         var request = CreateToolInferenceRequest("lookup_weather");
 
         var toolCalls = ExtractToolCalls(
-            """{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup_weather","arguments":{"city":"Fuzhou"}}}]}""",
+            """{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup_weather","arguments":{"city":"Paris"}}}]}""",
             request,
             out var cleanText);
 
         Assert.Empty(cleanText);
         var call = Assert.Single(toolCalls);
         Assert.Equal("lookup_weather", call.Function.Name);
-        Assert.Equal("""{"city":"Fuzhou"}""", call.Function.Arguments);
+        Assert.Equal("""{"city":"Paris"}""", call.Function.Arguments);
     }
 
     [Fact]
@@ -439,7 +399,7 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolProtocolRetryNudge_IncludesRealToolNames()
     {
-        var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
+        var request = CreateToolInferenceRequest("lookup_weather", "lookup_time");
 
         var retry = AddToolProtocolRetryNudge(request);
         var nudge = retry.Messages[retry.Messages.Count - 1];
@@ -447,7 +407,7 @@ public sealed class InfrastructureBehaviorTests
         Assert.True(retry.ForceToolCallJson);
         Assert.Equal(0, retry.Temperature);
         Assert.Contains("lookup_weather", nudge.Content);
-        Assert.Contains("skill_list", nudge.Content);
+        Assert.Contains("lookup_time", nudge.Content);
         Assert.Contains("""{"name":"tool_name","arguments":{}}""", nudge.Content);
         Assert.DoesNotContain("tool_calls", nudge.Content);
     }
@@ -455,7 +415,7 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolProtocolRetryNudge_PrunesPreviousFailureHistory()
     {
-        var request = CreateToolInferenceRequest("skill_run_command");
+        var request = CreateToolInferenceRequest("run_command");
         request.Messages =
         [
             new InferenceMessage { Role = "system", Content = "system prompt" },
@@ -463,7 +423,7 @@ public sealed class InfrastructureBehaviorTests
             new InferenceMessage { Role = "assistant", Content = "hello response" },
             new InferenceMessage { Role = "user", Content = "lookup weather" },
             new InferenceMessage { Role = "assistant", Content = "Model did not generate a valid tool call.\n{" },
-            new InferenceMessage { Role = "user", Content = "check this computer memory" },
+            new InferenceMessage { Role = "user", Content = "inspect host status" },
             new InferenceMessage { Role = "user", Content = "The previous assistant message was not a valid final answer or a valid tool call. Continue the same user request." }
         ];
 
@@ -474,7 +434,7 @@ public sealed class InfrastructureBehaviorTests
         Assert.Contains("tool-call planner", retry.Messages[0].Content);
         Assert.DoesNotContain("system prompt", retry.Messages[0].Content);
         Assert.Equal("user", retry.Messages[1].Role);
-        Assert.Equal("check this computer memory", retry.Messages[1].Content);
+        Assert.Equal("inspect host status", retry.Messages[1].Content);
         Assert.StartsWith("Retry the same request by calling", retry.Messages[2].Content);
         Assert.DoesNotContain(retry.Messages, message => message.Content.Contains("Model did not generate", StringComparison.Ordinal));
         Assert.DoesNotContain(retry.Messages, message => message.Content.Contains("lookup weather", StringComparison.Ordinal));
@@ -484,7 +444,7 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolProtocolRepairNudge_DisablesGrammarAndUsesRealToolNames()
     {
-        var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
+        var request = CreateToolInferenceRequest("lookup_weather", "lookup_time");
 
         var repair = AddToolProtocolRepairNudge(request, "{\"");
         var nudge = repair.Messages[repair.Messages.Count - 1];
@@ -492,7 +452,7 @@ public sealed class InfrastructureBehaviorTests
         Assert.False(repair.ForceToolCallJson);
         Assert.Equal(0, repair.Temperature);
         Assert.Contains("lookup_weather", nudge.Content);
-        Assert.Contains("skill_list", nudge.Content);
+        Assert.Contains("lookup_time", nudge.Content);
         Assert.Contains("""{"name":"lookup_weather","arguments":{}}""", nudge.Content);
         Assert.DoesNotContain("tool_calls", nudge.Content);
     }
@@ -500,11 +460,11 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolProtocolRepairNudge_DropsPreviousRetryPrompt()
     {
-        var request = CreateToolInferenceRequest("skill_run_command");
+        var request = CreateToolInferenceRequest("run_command");
         request.Messages =
         [
             new InferenceMessage { Role = "system", Content = "system prompt" },
-            new InferenceMessage { Role = "user", Content = "check this computer memory" }
+            new InferenceMessage { Role = "user", Content = "inspect host status" }
         ];
 
         var retry = AddToolProtocolRetryNudge(request);
@@ -513,7 +473,7 @@ public sealed class InfrastructureBehaviorTests
         Assert.Equal(3, repair.Messages.Count);
         Assert.Contains("tool-call planner", repair.Messages[0].Content);
         Assert.DoesNotContain("system prompt", repair.Messages[0].Content);
-        Assert.Equal("check this computer memory", repair.Messages[1].Content);
+        Assert.Equal("inspect host status", repair.Messages[1].Content);
         Assert.StartsWith("The previous tool-call JSON was invalid.", repair.Messages[2].Content);
         Assert.DoesNotContain(repair.Messages, message => message.Content.StartsWith("Retry the same request", StringComparison.Ordinal));
     }
@@ -521,7 +481,7 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolCallGrammar_CanBeParsedByLLamaSharp()
     {
-        var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
+        var request = CreateToolInferenceRequest("lookup_weather", "lookup_time");
         var grammarText = BuildToolCallGrammar(request);
 
         Assert.DoesNotContain("\"\\{\"", grammarText);
@@ -544,48 +504,7 @@ public sealed class InfrastructureBehaviorTests
         Assert.True(IsInvalidToolProtocolRetryOutput("""{"tool_calls":["""));
         Assert.False(IsInvalidToolProtocolRetryOutput("I cannot call a tool."));
 
-        var fallback = BuildInvalidToolCallFallback("{");
-
-        Assert.Contains("模型没有生成有效的工具调用", fallback);
-        Assert.NotEqual("{", fallback.Trim());
     }
-
-    [Fact]
-    public void ToolProtocolRecovery_UsesRegisteredSkillListWhenAvailable()
-    {
-        var request = CreateToolInferenceRequest("lookup_weather", "skill_list");
-
-        var calls = TryBuildToolProtocolRecoveryCall(request);
-
-        var call = Assert.Single(calls);
-        Assert.Equal("skill_list", call.Function.Name);
-        Assert.Equal("{}", call.Function.Arguments);
-    }
-
-    [Fact]
-    public void ToolProtocolRecovery_DoesNotGuessPureAutoCustomTool()
-    {
-        var request = CreateToolInferenceRequest("lookup_weather");
-
-        var calls = TryBuildToolProtocolRecoveryCall(request);
-
-        Assert.Empty(calls);
-    }
-
-    [Fact]
-    public void ToolProtocolRecovery_HonorsSpecificFunctionChoice()
-    {
-        var request = CreateToolInferenceRequest("lookup_weather");
-        request.ToolChoiceMode = InferenceToolChoiceMode.Function;
-        request.ToolChoiceName = "lookup_weather";
-
-        var calls = TryBuildToolProtocolRecoveryCall(request);
-
-        var call = Assert.Single(calls);
-        Assert.Equal("lookup_weather", call.Function.Name);
-        Assert.Equal("{}", call.Function.Arguments);
-    }
-
     [Fact]
     public void ToolResultContinuation_TreatsThinkAndPartialJsonAsFailure()
     {
@@ -598,13 +517,13 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolResultContinuationNudge_UsesCompactContext()
     {
-        var request = CreateToolInferenceRequest("skill_run_command");
+        var request = CreateToolInferenceRequest("run_command");
         request.Messages =
         [
             new InferenceMessage { Role = "system", Content = "system prompt" },
             new InferenceMessage { Role = "user", Content = "hello" },
             new InferenceMessage { Role = "assistant", Content = "hello response" },
-            new InferenceMessage { Role = "user", Content = "check memory" },
+            new InferenceMessage { Role = "user", Content = "inspect host status" },
             new InferenceMessage
             {
                 Role = "tool",
@@ -617,7 +536,7 @@ public sealed class InfrastructureBehaviorTests
 
         Assert.Equal(4, retry.Messages.Count);
         Assert.Equal("system prompt", retry.Messages[0].Content);
-        Assert.Equal("check memory", retry.Messages[1].Content);
+        Assert.Equal("inspect host status", retry.Messages[1].Content);
         Assert.Equal("tool", retry.Messages[2].Role);
         Assert.StartsWith("Continue the original task from the tool result.", retry.Messages[3].Content);
         Assert.Equal(0, retry.Temperature);
@@ -627,10 +546,10 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolResultAnswerNudge_DisablesToolsAndAsksForNaturalAnswer()
     {
-        var request = CreateToolInferenceRequest("skill_run_command");
+        var request = CreateToolInferenceRequest("run_command");
         request.Messages =
         [
-            new InferenceMessage { Role = "user", Content = "check weather" },
+            new InferenceMessage { Role = "user", Content = "inspect host status" },
             new InferenceMessage
             {
                 Role = "tool",
@@ -646,103 +565,6 @@ public sealed class InfrastructureBehaviorTests
         Assert.False(answer.ForceToolCallJson);
         Assert.False(answer.ForceJson);
         Assert.Contains("explain that naturally", answer.Messages[^1].Content);
-    }
-
-    [Fact]
-    public void IntermediateToolResultNudge_ForcesFollowUpToolCallAndKeepsToolOutput()
-    {
-        var request = CreateToolInferenceRequest("skill_list", "skill_read");
-        request.Messages =
-        [
-            new InferenceMessage { Role = "user", Content = "weather in Fuzhou" },
-            new InferenceMessage
-            {
-                Role = "tool",
-                Content = """{"ok":true,"skills":[{"name":"web_search","markdown":"skills/web_search/SKILL.md","description":"Search the public web."}]}""",
-                ToolCallId = "call_1"
-            }
-        ];
-
-        var retry = AddToolResultToolCallNudge(request);
-
-        Assert.True(retry.ForceToolCallJson);
-        Assert.Equal(InferenceToolChoiceMode.Required, retry.ToolChoiceMode);
-        Assert.Equal(0, retry.Temperature);
-        Assert.True(HasIntermediateToolResultMessage(request));
-        Assert.Equal(4, retry.Messages.Count);
-        Assert.Contains("tool-call planner", retry.Messages[0].Content);
-        Assert.Equal("weather in Fuzhou", retry.Messages[1].Content);
-        Assert.Equal("tool", retry.Messages[2].Role);
-        Assert.Contains("web_search", retry.Messages[2].Content);
-        Assert.StartsWith("The previous tool result is intermediate", retry.Messages[3].Content);
-        Assert.Contains("skill_read", retry.Messages[3].Content);
-    }
-
-    [Fact]
-    public void IntermediateToolResultRecovery_ReadsSingleListedSkill()
-    {
-        var request = CreateToolInferenceRequest("skill_list", "skill_read");
-        request.Messages =
-        [
-            new InferenceMessage { Role = "user", Content = "weather in Fuzhou" },
-            new InferenceMessage
-            {
-                Role = "tool",
-                Content = """{"ok":true,"skills":[{"name":"web_search","markdown":"skills/web_search/SKILL.md","description":"Search the public web."}]}""",
-                ToolCallId = "call_1"
-            }
-        ];
-
-        var calls = TryBuildIntermediateToolResultRecoveryCall(request);
-
-        var call = Assert.Single(calls);
-        Assert.Equal("skill_read", call.Function.Name);
-        Assert.Equal("""{"name":"web_search"}""", call.Function.Arguments);
-    }
-
-    [Fact]
-    public void ToolResultFallback_ReportsFailedToolResult()
-    {
-        var request = new InferenceRequest
-        {
-            Messages =
-            [
-                new InferenceMessage
-                {
-                    Role = "tool",
-                    Content = """{"ok":false,"command":"curl -s 'https://wttr.in/Fuzhou'","exitCode":3,"stdout":"","stderr":""}""",
-                    ToolCallId = "call_1"
-                }
-            ]
-        };
-
-        var fallback = BuildToolResultNonAnswerFallback(request);
-
-        Assert.Contains("工具调用失败", fallback);
-        Assert.Contains("退出码：3", fallback);
-        Assert.DoesNotContain("<think>", fallback);
-    }
-
-    [Fact]
-    public void ToolResultFallback_DoesNotTreatNonCommandJsonAsFailedCommand()
-    {
-        var request = new InferenceRequest
-        {
-            Messages =
-            [
-                new InferenceMessage
-                {
-                    Role = "tool",
-                    Content = """{"skills":[{"name":"system_info","description":"Read system information."}]}""",
-                    ToolCallId = "call_1"
-                }
-            ]
-        };
-
-        var fallback = BuildToolResultNonAnswerFallback(request);
-
-        Assert.Contains("system_info", fallback);
-        Assert.DoesNotContain("stdout/stderr", fallback);
     }
 
     [Fact]
@@ -800,7 +622,7 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolInstruction_DoesNotDuplicateAlreadyProvidedToolDefinitions()
     {
-        var request = CreateToolInferenceRequest("memory_search", "skill_list");
+        var request = CreateToolInferenceRequest("lookup_profile", "lookup_events");
         request.Messages =
         [
             new InferenceMessage
@@ -808,7 +630,7 @@ public sealed class InfrastructureBehaviorTests
                 Role = "system",
                 Content = """
                     Available tools are provided as JSON:
-                    [{"type":"function","function":{"name":"memory_search","parameters":{}}},{"type":"function","function":{"name":"skill_list","parameters":{}}}]
+                    [{"type":"function","function":{"name":"lookup_profile","parameters":{}}},{"type":"function","function":{"name":"lookup_events","parameters":{}}}]
                     """
             }
         ];
@@ -825,16 +647,16 @@ public sealed class InfrastructureBehaviorTests
     [Fact]
     public void ToolInstruction_DoesNotTreatTextCatalogAsJsonToolDefinitions()
     {
-        var request = CreateToolInferenceRequest("memory_search", "skill_list");
+        var request = CreateToolInferenceRequest("lookup_profile", "lookup_events");
         request.Messages =
         [
             new InferenceMessage
             {
                 Role = "system",
-                Content = "\u53ef\u7528\u5de5\u5177:\n" +
-                    "- memory_search: Search long-term memory files.\n" +
-                    "- skill_list: List project skills.\n" +
-                    "\u5de5\u5177\u8c03\u7528: respond with tool_calls JSON."
+                Content = "Available tools:\n" +
+                    "- lookup_profile: Read profile data.\n" +
+                    "- lookup_events: Read event data.\n" +
+                    "Tool calls: respond with tool_calls JSON."
             }
         ];
 
@@ -941,22 +763,10 @@ public sealed class InfrastructureBehaviorTests
         return (string)BuildToolCallGrammarMethod.Invoke(null, parameters)!;
     }
 
-    private static string BuildToolResultNonAnswerFallback(InferenceRequest request)
-    {
-        object?[] parameters = [request];
-        return (string)BuildToolResultNonAnswerFallbackMethod.Invoke(null, parameters)!;
-    }
-
     private static bool IsInvalidToolProtocolRetryOutput(string cleanText)
     {
         object?[] parameters = [cleanText];
         return (bool)IsInvalidToolProtocolRetryOutputMethod.Invoke(null, parameters)!;
-    }
-
-    private static string BuildInvalidToolCallFallback(string invalidOutput)
-    {
-        object?[] parameters = [invalidOutput];
-        return (string)BuildInvalidToolCallFallbackMethod.Invoke(null, parameters)!;
     }
 
     private static InferenceParams CreateInferenceParams(LLamaModelRuntimeOptions model, InferenceRequest request, int? promptTokens = null)
@@ -1007,34 +817,10 @@ public sealed class InfrastructureBehaviorTests
         return (InferenceRequest)AddToolResultAnswerNudgeMethod.Invoke(null, parameters)!;
     }
 
-    private static IReadOnlyList<OpenAiToolCall> TryBuildToolProtocolRecoveryCall(InferenceRequest request)
-    {
-        object?[] parameters = [request];
-        return (IReadOnlyList<OpenAiToolCall>)TryBuildToolProtocolRecoveryCallMethod.Invoke(null, parameters)!;
-    }
-
-    private static InferenceRequest AddToolResultToolCallNudge(InferenceRequest request)
-    {
-        object?[] parameters = [request];
-        return (InferenceRequest)AddToolResultToolCallNudgeMethod.Invoke(null, parameters)!;
-    }
-
-    private static bool HasIntermediateToolResultMessage(InferenceRequest request)
-    {
-        object?[] parameters = [request];
-        return (bool)HasIntermediateToolResultMessageMethod.Invoke(null, parameters)!;
-    }
-
     private static bool IsToolResultContinuationFailure(string cleanText)
     {
         object?[] parameters = [cleanText];
         return (bool)IsToolResultContinuationFailureMethod.Invoke(null, parameters)!;
-    }
-
-    private static IReadOnlyList<OpenAiToolCall> TryBuildIntermediateToolResultRecoveryCall(InferenceRequest request)
-    {
-        object?[] parameters = [request];
-        return (IReadOnlyList<OpenAiToolCall>)TryBuildIntermediateToolResultRecoveryCallMethod.Invoke(null, parameters)!;
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory

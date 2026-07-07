@@ -282,71 +282,22 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                     request = repairRequest;
                     text = createdText.ToString();
                     toolCalls = TryExtractToolCalls(text, request, out cleanText);
-
-                    if (toolCalls.Count == 0 && IsInvalidToolProtocolRetryOutput(cleanText))
-                    {
-                        toolCalls = TryBuildToolProtocolRecoveryCall(request);
-                        if (toolCalls.Count > 0)
-                        {
-                            cleanText = string.Empty;
-                            request = request.WithCompatibilityWarnings(request.CompatibilityWarnings
-                                .Concat(["Model failed to produce valid tool-call JSON; recovered with a registered tool-discovery call."])
-                                .Distinct(StringComparer.Ordinal)
-                                .ToArray());
-                        }
-                        else
-                        {
-                            cleanText = BuildInvalidToolCallFallback(cleanText);
-                        }
-                    }
                 }
             }
 
             if (toolCalls.Count == 0 && HasTerminalToolResultMessage(request) && IsToolResultContinuationFailure(cleanText))
             {
                 var toolResultRequest = request;
-                if (toolResultRequest.Tools.Count > 0 &&
-                    toolResultRequest.ToolChoiceMode != InferenceToolChoiceMode.None &&
-                    HasIntermediateToolResultMessage(toolResultRequest) &&
-                    IsToolResultContinuationFailure(cleanText))
+                var retryRequest = AddToolResultContinuationNudge(toolResultRequest);
+                createdText.Clear();
+                await foreach (var token in StreamTextAsync(retryRequest, loaded, model, cancellationToken))
                 {
-                    var nextToolRequest = AddToolResultToolCallNudge(toolResultRequest);
-                    createdText.Clear();
-                    await foreach (var token in StreamTextAsync(nextToolRequest, loaded, model, cancellationToken))
-                    {
-                        createdText.Append(token);
-                    }
-
-                    request = nextToolRequest;
-                    text = createdText.ToString();
-                    toolCalls = TryExtractToolCalls(text, request, out cleanText);
-
-                    if (toolCalls.Count == 0 && IsToolResultContinuationFailure(cleanText))
-                    {
-                        toolCalls = TryBuildIntermediateToolResultRecoveryCall(toolResultRequest);
-                        if (toolCalls.Count > 0)
-                        {
-                            cleanText = string.Empty;
-                            request = request.WithCompatibilityWarnings(request.CompatibilityWarnings
-                                .Concat(["Model failed to continue after an intermediate tool result; recovered with a registered follow-up tool call."])
-                                .Distinct(StringComparer.Ordinal)
-                                .ToArray());
-                        }
-                    }
+                    createdText.Append(token);
                 }
-                else
-                {
-                    var retryRequest = AddToolResultContinuationNudge(toolResultRequest);
-                    createdText.Clear();
-                    await foreach (var token in StreamTextAsync(retryRequest, loaded, model, cancellationToken))
-                    {
-                        createdText.Append(token);
-                    }
 
-                    request = retryRequest;
-                    text = createdText.ToString();
-                    toolCalls = TryExtractToolCalls(text, request, out cleanText);
-                }
+                request = retryRequest;
+                text = createdText.ToString();
+                toolCalls = TryExtractToolCalls(text, request, out cleanText);
 
                 if (toolCalls.Count == 0 && IsToolResultContinuationFailure(cleanText))
                 {
@@ -360,11 +311,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                     request = answerRequest;
                     text = createdText.ToString();
                     toolCalls = TryExtractToolCalls(text, request, out cleanText);
-                }
-
-                if (toolCalls.Count == 0 && IsToolResultContinuationFailure(cleanText))
-                {
-                    cleanText = BuildToolResultNonAnswerFallback(toolResultRequest);
                 }
             }
 
@@ -1725,79 +1671,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return request.Messages.LastOrDefault(message => IsToolResultRole(message.Role));
     }
 
-    private static bool HasIntermediateToolResultMessage(InferenceRequest request)
-    {
-        var message = GetLastToolResultMessage(request);
-        return message is not null && IsIntermediateToolResult(message);
-    }
-
-    private static bool IsIntermediateToolResult(InferenceMessage message)
-    {
-        if (IsIntermediateToolResultName(message.Name))
-        {
-            return true;
-        }
-
-        var content = message.Content.Trim();
-        if (content.Length == 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(content);
-            var root = document.RootElement;
-            if (root.ValueKind != JsonValueKind.Object)
-            {
-                return false;
-            }
-
-            if (root.TryGetProperty("skills", out var skills) &&
-                skills.ValueKind == JsonValueKind.Array &&
-                skills.GetArrayLength() > 0)
-            {
-                return true;
-            }
-
-            if (root.TryGetProperty("matches", out var matches) &&
-                matches.ValueKind == JsonValueKind.Array &&
-                matches.GetArrayLength() > 0)
-            {
-                return true;
-            }
-
-            if (root.TryGetProperty("files", out var files) &&
-                files.ValueKind == JsonValueKind.Array &&
-                files.GetArrayLength() > 0)
-            {
-                return true;
-            }
-
-            if (TryGetString(root, "markdown")?.Contains("SKILL.md", StringComparison.OrdinalIgnoreCase) == true ||
-                TryGetString(root, "path")?.Contains("SKILL.md", StringComparison.OrdinalIgnoreCase) == true ||
-                TryGetString(root, "file")?.Contains("SKILL.md", StringComparison.OrdinalIgnoreCase) == true)
-            {
-                return true;
-            }
-        }
-        catch (JsonException)
-        {
-            return content.Contains("SKILL.md", StringComparison.OrdinalIgnoreCase);
-        }
-
-        return false;
-    }
-
-    private static bool IsIntermediateToolResultName(string? name)
-    {
-        return string.Equals(name, "skill_list", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(name, "skill_read", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(name, "skill_list_files", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(name, "skill_search_files", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(name, "memory_search", StringComparison.OrdinalIgnoreCase);
-    }
-
     private static bool IsTerminalToolResultMessage(IReadOnlyList<InferenceMessage> messages, int index)
     {
         for (var i = index + 1; i < messages.Count; i++)
@@ -1889,59 +1762,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return messages;
     }
 
-    private static InferenceRequest AddToolResultToolCallNudge(InferenceRequest request)
-    {
-        var toolNames = BuildToolNamesList(request);
-        var messages = BuildToolResultToolCallMessages(request, new InferenceMessage
-        {
-            Role = "user",
-            Content = "The previous tool result is intermediate, not the final answer. Continue the same user task by calling exactly one next registered tool. Available tool names: " + toolNames + ". If the tool output lists skills, call skill_read for the relevant skill. If the tool output is a skill guide, follow it by calling skill_run_command or another registered tool as appropriate. Output only one complete JSON object in this simple shape: {\"name\":\"tool_name\",\"arguments\":{}}. No reasoning, Markdown, prose, or partial JSON."
-        });
-
-        var warnings = request.CompatibilityWarnings
-            .Concat(["Model returned a non-answer after an intermediate tool result; retried once with constrained follow-up tool-call JSON."])
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-
-        var nextToolRequest = request.WithMessages(messages, warnings);
-        nextToolRequest.ForceToolCallJson = true;
-        nextToolRequest.ToolChoiceMode = nextToolRequest.ToolChoiceMode == InferenceToolChoiceMode.Auto
-            ? InferenceToolChoiceMode.Required
-            : nextToolRequest.ToolChoiceMode;
-        nextToolRequest.Temperature = 0;
-        nextToolRequest.MaxTokens = ResolveToolRetryMaxTokens(nextToolRequest.MaxTokens);
-        return nextToolRequest;
-    }
-
-    private static IReadOnlyList<InferenceMessage> BuildToolResultToolCallMessages(
-        InferenceRequest request,
-        InferenceMessage nudgeMessage)
-    {
-        var messages = new List<InferenceMessage>
-        {
-            new()
-            {
-                Role = "system",
-                Content = "You are a tool-call planner for an OpenAI-compatible API. Use only the registered tools provided below. The previous tool output was intermediate, so continue with the next tool call instead of answering directly."
-            }
-        };
-
-        var latestTask = FindLatestUserTaskMessage(request) ?? FindLatestTaskMessage(request);
-        if (latestTask is not null)
-        {
-            messages.Add(latestTask);
-        }
-
-        var toolResult = GetLastToolResultMessage(request);
-        if (toolResult is not null)
-        {
-            messages.Add(toolResult);
-        }
-
-        messages.Add(nudgeMessage);
-        return messages;
-    }
-
     private static bool IsToolResultContinuationFailure(string text)
     {
         if (IsNonAnswer(text))
@@ -1951,7 +1771,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         var trimmed = text.Trim();
         return trimmed is "{" or "[" or "{\"" or "[{" ||
-            trimmed.StartsWith("<dw_tool_call>", StringComparison.OrdinalIgnoreCase) ||
             trimmed.StartsWith("{\"tool_calls\"", StringComparison.Ordinal) ||
             trimmed.StartsWith("{\"function_call\"", StringComparison.Ordinal) ||
             trimmed.StartsWith("{\"name\"", StringComparison.Ordinal);
@@ -1990,8 +1809,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         }
 
         return text.StartsWith('{') ||
-            text.StartsWith('[') ||
-            text.StartsWith("<dw_tool_call>", StringComparison.OrdinalIgnoreCase);
+            text.StartsWith('[');
     }
 
     private static bool ContainsOnlyMarkupTagsAndWhitespace(string text)
@@ -2115,7 +1933,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         return content.StartsWith("Retry the same request by calling", StringComparison.Ordinal) ||
             content.StartsWith("The previous tool-call JSON was invalid.", StringComparison.Ordinal) ||
-            content.StartsWith("The previous tool result is intermediate", StringComparison.Ordinal) ||
             content.StartsWith("Continue the original task from the tool result.", StringComparison.Ordinal) ||
             content.StartsWith("Write the final user-facing answer now", StringComparison.Ordinal) ||
             content.StartsWith("The previous assistant message was not a valid final answer", StringComparison.Ordinal);
@@ -2129,193 +1946,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     private static int ResolveToolRetryMaxTokens(int? maxTokens)
     {
         return Math.Clamp(maxTokens ?? ToolRetryMaxTokens, ToolRetryMinimumTokens, ToolRetryMaxTokens);
-    }
-
-    private static IReadOnlyList<OpenAiToolCall> TryBuildToolProtocolRecoveryCall(InferenceRequest request)
-    {
-        if (request.Tools.Count == 0 || request.ToolChoiceMode == InferenceToolChoiceMode.None)
-        {
-            return [];
-        }
-
-        if (request.ToolChoiceMode == InferenceToolChoiceMode.Function &&
-            !string.IsNullOrWhiteSpace(request.ToolChoiceName) &&
-            IsRegisteredToolName(request, request.ToolChoiceName))
-        {
-            return [CreateToolCall(request.ToolChoiceName, "{}")];
-        }
-
-        var skillList = request.Tools
-            .Select(tool => tool.Function?.Name)
-            .FirstOrDefault(name => string.Equals(name, "skill_list", StringComparison.OrdinalIgnoreCase));
-
-        if (!string.IsNullOrWhiteSpace(skillList))
-        {
-            return [CreateToolCall(skillList, "{}")];
-        }
-
-        if (request.ToolChoiceMode == InferenceToolChoiceMode.Required)
-        {
-            var noArgumentTool = request.Tools.FirstOrDefault(ToolAllowsEmptyArguments);
-            if (!string.IsNullOrWhiteSpace(noArgumentTool?.Function?.Name))
-            {
-                return [CreateToolCall(noArgumentTool.Function.Name, "{}")];
-            }
-        }
-
-        return [];
-    }
-
-    private static IReadOnlyList<OpenAiToolCall> TryBuildIntermediateToolResultRecoveryCall(InferenceRequest request)
-    {
-        if (request.Tools.Count == 0 || request.ToolChoiceMode == InferenceToolChoiceMode.None)
-        {
-            return [];
-        }
-
-        if (request.ToolChoiceMode == InferenceToolChoiceMode.Function &&
-            !string.Equals(request.ToolChoiceName, "skill_read", StringComparison.OrdinalIgnoreCase))
-        {
-            return [];
-        }
-
-        var skillReadTool = GetRegisteredToolName(request, "skill_read");
-        if (string.IsNullOrWhiteSpace(skillReadTool))
-        {
-            return [];
-        }
-
-        var skillName = TrySelectSkillNameFromToolResult(request);
-        if (string.IsNullOrWhiteSpace(skillName))
-        {
-            return [];
-        }
-
-        var arguments = JsonSerializer.Serialize(new { name = skillName });
-        return [CreateToolCall(skillReadTool, arguments)];
-    }
-
-    private static string? TrySelectSkillNameFromToolResult(InferenceRequest request)
-    {
-        var message = GetLastToolResultMessage(request);
-        if (message is null || string.IsNullOrWhiteSpace(message.Content))
-        {
-            return null;
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(message.Content);
-            var root = document.RootElement;
-            if (root.ValueKind != JsonValueKind.Object ||
-                !root.TryGetProperty("skills", out var skills) ||
-                skills.ValueKind != JsonValueKind.Array)
-            {
-                return null;
-            }
-
-            var candidates = new List<(string Name, string Description)>();
-            foreach (var skill in skills.EnumerateArray())
-            {
-                if (skill.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
-
-                var name = TryGetString(skill, "name");
-                if (string.IsNullOrWhiteSpace(name))
-                {
-                    continue;
-                }
-
-                var description = TryGetString(skill, "description") ?? string.Empty;
-                candidates.Add((name, description));
-            }
-
-            if (candidates.Count == 1)
-            {
-                return candidates[0].Name;
-            }
-
-            var task = FindLatestUserTaskMessage(request)?.Content ?? string.Empty;
-            return candidates
-                .Select(candidate => (candidate.Name, ScoreSkillCandidate(candidate.Name, candidate.Description, task)))
-                .Where(candidate => candidate.Item2 > 0)
-                .OrderByDescending(candidate => candidate.Item2)
-                .ThenBy(candidate => candidate.Name, StringComparer.OrdinalIgnoreCase)
-                .Select(candidate => candidate.Name)
-                .FirstOrDefault();
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
-
-    private static int ScoreSkillCandidate(string name, string description, string task)
-    {
-        var score = 0;
-        var haystack = (name + " " + description).ToLowerInvariant();
-        var normalizedTask = task.ToLowerInvariant();
-        foreach (var token in name.Split(['_', '-', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            if (token.Length > 1 && normalizedTask.Contains(token, StringComparison.OrdinalIgnoreCase))
-            {
-                score += 4;
-            }
-        }
-
-        if ((normalizedTask.Contains("\u5929\u6c14", StringComparison.Ordinal) ||
-                normalizedTask.Contains("\u65b0\u95fb", StringComparison.Ordinal) ||
-                normalizedTask.Contains("\u8054\u7f51", StringComparison.Ordinal) ||
-                normalizedTask.Contains("\u5b9e\u65f6", StringComparison.Ordinal) ||
-                normalizedTask.Contains("current", StringComparison.Ordinal) ||
-                normalizedTask.Contains("weather", StringComparison.Ordinal) ||
-                normalizedTask.Contains("news", StringComparison.Ordinal)) &&
-            (haystack.Contains("web", StringComparison.Ordinal) ||
-                haystack.Contains("search", StringComparison.Ordinal) ||
-                haystack.Contains("public web", StringComparison.Ordinal)))
-        {
-            score += 8;
-        }
-
-        return score;
-    }
-
-    private static string? GetRegisteredToolName(InferenceRequest request, string name)
-    {
-        return request.Tools
-            .Select(tool => tool.Function?.Name)
-            .FirstOrDefault(toolName => string.Equals(toolName, name, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static bool IsRegisteredToolName(InferenceRequest request, string name)
-    {
-        return request.Tools.Any(tool =>
-            string.Equals(tool.Type, "function", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(tool.Function?.Name, name, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static bool ToolAllowsEmptyArguments(OpenAiTool tool)
-    {
-        if (!string.Equals(tool.Type, "function", StringComparison.OrdinalIgnoreCase) ||
-            tool.Function is null)
-        {
-            return false;
-        }
-
-        var parameters = tool.Function.Parameters;
-        return parameters is null ||
-            parameters.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined ||
-            !HasRequiredParameters(parameters.Value);
-    }
-
-    private static bool HasRequiredParameters(JsonElement parameters)
-    {
-        return parameters.ValueKind == JsonValueKind.Object &&
-            parameters.TryGetProperty("required", out var required) &&
-            required.ValueKind == JsonValueKind.Array &&
-            required.GetArrayLength() > 0;
     }
 
     private static string BuildToolNamesList(InferenceRequest request)
@@ -2335,234 +1965,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return request.Tools
             .Select(x => x.Function?.Name)
             .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
-    }
-
-    private static string BuildInvalidToolCallFallback(string invalidOutput)
-    {
-        var excerpt = TruncateForFallback(invalidOutput);
-        return string.IsNullOrWhiteSpace(excerpt)
-            ? "模型没有生成有效的工具调用，因此无法继续执行这次查询。请稍后重试，或调整可用工具/提示词后再试。"
-            : "模型没有生成有效的工具调用，因此无法继续执行这次查询。模型返回的无效片段如下：\n" + excerpt;
-    }
-
-    private static string BuildToolResultNonAnswerFallback(InferenceRequest request)
-    {
-        var toolMessage = request.Messages.LastOrDefault(message =>
-            string.Equals(message.Role, "tool", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(message.Role, "function", StringComparison.OrdinalIgnoreCase));
-
-        if (toolMessage is null || string.IsNullOrWhiteSpace(toolMessage.Content))
-        {
-            return "工具调用后模型没有生成回复。请稍后重试，或检查工具返回内容是否为空。";
-        }
-
-        var content = toolMessage.Content.Trim();
-        try
-        {
-            using var document = JsonDocument.Parse(content);
-            var root = document.RootElement;
-            var ok = TryGetBoolean(root, "ok");
-            var command = TryGetString(root, "command");
-            var exitCode = TryGetInt32(root, "exitCode");
-            var timedOut = TryGetBoolean(root, "timedOut");
-            var stdout = TryGetString(root, "stdout");
-            var stderr = TryGetString(root, "stderr");
-
-            if (!LooksLikeCommandResult(ok, command, exitCode, timedOut, stdout, stderr))
-            {
-                return BuildGenericToolResultFallback(content);
-            }
-
-            if ((ok == true || exitCode == 0) && !string.IsNullOrWhiteSpace(stdout))
-            {
-                return BuildGenericToolResultFallback(stdout);
-            }
-
-            if ((ok == true || exitCode == 0) && !string.IsNullOrWhiteSpace(stderr))
-            {
-                return BuildGenericToolResultFallback(stderr);
-            }
-
-            if (ok == true || exitCode == 0)
-            {
-                return BuildGenericToolResultFallback(content);
-            }
-
-            var builder = new StringBuilder("工具调用失败，所以这次没能拿到可用结果。");
-            if (!string.IsNullOrWhiteSpace(command))
-            {
-                builder.AppendLine();
-                builder.Append("命令：").Append(command);
-            }
-
-            if (exitCode is not null)
-            {
-                builder.AppendLine();
-                builder.Append("退出码：").Append(exitCode.Value);
-            }
-
-            if (timedOut == true)
-            {
-                builder.AppendLine();
-                builder.Append("状态：执行超时");
-            }
-
-            if (!string.IsNullOrWhiteSpace(stderr))
-            {
-                builder.AppendLine();
-                builder.Append("错误输出：").Append(TruncateForFallback(stderr));
-            }
-            else if (!string.IsNullOrWhiteSpace(stdout))
-            {
-                builder.AppendLine();
-                builder.Append("工具输出：").Append(TruncateForFallback(stdout));
-            }
-            else
-            {
-                builder.AppendLine();
-                builder.Append("工具没有返回 stdout/stderr。");
-            }
-
-            return builder.ToString();
-        }
-        catch (JsonException)
-        {
-            return BuildGenericToolResultFallback(content);
-        }
-    }
-
-    private static bool LooksLikeCommandResult(
-        bool? ok,
-        string? command,
-        int? exitCode,
-        bool? timedOut,
-        string? stdout,
-        string? stderr)
-    {
-        return ok is not null ||
-            !string.IsNullOrWhiteSpace(command) ||
-            exitCode is not null ||
-            timedOut is not null ||
-            stdout is not null ||
-            stderr is not null;
-    }
-
-    private static string BuildGenericToolResultFallback(string content)
-    {
-        return "\u5de5\u5177\u8fd4\u56de\u4e86\u7ed3\u679c\uff0c\u4f46\u6a21\u578b\u6ca1\u6709\u751f\u6210\u6700\u7ec8\u56de\u590d\u3002\u5de5\u5177\u8f93\u51fa\u5982\u4e0b\uff1a\n" + TruncateForFallback(content);
-    }
-
-    private static string BuildEmptyToolResultFallback(InferenceRequest request)
-    {
-        var toolMessage = request.Messages.LastOrDefault(message =>
-            string.Equals(message.Role, "tool", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(message.Role, "function", StringComparison.OrdinalIgnoreCase));
-
-        if (toolMessage is null || string.IsNullOrWhiteSpace(toolMessage.Content))
-        {
-            return "工具调用后模型没有生成回复。请稍后重试，或检查工具返回内容是否为空。";
-        }
-
-        var content = toolMessage.Content.Trim();
-        try
-        {
-            using var document = JsonDocument.Parse(content);
-            var root = document.RootElement;
-            var ok = TryGetBoolean(root, "ok");
-            var command = TryGetString(root, "command");
-            var exitCode = TryGetInt32(root, "exitCode");
-            var timedOut = TryGetBoolean(root, "timedOut");
-            var stdout = TryGetString(root, "stdout");
-            var stderr = TryGetString(root, "stderr");
-
-            if (ok == true && !string.IsNullOrWhiteSpace(stdout))
-            {
-                return "工具已经返回结果，但模型没有生成最终回复。工具输出如下：\n" + TruncateForFallback(stdout);
-            }
-
-            var builder = new StringBuilder("工具调用失败，所以这次没能拿到可用结果。");
-            if (!string.IsNullOrWhiteSpace(command))
-            {
-                builder.AppendLine();
-                builder.Append("命令：").Append(command);
-            }
-
-            if (exitCode is not null)
-            {
-                builder.AppendLine();
-                builder.Append("退出码：").Append(exitCode.Value);
-            }
-
-            if (timedOut == true)
-            {
-                builder.AppendLine();
-                builder.Append("状态：执行超时");
-            }
-
-            if (!string.IsNullOrWhiteSpace(stderr))
-            {
-                builder.AppendLine();
-                builder.Append("错误输出：").Append(TruncateForFallback(stderr));
-            }
-            else if (!string.IsNullOrWhiteSpace(stdout))
-            {
-                builder.AppendLine();
-                builder.Append("工具输出：").Append(TruncateForFallback(stdout));
-            }
-            else
-            {
-                builder.AppendLine();
-                builder.Append("工具没有返回 stdout/stderr。");
-            }
-
-            return builder.ToString();
-        }
-        catch (JsonException)
-        {
-            return "工具返回了结果，但模型没有生成最终回复。工具输出如下：\n" + TruncateForFallback(content);
-        }
-    }
-
-    private static string TruncateForFallback(string value)
-    {
-        value = value.Trim();
-        const int maxLength = 1200;
-        return value.Length <= maxLength ? value : value[..maxLength] + "...";
-    }
-
-    private static string? TryGetString(JsonElement element, string propertyName)
-    {
-        return element.ValueKind == JsonValueKind.Object &&
-            element.TryGetProperty(propertyName, out var property) &&
-            property.ValueKind == JsonValueKind.String
-            ? property.GetString()
-            : null;
-    }
-
-    private static bool? TryGetBoolean(JsonElement element, string propertyName)
-    {
-        if (element.ValueKind != JsonValueKind.Object ||
-            !element.TryGetProperty(propertyName, out var property))
-        {
-            return null;
-        }
-
-        return property.ValueKind switch
-        {
-            JsonValueKind.True => true,
-            JsonValueKind.False => false,
-            _ => null
-        };
-    }
-
-    private static int? TryGetInt32(JsonElement element, string propertyName)
-    {
-        return element.ValueKind == JsonValueKind.Object &&
-            element.TryGetProperty(propertyName, out var property) &&
-            property.ValueKind == JsonValueKind.Number &&
-            property.TryGetInt32(out var value)
-            ? value
-            : null;
     }
 
     private static string BuildToolCallGrammar(InferenceRequest request)
@@ -2648,8 +2050,8 @@ ws ::= [ \t\n\r]*
     private static string BuildToolInstruction(InferenceRequest request, bool includeToolDefinitions = true)
     {
         var builder = new StringBuilder();
-        builder.AppendLine("Use tools whenever the user's request needs current, external, local project, file, command, memory, skill, calculation, or other registered capabilities.");
-        builder.AppendLine("For those requests, do not answer from model memory and do not ask the user to perform the lookup.");
+        builder.AppendLine("Use tools when the user's request requires information or actions provided by the registered tools.");
+        builder.AppendLine("For those requests, call a registered tool instead of answering from model memory or asking the user to perform the lookup.");
         if (includeToolDefinitions)
         {
             var options = OpenAiJson.CreateOptions();
@@ -2687,9 +2089,7 @@ ws ::= [ \t\n\r]*
             builder.AppendLine("When calling a tool, do not output reasoning, Markdown, prose, or any text outside JSON. The first non-whitespace character must be `{`. Respond only with one complete JSON object in this simple shape:");
             builder.AppendLine("""{"name":"tool_name","arguments":{"arg":"value"}}""");
         }
-        builder.AppendLine("""If you already produced a <dw_tool_call>{"name":"tool_name","arguments":{}}</dw_tool_call> text-protocol call, output the equivalent simple JSON object instead.""");
         builder.AppendLine("When a tool result is provided, continue the task. If the tool succeeded, answer the user from the tool result. If it failed, call another appropriate tool with corrected arguments or explain the failure. Never return an empty message after a tool result.");
-        builder.AppendLine("When using shell commands, quote URLs or arguments that contain shell metacharacters such as `&`.");
         builder.AppendLine("If the request can be answered without any registered tool, answer normally.");
         if (request.ForceJson)
         {
@@ -2882,7 +2282,6 @@ ws ::= [ \t\n\r]*
     private static IReadOnlyList<OpenAiToolCall> TryExtractTaggedToolCalls(string text, InferenceRequest request)
     {
         var calls = new List<OpenAiToolCall>();
-        AddTaggedToolCalls(text, "dw_tool_call", calls);
         AddTaggedToolCalls(text, "tool_call", calls);
         AddTaggedToolCalls(text, "function_call", calls);
         return calls.Count > 0 ? ValidateToolCalls(calls, request) : [];
