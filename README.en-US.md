@@ -1,14 +1,15 @@
-﻿# Zhengyan.LLamaStack
+# Zhengyan.LLamaStack
 
 English | [Simplified Chinese](README.md)
 
-`Zhengyan.LLamaStack` is a local large language model inference service built with **.NET 10** and **LLamaSharp**. It runs GGUF models locally and exposes an OpenAI-compatible HTTP API so existing OpenAI SDKs, clients, and tools can gradually move to a local inference runtime.
+`Zhengyan.LLamaStack` is a local OpenAI-compatible inference stack for GGUF models. It is built with .NET 10, ASP.NET Core Minimal API, and LLamaSharp 0.27.0. The service loads local GGUF chat, vision, audio-capable multimodal, and embedding models, then exposes OpenAI-style HTTP endpoints for existing SDKs and debugging clients.
 
-The current version covers `chat/completions`, `responses`, `embeddings`, SSE streaming, multi-model registration, `model` routing, tool-call execution, structured outputs, embedding vector extraction, concurrent inference (queuing/dynamic pool size/cancellation/VRAM protection), multimodal input parsing, and persistent storage. See [OpenAI Compatibility Roadmap](#openai-compatibility-roadmap).
+The current codebase covers Chat Completions, Responses, Embeddings, tokenization, SSE streaming, multi-model routing, lazy and explicit model load/unload, per-model request queues, runtime pool resizing, tool-call protocol extraction, JSON-schema structured outputs, guarded multimodal input loading, persistent stores, API-key auth, CORS, and an Avalonia desktop debug client.
 
 ## Table of Contents
 
 - [Features](#features)
+- [Project Logic](#project-logic)
 - [Project Structure](#project-structure)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
@@ -16,6 +17,7 @@ The current version covers `chat/completions`, `responses`, `embeddings`, SSE st
 - [Model Preparation](#model-preparation)
 - [Running the Service](#running-the-service)
 - [API Examples](#api-examples)
+- [Desktop Debug Client](#desktop-debug-client)
 - [Deployment](#deployment)
 - [GPU Backends](#gpu-backends)
 - [OpenAI Compatibility Roadmap](#openai-compatibility-roadmap)
@@ -24,60 +26,75 @@ The current version covers `chat/completions`, `responses`, `embeddings`, SSE st
 
 ## Features
 
-- Built on `.NET 10` and `ASP.NET Core Minimal API`.
-- Runs GGUF models through `LLamaSharp 0.27.0`.
-- Uses `LLamaSharp.Backend.Cpu` by default and can be switched to CUDA, Vulkan, or other backends.
-- Supports multi-model registration, a default model, and request routing by the `model` field.
-- `/v1/models` returns model load state and capability declarations.
-- Exposes OpenAI-compatible endpoints:
-  - `GET /v1/models`
-  - `POST /v1/chat/completions`
-  - `POST /v1/responses`
-  - `POST /v1/embeddings`
-  - `POST /v1/tokenize`
-  - `POST /v1/detokenize`
-  - `GET /v1/health`
-  - `POST /v1/models/{model_id}/load`
-  - `POST /v1/models/{model_id}/unload`
-  - `GET /v1/queue/{entry_id}`
-  - `GET /v1/chat/completions`
-  - `GET /v1/chat/completions/{completion_id}`
-  - `POST /v1/chat/completions/{completion_id}`
-  - `DELETE /v1/chat/completions/{completion_id}`
-  - `GET /v1/chat/completions/{completion_id}/messages`
-  - `GET /v1/responses`
-  - `GET /v1/responses/{response_id}`
-  - `POST /v1/responses/{response_id}`
-  - `DELETE /v1/responses/{response_id}`
-  - `POST /v1/responses/{response_id}/cancel`
-  - `GET /v1/responses/{response_id}/input_items`
-  - `POST /v1/responses/{response_id}/count_tokens`
-  - `POST /v1/responses/input_tokens`
-  - `POST /v1/responses/compact`
-  - `GET /v1/responses/tasks/{taskId}`
-  - `POST /v1/chat/completions/{completionId}/cancel`
-  - `POST /v1/models/{modelId}/resize`
-  - `POST /chat/completions`
-  - `POST /responses`
-  - `GET /health`
-- Supports OpenAI-style input:
-  - plain text messages
-  - Chat Completions content arrays
-  - Responses API `input`
-  - `image_url` / `input_image`
-  - `input_audio`
-- Supports media loading from data URLs, guarded remote URLs, and optionally local file paths.
-- Supports SSE streaming. Tool-enabled streaming is buffered and then emitted as SSE with the same response shape as non-streaming calls.
-- Supports Chat/Responses storage (Memory/SQLite/PostgreSQL/Redis) with full management endpoints.
-- Parses `tools` and legacy `functions` and returns model-emitted calls in OpenAI-compatible response fields.
-- Tool calls are protocol-only: the server tells the client which function to call and with what JSON arguments; clients execute tools and send results back.
-- Converts model-emitted tool-call JSON into OpenAI-compatible `tool_calls` / `function_call` response fields.
-- Supports optional `mmproj` / MTMD multimodal projection models.
-- Per-model configurable concurrency (`MaxConcurrency`), shared weights, isolated context/executor instances; runtime dynamic pool resizing, request queuing, real-time cancellation, and VRAM protection.
-- Independent embedding model registration and vector extraction with `Dimensions` truncation support.
-- Structured outputs: JSON Schema 鈫?GBNF Grammar constrained decoding + strict mode validation.
-- Past-Responses management (`previous_response_id` context continuation, `conversation` sessions, `compact` compression, `background` execution).
-- API Key authentication and CORS configuration.
+- .NET 10 ASP.NET Core Minimal API service backed by LLamaSharp 0.27.0.
+- OpenAI-style JSON, using snake_case property names and omitting null values.
+- Multi-model registry through `LLamaStack:Models[]`, with legacy `ModelId` / `ModelPath` fallback.
+- Independent embedding model registry through `LLamaStack:EmbeddingModels[]`.
+- Lazy model loading by default, with optional startup warmup and explicit load/unload endpoints.
+- Model capability declarations exposed from `/v1/models` and checked before inference.
+- Per-model FIFO request queue plus an inner pool of `LLamaContext` / `InteractiveExecutor` instances that share one `LLamaWeights`.
+- Runtime model pool resize through `POST /v1/models/{modelId}/resize`, with estimated VRAM budget checks.
+- SSE streaming for Chat Completions and Responses. Requests with tools are buffered and emitted as final SSE output so stream and non-stream shapes stay aligned.
+- Tool calling is protocol-only. The server injects declared `tools` / legacy `functions`, parses model-emitted JSON, and returns OpenAI-compatible `tool_calls` / `function_call` output for the client to execute.
+- `tool_choice: none`, specific function choices, and `parallel_tool_calls: false` are enforced while extracting tool calls.
+- Structured output support through JSON Schema to GBNF constrained decoding where possible, plus strict post-generation validation.
+- Multimodal request parsing for text, image, and audio input blocks. Media may come from data URLs, raw base64, guarded remote URLs, or explicitly enabled local file paths.
+- Chat and Responses management endpoints backed by Memory, SQLite, PostgreSQL, or Redis stores.
+- Responses features include `previous_response_id`, in-memory `conversation` continuation, `background` execution, cancellation, token counting, and compact tasks.
+- Optional API key authentication and CORS configuration.
+- Logs redact prompts, message content, media URLs/data, embeddings, generated text, and API keys.
+- Avalonia desktop client for local manual debugging.
+
+### Endpoint Summary
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /` | Service descriptor. |
+| `GET /health` | Simple health alias. |
+| `GET /v1/health` | OpenAI-style health details with model load state and uptime. |
+| `GET /v1/models` | Model list, load state, paths, capabilities, embedding dimensions. |
+| `POST /v1/models/{modelId}/load` | Load a model at runtime. |
+| `POST /v1/models/{modelId}/unload` | Unload a model at runtime. |
+| `POST /v1/models/{modelId}/resize` | Resize the loaded model pool. |
+| `GET /v1/queue/{entryId}` | Inspect queue entry state. |
+| `POST /v1/chat/completions` | Chat Completions inference. |
+| `POST /chat/completions` | Compatibility alias for Chat Completions. |
+| `GET /v1/chat/completions` | List stored Chat Completions. |
+| `GET /v1/chat/completions/{completionId}` | Retrieve a stored Chat Completion. |
+| `POST /v1/chat/completions/{completionId}` | Update stored Chat Completion metadata. |
+| `DELETE /v1/chat/completions/{completionId}` | Delete a stored Chat Completion. |
+| `GET /v1/chat/completions/{completionId}/messages` | List stored Chat Completion messages. |
+| `POST /v1/chat/completions/{completionId}/cancel` | Cancel an executing non-streaming Chat Completion when tracked. |
+| `POST /v1/responses` | Responses API inference. |
+| `POST /responses` | Compatibility alias for Responses. |
+| `GET /v1/responses` | List stored Responses. |
+| `GET /v1/responses/{responseId}` | Retrieve a stored Response. |
+| `POST /v1/responses/{responseId}` | Update stored Response metadata. |
+| `DELETE /v1/responses/{responseId}` | Delete a stored Response. |
+| `POST /v1/responses/{responseId}/cancel` | Cancel an executing or stored Response. |
+| `GET /v1/responses/{responseId}/input_items` | List stored Response input items. |
+| `POST /v1/responses/{responseId}/count_tokens` | Count tokens for a stored Response. |
+| `POST /v1/responses/input_tokens` | Estimate input tokens for a Responses request. |
+| `POST /v1/responses/compact` | Schedule a model-driven compact task for a stored Response. |
+| `GET /v1/responses/tasks/{taskId}` | Inspect compact task state. |
+| `POST /v1/embeddings` | Generate embeddings. |
+| `POST /v1/tokenize` | Tokenize text with a configured model. |
+| `POST /v1/detokenize` | Detokenize token IDs with a configured model. |
+
+## Project Logic
+
+The service startup path is in `src/Zhengyan.LLamaStack.Api/Program.cs`. It binds the `LLamaStack` options section, configures JSON naming, registers the store provider, request mapper, inference service, queue manager, conversation store, cancellation tracker, background response worker, compact scheduler, warmup hosted service, exception handler, API-key middleware, and endpoint routes.
+
+Request flow:
+
+1. `OpenAiCompatibleEndpoints` receives an OpenAI-style request and logs a redacted shape.
+2. `OpenAiRequestMapper` converts Chat Completions or Responses payloads into `InferenceRequest`, including content arrays, media blocks, tools, tool choice, JSON mode, sampling options, metadata, and compatibility warnings.
+3. `LLamaInferenceService.ValidateRequest` checks model existence, declared capabilities, model path, optional `mmproj` path, streaming, tools, JSON mode, and media capability requirements.
+4. `ModelRequestQueue` gives each model FIFO admission. Response headers include `X-Queue-Position` and `X-Queue-Entry-Id`.
+5. `LLamaInferenceService` lazily loads the selected runtime, acquires one isolated context/executor instance from the pool, builds a prompt, optionally attaches media, applies sampler and grammar settings, streams or completes generation, extracts tool-call JSON, validates strict JSON schema output, counts tokens, and releases the instance.
+6. `OpenAiResponseFactory` converts the internal completion or stored object into OpenAI-compatible response JSON or SSE events. Store-backed endpoints persist and retrieve compact local state.
+
+The API does not execute tools server-side. A client must execute the returned function call and send the result back as a tool message or Responses `function_call_output`.
 
 ## Project Structure
 
@@ -88,26 +105,27 @@ The current version covers `chat/completions`, `responses`, `embeddings`, SSE st
 |-- Zhengyan.LLamaStack.slnx
 |-- src/
 |   |-- Zhengyan.LLamaStack.Api/
-|   |   |-- Endpoints/
-|   |   |-- Inference/
-|   |   |-- Infrastructure/
-|   |   |-- OpenAi/
-|   |   |-- Options/
-|   |   |-- Storage/
+|   |   |-- Endpoints/        # HTTP route handlers
+|   |   |-- Inference/        # LLamaSharp runtime, queues, background tasks
+|   |   |-- Infrastructure/   # API key middleware and OpenAI errors
+|   |   |-- OpenAi/           # Request mapper, response factory, API contracts
+|   |   |-- Options/          # LLamaStack configuration model
+|   |   |-- Storage/          # Memory, SQLite, PostgreSQL, Redis stores
 |   |   |-- Program.cs
 |   |   `-- appsettings.json
-|   |-- Zhengyan.OpenAIModels/
-|   `-- Zhengyan.ChatUI.Desktop/
+|   |-- Zhengyan.OpenAIModels/ # Shared OpenAI-compatible DTO library
+|   `-- Zhengyan.ChatUI.Desktop/ # Avalonia desktop debug client
 `-- tests/
-    `-- Zhengyan.LLamaStack.Tests/
+    `-- Zhengyan.LLamaStack.Tests/ # xUnit behavior tests
 ```
 
 ## Requirements
 
 - Windows, Linux, or macOS.
-- .NET SDK 10.0 or later.
-- A GGUF large language model file.
-- A compatible `mmproj` GGUF file for multimodal input.
+- .NET SDK 10.0 or later for the API and tests.
+- A GGUF model file for text inference.
+- A matching `mmproj` GGUF file when image or audio input is needed.
+- For the checked-in API project, the current backend package is `LLamaSharp.Backend.Cuda12`. Replace it if your runtime target needs CPU-only, Vulkan, or another backend.
 
 Check the installed .NET version:
 
@@ -124,7 +142,7 @@ dotnet restore Zhengyan.LLamaStack.slnx
 dotnet build Zhengyan.LLamaStack.slnx -v minimal
 ```
 
-2. Configure the model path. You can edit `src/Zhengyan.LLamaStack.Api/appsettings.Development.json`:
+2. Configure a model path. You can create or edit `src/Zhengyan.LLamaStack.Api/appsettings.Development.json`:
 
 ```json
 {
@@ -140,7 +158,7 @@ dotnet build Zhengyan.LLamaStack.slnx -v minimal
 }
 ```
 
-Legacy single-model configuration is still supported:
+Legacy single-model configuration is still accepted:
 
 ```json
 {
@@ -159,13 +177,13 @@ $env:LLamaStack__Models__0__Id = "local-gguf"
 $env:LLamaStack__Models__0__ModelPath = "D:\models\your-model.gguf"
 ```
 
-3. Start the service:
+3. Start the API:
 
 ```powershell
 dotnet run --project src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj
 ```
 
-The default development URL is:
+Default development URL:
 
 ```text
 http://localhost:5062
@@ -173,13 +191,21 @@ http://localhost:5062
 
 4. Check health:
 
+Windows PowerShell:
+
 ```powershell
 Invoke-RestMethod http://localhost:5062/health
 ```
 
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/health
+```
+
 ## Configuration
 
-The configuration section is `LLamaStack`. The recommended configuration style is `Models`, which registers one or more models. The legacy `ModelId` / `ModelPath` configuration remains compatible.
+The main configuration section is `LLamaStack`. `Models[]` is the recommended shape; `ModelId` / `ModelPath` is retained for compatibility. Model-specific values inherit from top-level defaults when omitted.
 
 ```json
 {
@@ -199,6 +225,7 @@ The configuration section is `LLamaStack`. The recommended configuration style i
     "FlashAttention": null,
     "UseGpuForMtmd": false,
     "LoadModelOnStartup": false,
+    "MaxVramBytes": 0,
     "DefaultMaxTokens": 512,
     "DefaultTemperature": 0.7,
     "DefaultTopP": 0.95,
@@ -207,7 +234,22 @@ The configuration section is `LLamaStack`. The recommended configuration style i
     "AllowRemoteMedia": true,
     "AllowLocalMediaPaths": false,
     "MaxMediaBytes": 33554432,
-    "MaxVramBytes": 0,
+    "Store": {
+      "Provider": "Memory",
+      "SqlitePath": "data/llamastack.db",
+      "ConnectionString": null
+    },
+    "Auth": {
+      "Enabled": false,
+      "ApiKey": null,
+      "ApiKeyHeader": "Authorization"
+    },
+    "Cors": {
+      "Enabled": false,
+      "AllowedOrigins": [],
+      "AllowedHeaders": [],
+      "AllowedMethods": []
+    },
     "Models": [
       {
         "Id": "local-gguf",
@@ -216,6 +258,7 @@ The configuration section is `LLamaStack`. The recommended configuration style i
         "MmprojPath": "",
         "ContextSize": 4096,
         "GpuLayerCount": 0,
+        "MaxConcurrency": 1,
         "Capabilities": {
           "ChatCompletions": true,
           "Responses": true,
@@ -227,16 +270,14 @@ The configuration section is `LLamaStack`. The recommended configuration style i
           "JsonMode": true,
           "Embeddings": false
         }
-      },
+      }
+    ],
+    "EmbeddingModels": [
       {
-        "Id": "vision-gguf",
-        "OwnedBy": "local",
-        "ModelPath": "D:\\models\\vision-model.gguf",
-        "MmprojPath": "D:\\models\\mmproj.gguf",
-        "Capabilities": {
-          "ImageInput": true,
-          "AudioInput": true
-        }
+        "Id": "bge-m3",
+        "ModelPath": "D:\\models\\bge-m3.gguf",
+        "Dimensions": 1024,
+        "MaxConcurrency": 1
       }
     ]
   }
@@ -245,49 +286,43 @@ The configuration section is `LLamaStack`. The recommended configuration style i
 
 | Key | Description |
 | --- | --- |
-| `DefaultModel` | Default model ID used when the request omits `model`. |
-| `ModelId` | Legacy single-model model ID; still auto-registers as the default model. |
-| `ModelPath` | Legacy single-model GGUF path. Inference endpoints return an OpenAI-style `503` error when it is missing. |
-| `MmprojPath` | Legacy single-model multimodal projection model path. |
-| `ContextSize` | Default context window size. |
-| `GpuLayerCount` | Default number of layers to offload to GPU. Use `0` for CPU mode. |
-| `Threads` | Default inference thread count. `null` uses LLamaSharp defaults. |
-| `BatchThreads` | Default batch thread count. |
-| `BatchSize` | Default prompt batch size. |
-| `UBatchSize` | Default physical batch size. |
-| `UseMemoryMap` | Whether to load the model with memory mapping. |
-| `UseMemoryLock` | Whether to lock model memory. |
-| `FlashAttention` | Whether to enable Flash Attention. |
-| `UseGpuForMtmd` | Whether MTMD/mmproj should use GPU. |
-| `LoadModelOnStartup` | Load the model during service startup. The default is lazy loading. |
-| `DefaultMaxTokens` | Default generation token limit when the request does not set one. |
-| `DefaultTemperature` | Default temperature. |
-| `DefaultTopP` | Default top_p. |
-| `DefaultTopK` | Default top_k. |
-| `AntiPrompts` | LLamaSharp anti-prompts used to stop generation. |
-| `AllowRemoteMedia` | Allow remote image/audio URLs. Remote URLs are blocked for localhost/private/link-local/CGNAT targets, redirects are disabled, and downloads are limited by `MaxMediaBytes`. |
-| `AllowLocalMediaPaths` | Allow request bodies to reference local media paths. Keep disabled in production unless needed. |
+| `DefaultModel` | Default chat/Responses model when a request omits `model`. |
+| `ModelId` / `ModelPath` | Legacy single-model ID and GGUF path. |
+| `MmprojPath` | Legacy/default multimodal projection model path. |
+| `ContextSize` | Context window size. |
+| `GpuLayerCount` | Number of layers to offload. `0` means no layer offload. |
+| `Threads`, `BatchThreads` | LLamaSharp thread settings. `null` lets LLamaSharp choose. |
+| `BatchSize`, `UBatchSize` | Prompt and physical batch sizes. |
+| `UseMemoryMap`, `UseMemoryLock` | Model memory loading behavior. |
+| `FlashAttention` | Optional Flash Attention setting. |
+| `UseGpuForMtmd` | Whether MTMD/mmproj runs on GPU. |
+| `LoadModelOnStartup` | Load configured models during startup instead of lazy loading. |
+| `MaxVramBytes` | Estimated VRAM budget. `0` disables the budget check. |
+| `DefaultMaxTokens`, `DefaultTemperature`, `DefaultTopP`, `DefaultTopK` | Default generation settings. |
+| `AntiPrompts` | LLamaSharp anti-prompts used as stop strings. |
+| `AllowRemoteMedia` | Allows remote image/audio URLs with host guards, no redirects, and byte limits. |
+| `AllowLocalMediaPaths` | Allows local file paths in request bodies. Keep disabled unless needed. |
 | `MaxMediaBytes` | Maximum bytes per media input. |
-| `MaxVramBytes` | VRAM budget limit in bytes. `0` means unlimited. Checked before model loading and pool resize. |
-| `Models` | Multi-model registry. Requests are routed by the `model` field. |
+| `Store.Provider` | `Memory`, `Sqlite`, `Postgres`, or `Redis`. |
+| `Store.SqlitePath` | SQLite database path. |
+| `Store.ConnectionString` | PostgreSQL or Redis connection string. |
+| `Auth.Enabled`, `Auth.ApiKey`, `Auth.ApiKeyHeader` | Optional API-key authentication. The middleware accepts either a raw key or `Bearer <key>`. |
+| `Cors` | Optional allowed origins, headers, and methods. Empty lists mean allow any when CORS is enabled. |
 | `Models[].Id` | Public model ID. |
-| `Models[].OwnedBy` | Owner field returned by `/v1/models`. |
-| `Models[].ModelPath` | GGUF file path for that model. |
-| `Models[].MmprojPath` | mmproj file path for that model. |
-| `Models[].Capabilities` | Model capability declaration used by `/v1/models` and request preflight validation. |
-| `MaxConcurrency` | Number of concurrent inference instances per model (default `1`). LLamaWeights are shared; LLamaContext/InteractiveExecutor are isolated. Can be changed at runtime via `POST /v1/models/{id}/resize`. |
-| `EmbeddingModels` | Independent embedding model registry (see details below). |
-| `EmbeddingModels[].Id` | Embedding model ID. |
-| `EmbeddingModels[].ModelPath` | GGUF file path for the embedding model. |
-| `EmbeddingModels[].Dimensions` | Output embedding vector dimension (optional if the model declares it natively). |
-
-Inference settings omitted from `Models[]` inherit from the top-level defaults. Embedding models support `GpuLayerCount`, `Threads`, `BatchSize`, `MaxConcurrency`, etc.
+| `Models[].OwnedBy` | `owned_by` returned by `/v1/models`. |
+| `Models[].ModelPath` | GGUF path for this model. |
+| `Models[].MmprojPath` | mmproj path for this model. |
+| `Models[].MaxConcurrency` | Number of runtime context/executor instances for this model. |
+| `Models[].Capabilities` | Capability declaration used for `/v1/models` and request validation. |
+| `EmbeddingModels[]` | Dedicated embedding model registry. Embedding settings include `Dimensions`, GPU layers, threads, batch size, memory options, and `MaxConcurrency`. |
 
 ## Model Preparation
 
-LLamaSharp uses GGUF models. You can download pre-converted GGUF files from model hubs such as Hugging Face, or convert and quantize models yourself with the llama.cpp toolchain.
+LLamaSharp consumes GGUF files. Download pre-converted GGUF models from a model hub or convert/quantize with the llama.cpp toolchain.
 
-Quantized models such as `Q4_K_M`, `Q5_K_M`, or `Q6_K` are recommended to reduce memory usage. Multimodal models require both the text model GGUF and the matching `mmproj` GGUF.
+Quantized variants such as `Q4_K_M`, `Q5_K_M`, and `Q6_K` reduce memory usage. Multimodal models need both the text GGUF and the matching `mmproj` GGUF file.
+
+Model files under `./models/` are gitignored.
 
 ## Running the Service
 
@@ -305,15 +340,59 @@ dotnet run --project src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj 
 
 ## API Examples
 
+Every testable interface below includes both Windows PowerShell and Linux curl commands. For examples that need a dynamic ID, first run the create request; on Linux, either copy the returned `id` manually into the variable or use a JSON helper such as `jq`. If API key authentication is enabled, add `-Headers @{ Authorization = "Bearer <key>" }` to PowerShell requests and `-H "Authorization: Bearer <key>"` to curl requests.
+
+### Health Check
+
+Windows PowerShell:
+
+```powershell
+Invoke-RestMethod http://localhost:5062/health
+Invoke-RestMethod http://localhost:5062/v1/health
+```
+
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/health
+curl -s http://localhost:5062/v1/health
+```
+
 ### List Models
+
+Windows PowerShell:
 
 ```powershell
 Invoke-RestMethod http://localhost:5062/v1/models
 ```
 
-The response includes `loaded` and `capabilities`, allowing clients to inspect model state and supported features.
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/models
+```
+
+The response includes `loaded`, model paths, `capabilities`, and embedding dimensions when available.
+
+### Load and Unload a Model
+
+Windows PowerShell:
+
+```powershell
+Invoke-RestMethod http://localhost:5062/v1/models/local-gguf/load -Method Post
+Invoke-RestMethod http://localhost:5062/v1/models/local-gguf/unload -Method Post
+```
+
+Linux curl:
+
+```bash
+curl -s -X POST http://localhost:5062/v1/models/local-gguf/load
+curl -s -X POST http://localhost:5062/v1/models/local-gguf/unload
+```
 
 ### Chat Completions
+
+Windows PowerShell:
 
 ```powershell
 $body = @{
@@ -331,12 +410,30 @@ Invoke-RestMethod http://localhost:5062/v1/chat/completions `
   -Body $body
 ```
 
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "messages": [
+      { "role": "system", "content": "You are a concise assistant." },
+      { "role": "user", "content": "Say hello in Chinese." }
+    ],
+    "max_tokens": 64
+  }'
+```
+
 ### Chat Completions Streaming
+
+Windows PowerShell:
 
 ```powershell
 $body = @{
   model = "local-gguf"
   stream = $true
+  stream_options = @{ include_usage = $true }
   messages = @(
     @{ role = "user"; content = "Write a short haiku about local inference." }
   )
@@ -348,7 +445,24 @@ Invoke-WebRequest http://localhost:5062/v1/chat/completions `
   -Body $body
 ```
 
+Linux curl:
+
+```bash
+curl -N -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "stream": true,
+    "stream_options": { "include_usage": true },
+    "messages": [
+      { "role": "user", "content": "Write a short haiku about local inference." }
+    ]
+  }'
+```
+
 ### Responses API
+
+Windows PowerShell:
 
 ```powershell
 $body = @{
@@ -363,7 +477,52 @@ Invoke-RestMethod http://localhost:5062/v1/responses `
   -Body $body
 ```
 
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "input": "Write one sentence about local GGUF inference.",
+    "max_output_tokens": 64
+  }'
+```
+
+### Responses Streaming
+
+Windows PowerShell:
+
+```powershell
+$body = @{
+  model = "local-gguf"
+  stream = $true
+  stream_options = @{ include_usage = $true }
+  input = "Stream a short local inference answer."
+} | ConvertTo-Json -Depth 10
+
+Invoke-WebRequest http://localhost:5062/v1/responses `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+Linux curl:
+
+```bash
+curl -N -s http://localhost:5062/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "stream": true,
+    "stream_options": { "include_usage": true },
+    "input": "Stream a short local inference answer."
+  }'
+```
+
 ### Embeddings
+
+Windows PowerShell:
 
 ```powershell
 $body = @{
@@ -378,53 +537,148 @@ Invoke-RestMethod http://localhost:5062/v1/embeddings `
   -Body $body
 ```
 
-You can also use a Chat model for embeddings without registering a dedicated embedding model. The service will create a one-shot embedder from the chat model's weights.
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "bge-m3",
+    "input": "Hello world",
+    "dimensions": 512
+  }'
+```
+
+If a dedicated embedding model is not registered, the endpoint can fall back to a configured chat model and create a one-shot embedder from that model.
+
+### Tokenize and Detokenize
+
+Windows PowerShell:
+
+```powershell
+$tokenizeBody = @{
+  model = "local-gguf"
+  input = "Hello local inference"
+} | ConvertTo-Json
+
+$tokens = Invoke-RestMethod http://localhost:5062/v1/tokenize `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $tokenizeBody
+
+$detokenizeBody = @{
+  model = "local-gguf"
+  tokens = @($tokens.data | ForEach-Object { $_.token })
+} | ConvertTo-Json
+
+Invoke-RestMethod http://localhost:5062/v1/detokenize `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $detokenizeBody
+```
+
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/tokenize \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "local-gguf", "input": "Hello local inference" }'
+
+curl -s http://localhost:5062/v1/detokenize \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "local-gguf", "tokens": [1, 2, 3] }'
+```
 
 ### Dynamic Pool Resize
 
-`POST /v1/models/{modelId}/resize` adjusts concurrency without unloading:
+Windows PowerShell:
 
 ```powershell
 $body = @{ max_concurrency = 4 } | ConvertTo-Json
+
 Invoke-RestMethod http://localhost:5062/v1/models/local-gguf/resize `
   -Method Post `
   -ContentType "application/json" `
   -Body $body
 ```
 
-The response includes the new concurrency count and estimated memory usage.
+Linux curl:
 
-### Request Cancellation
+```bash
+curl -s http://localhost:5062/v1/models/local-gguf/resize \
+  -H "Content-Type: application/json" \
+  -d '{ "max_concurrency": 4 }'
+```
 
-Non-streaming Chat Completions can be cancelled via `POST /v1/chat/completions/{completionId}/cancel`:
+The response includes the new concurrency and estimated model memory.
+
+### Queue Status
+
+First send an inference request. The response headers include `X-Queue-Entry-Id`. Queue entries exist only while the request is queued or executing; if the request has already completed, the lookup may return not found.
+
+Windows PowerShell:
 
 ```powershell
 $body = @{
   model = "local-gguf"
-  messages = @(@{ role = "user"; content = "Write a very long story..." })
+  messages = @(@{ role = "user"; content = "Write a slow answer." })
+  max_tokens = 512
 } | ConvertTo-Json -Depth 10
 
-$chat = Invoke-RestMethod http://localhost:5062/v1/chat/completions `
-  -Method Post -ContentType "application/json" -Body $body
+$result = Invoke-WebRequest http://localhost:5062/v1/chat/completions `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
 
-# Cancel
-Invoke-RestMethod "http://localhost:5062/v1/chat/completions/$($chat.id)/cancel" -Method Post
+$entryId = $result.Headers["X-Queue-Entry-Id"]
+Invoke-RestMethod "http://localhost:5062/v1/queue/$entryId"
 ```
 
-`POST /v1/responses/{responseId}/cancel` works the same way.
+Linux curl:
+
+```bash
+curl -i -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "messages": [{ "role": "user", "content": "Write a slow answer." }],
+    "max_tokens": 512
+  }'
+
+QUEUE_ENTRY_ID=replace_with_x_queue_entry_id
+curl -s "http://localhost:5062/v1/queue/$QUEUE_ENTRY_ID"
+```
+
+### Request Cancellation
+
+Windows PowerShell:
+
+```powershell
+Invoke-RestMethod "http://localhost:5062/v1/chat/completions/chatcmpl_xxx/cancel" -Method Post
+Invoke-RestMethod "http://localhost:5062/v1/responses/resp_xxx/cancel" -Method Post
+```
+
+Linux curl:
+
+```bash
+curl -s -X POST http://localhost:5062/v1/chat/completions/chatcmpl_xxx/cancel
+curl -s -X POST http://localhost:5062/v1/responses/resp_xxx/cancel
+```
+
+Cancellation works for tracked non-streaming and background executions. A finished or unknown Chat Completion cancel request returns `cancelled = false`; unknown Responses return a not-found error unless a stored response exists.
 
 ### Management Endpoints
 
-Chat Completions are stored only when the request explicitly sets `store = $true`:
+Chat Completions are stored only when `store = true`.
+
+Windows PowerShell:
 
 ```powershell
 $body = @{
   model = "local-gguf"
   store = $true
   metadata = @{ app = "demo" }
-  messages = @(
-    @{ role = "user"; content = "Say hello." }
-  )
+  messages = @(@{ role = "user"; content = "Say hello." })
 } | ConvertTo-Json -Depth 10
 
 $chat = Invoke-RestMethod http://localhost:5062/v1/chat/completions `
@@ -435,9 +689,41 @@ $chat = Invoke-RestMethod http://localhost:5062/v1/chat/completions `
 Invoke-RestMethod "http://localhost:5062/v1/chat/completions/$($chat.id)"
 Invoke-RestMethod "http://localhost:5062/v1/chat/completions/$($chat.id)/messages"
 Invoke-RestMethod http://localhost:5062/v1/chat/completions
+
+$update = @{ metadata = @{ app = "demo-updated" } } | ConvertTo-Json -Depth 10
+Invoke-RestMethod "http://localhost:5062/v1/chat/completions/$($chat.id)" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $update
+
+Invoke-RestMethod "http://localhost:5062/v1/chat/completions/$($chat.id)" -Method Delete
 ```
 
-Responses are stored in local memory by default. Set `store = $false` to skip storage and make the response unavailable to later management calls:
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "store": true,
+    "metadata": { "app": "demo" },
+    "messages": [{ "role": "user", "content": "Say hello." }]
+  }'
+
+CHAT_ID=chatcmpl_xxx
+curl -s "http://localhost:5062/v1/chat/completions/$CHAT_ID"
+curl -s "http://localhost:5062/v1/chat/completions/$CHAT_ID/messages"
+curl -s http://localhost:5062/v1/chat/completions
+curl -s -X POST "http://localhost:5062/v1/chat/completions/$CHAT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "metadata": { "app": "demo-updated" } }'
+curl -s -X DELETE "http://localhost:5062/v1/chat/completions/$CHAT_ID"
+```
+
+Responses are stored by default. Set `store = false` to skip persistence.
+
+Windows PowerShell:
 
 ```powershell
 $body = @{
@@ -464,35 +750,166 @@ Invoke-RestMethod http://localhost:5062/v1/responses `
   -Method Post `
   -ContentType "application/json" `
   -Body $next
+
+$update = @{ metadata = @{ app = "responses-demo" } } | ConvertTo-Json -Depth 10
+Invoke-RestMethod "http://localhost:5062/v1/responses/$($response.id)" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $update
+
+Invoke-RestMethod "http://localhost:5062/v1/responses/$($response.id)" -Method Delete
 ```
 
-The management layer supports multiple storage backends via `LLamaStack:Store:Provider`:
-- `Memory` (default, in-process, lost on restart)
-- `Sqlite` 鈥?set `LLamaStack:Store:SqlitePath`
-- `Postgres` 鈥?set `LLamaStack:Store:ConnectionString`
-- `Redis` 鈥?set `LLamaStack:Store:ConnectionString`
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "input": "Write one sentence about local state."
+  }'
+
+RESPONSE_ID=resp_xxx
+curl -s "http://localhost:5062/v1/responses/$RESPONSE_ID"
+curl -s "http://localhost:5062/v1/responses/$RESPONSE_ID/input_items"
+curl -s -X POST "http://localhost:5062/v1/responses/$RESPONSE_ID/count_tokens"
+curl -s http://localhost:5062/v1/responses \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"local-gguf\",
+    \"previous_response_id\": \"$RESPONSE_ID\",
+    \"input\": \"Continue from the previous response.\"
+  }"
+curl -s -X POST "http://localhost:5062/v1/responses/$RESPONSE_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "metadata": { "app": "responses-demo" } }'
+curl -s -X DELETE "http://localhost:5062/v1/responses/$RESPONSE_ID"
+```
+
+Store providers:
+
+| Provider | Configuration |
+| --- | --- |
+| `Memory` | Default in-process store, lost on restart. |
+| `Sqlite` | Set `LLamaStack:Store:SqlitePath`. |
+| `Postgres` | Set `LLamaStack:Store:ConnectionString`. |
+| `Redis` | Set `LLamaStack:Store:ConnectionString`. |
+
+### Background Responses and Compact Tasks
+
+Windows PowerShell:
+
+```powershell
+$body = @{
+  model = "local-gguf"
+  background = $true
+  input = "Write a longer answer in the background."
+} | ConvertTo-Json -Depth 10
+
+$response = Invoke-RestMethod http://localhost:5062/v1/responses `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+
+Invoke-RestMethod "http://localhost:5062/v1/responses/$($response.id)"
+
+$compactBody = @{ response_id = $response.id } | ConvertTo-Json
+$task = Invoke-RestMethod http://localhost:5062/v1/responses/compact `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $compactBody
+
+Invoke-RestMethod "http://localhost:5062/v1/responses/tasks/$($task.id)"
+```
+
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "background": true,
+    "input": "Write a longer answer in the background."
+  }'
+
+RESPONSE_ID=resp_xxx
+curl -s "http://localhost:5062/v1/responses/$RESPONSE_ID"
+curl -s http://localhost:5062/v1/responses/compact \
+  -H "Content-Type: application/json" \
+  -d "{ \"response_id\": \"$RESPONSE_ID\" }"
+
+TASK_ID=task_xxx
+curl -s "http://localhost:5062/v1/responses/tasks/$TASK_ID"
+```
 
 ### Tool Calling
 
-Streaming requests that include tools are buffered and then emitted as SSE final output, so `stream: true` and `stream: false` keep the same response shape.
+Tool calling is a protocol bridge, not a server-side tool runtime. The client supplies tool definitions, the model emits a tool-call JSON object, the server returns OpenAI-compatible tool-call fields, and the client executes the function.
 
-Tool calling is protocol-only. The service injects request-provided `tools` / legacy `functions` into the model prompt, parses model-emitted tool-call JSON, and returns standard OpenAI-compatible `tool_calls` / `function_call` output. The client is responsible for executing the tool and sending the tool result back in a follow-up request.
+The service recognizes common model outputs including:
 
-The server only accepts tool calls for functions declared in the current request. `tool_choice: "none"` suppresses tool-call extraction, a specific function choice restricts calls to that function, and `parallel_tool_calls: false` returns at most one call.
-
-Request body structure for the `calculator` tool:
+```json
+{"name":"calculator","arguments":{"expression":"15 * 37"}}
+```
 
 ```json
 {
-  "model": "qwen3.5-0.8b",
-  "messages": [
+  "tool_calls": [
     {
-      "role": "user",
-      "content": "Calculate 15 * 37"
+      "id": "call_1",
+      "type": "function",
+      "function": {
+        "name": "calculator",
+        "arguments": "{\"expression\":\"15 * 37\"}"
+      }
     }
-  ],
-  "tools": [
-    {
+  ]
+}
+```
+
+Chat Completions tool calling.
+
+Windows PowerShell:
+
+```powershell
+$body = @{
+  model = "local-gguf"
+  messages = @(@{ role = "user"; content = "Calculate 15 * 37" })
+  tools = @(
+    @{
+      type = "function"
+      function = @{
+        name = "calculator"
+        description = "Perform arithmetic calculations"
+        parameters = @{
+          type = "object"
+          properties = @{
+            expression = @{ type = "string" }
+          }
+          required = @("expression")
+        }
+      }
+    }
+  )
+} | ConvertTo-Json -Depth 20
+
+Invoke-RestMethod http://localhost:5062/v1/chat/completions `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "messages": [{ "role": "user", "content": "Calculate 15 * 37" }],
+    "tools": [{
       "type": "function",
       "function": {
         "name": "calculator",
@@ -500,141 +917,193 @@ Request body structure for the `calculator` tool:
         "parameters": {
           "type": "object",
           "properties": {
-            "expression": { "type": "string", "description": "Math expression to evaluate" }
+            "expression": { "type": "string" }
           },
           "required": [ "expression" ]
         }
       }
-    }
-  ]
-}
-```
-
-#### Chat Completions with Tool Calling
-
-Linux:
-
-```bash
-curl -s http://localhost:5062/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.5-0.8b",
-    "messages": [{"role": "user", "content": "Tell me what time it is now."}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "current_time",
-        "description": "Get the current time for a timezone",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "timezone": { "type": "string", "description": "Timezone (e.g. Asia/Shanghai)" }
-          }
-        }
-      }
     }]
-  }' | jq .
+  }'
 ```
 
-Windows (CMD / PowerShell with `curl.exe`, save the JSON as `body.json` first):
+Responses tool calling.
 
-```json
-{
-  "model": "qwen3.5-0.8b",
-  "messages": [{"role": "user", "content": "Calculate 15 * 37"}],
-  "tools": [{
-    "type": "function",
-    "function": {
-      "name": "calculator",
-      "description": "Perform arithmetic calculations",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "expression": { "type": "string", "description": "Math expression" }
-        },
-        "required": ["expression"]
-      }
-    }
-  }]
-}
-```
+Windows PowerShell:
 
 ```powershell
-curl.exe -s http://localhost:5062/v1/chat/completions -H "Content-Type: application/json" -d "@body.json"
+$body = @{
+  model = "local-gguf"
+  input = "Calculate (42 + 7) * 3"
+  tools = @(
+    @{
+      type = "function"
+      function = @{
+        name = "calculator"
+        description = "Perform arithmetic calculations"
+        parameters = @{
+          type = "object"
+          properties = @{
+            expression = @{ type = "string" }
+          }
+          required = @("expression")
+        }
+      }
+    }
+  )
+} | ConvertTo-Json -Depth 20
+
+Invoke-RestMethod http://localhost:5062/v1/responses `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
-#### Responses with Tool Calling
-
-Linux:
+Linux curl:
 
 ```bash
 curl -s http://localhost:5062/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.5-0.8b",
-    "input": "What time is it in Tokyo?",
+    "model": "local-gguf",
+    "input": "Calculate (42 + 7) * 3",
     "tools": [{
       "type": "function",
       "function": {
-        "name": "current_time",
-        "description": "Get the current time for a timezone",
+        "name": "calculator",
+        "description": "Perform arithmetic calculations",
         "parameters": {
           "type": "object",
           "properties": {
-            "timezone": { "type": "string", "description": "Timezone (e.g. Asia/Tokyo)" }
-          }
+            "expression": { "type": "string" }
+          },
+          "required": [ "expression" ]
         }
       }
     }]
-  }' | jq .
+  }'
 ```
 
-Windows (CMD / PowerShell with `curl.exe`):
+### Structured Outputs
 
-```json
-{
-  "model": "qwen3.5-0.8b",
-  "input": "Calculate (42 + 7) * 3",
-  "tools": [{
-    "type": "function",
-    "function": {
-      "name": "calculator",
-      "description": "Perform arithmetic calculations",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "expression": { "type": "string", "description": "Math expression" }
-        },
-        "required": ["expression"]
-      }
-    }
-  }]
-}
-```
+Chat Completions use `response_format`; Responses use `text.format`. When `type` is `json_schema`, the service attempts grammar-constrained decoding and, in `strict` mode, validates the generated JSON before returning success.
+
+Windows PowerShell:
 
 ```powershell
-curl.exe -s http://localhost:5062/v1/responses -H "Content-Type: application/json" -d "@body.json"
+$body = @{
+  model = "local-gguf"
+  messages = @(@{ role = "user"; content = "Return a city record for Shanghai." })
+  response_format = @{
+    type = "json_schema"
+    json_schema = @{
+      name = "city"
+      strict = $true
+      schema = @{
+        type = "object"
+        properties = @{
+          name = @{ type = "string" }
+          country = @{ type = "string" }
+        }
+        required = @("name", "country")
+      }
+    }
+  }
+} | ConvertTo-Json -Depth 20
+
+Invoke-RestMethod http://localhost:5062/v1/chat/completions `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-gguf",
+    "messages": [
+      { "role": "user", "content": "Return a city record for Shanghai." }
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "city",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "country": { "type": "string" }
+          },
+          "required": [ "name", "country" ]
+        }
+      }
+    }
+  }'
 ```
 
 ### Multimodal Input
 
-```json
-{
-  "model": "vision-gguf",
-  "messages": [
-    {
+Windows PowerShell:
+
+```powershell
+$body = @{
+  model = "vision-gguf"
+  messages = @(
+    @{
+      role = "user"
+      content = @(
+        @{ type = "text"; text = "Describe this image." },
+        @{ type = "image_url"; image_url = @{ url = "data:image/png;base64,..." } }
+      )
+    }
+  )
+  max_tokens = 256
+} | ConvertTo-Json -Depth 20
+
+Invoke-RestMethod http://localhost:5062/v1/chat/completions `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+Linux curl:
+
+```bash
+curl -s http://localhost:5062/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "vision-gguf",
+    "messages": [{
       "role": "user",
       "content": [
         { "type": "text", "text": "Describe this image." },
         { "type": "image_url", "image_url": { "url": "data:image/png;base64,..." } }
       ]
-    }
-  ],
-  "max_tokens": 256
-}
+    }],
+    "max_tokens": 256
+  }'
 ```
 
-Multimodal models require `Models[].MmprojPath` and declared `ImageInput` or `AudioInput` capabilities.
+Multimodal models need `Models[].MmprojPath` and declared `ImageInput` or `AudioInput` capability. Remote media URLs block localhost, private, link-local, and CGNAT targets; redirects are disabled; downloads are capped by `MaxMediaBytes`.
+
+## Desktop Debug Client
+
+Run the Avalonia client:
+
+```powershell
+dotnet run --project src\Zhengyan.ChatUI.Desktop\Zhengyan.ChatUI.Desktop.csproj
+```
+
+Default endpoint:
+
+```text
+http://localhost:5062/v1
+```
+
+The client can load `/v1/models`, switch between Chat Completions and Responses, stream output, show reasoning/additional response fields, attach image URLs or local images, and persist local UI settings in `%LocalAppData%\Zhengyan.ChatUI.Desktop\settings.json`.
 
 ## Deployment
 
@@ -657,15 +1126,9 @@ dotnet publish\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.dll --urls http:/
 
 ### Windows Service
 
-The project does not yet include `Microsoft.Extensions.Hosting.WindowsServices`. To deploy as a Windows Service, the planned steps are:
-
-1. Add the Windows Service hosting package.
-2. Enable `UseWindowsService()` in `Program.cs`.
-3. Register the service with `sc.exe create` or PowerShell.
+The repository does not currently include Windows Service hosting. A future service deployment would add `Microsoft.Extensions.Hosting.WindowsServices`, call `UseWindowsService()` in `Program.cs`, and register the published app with `sc.exe` or PowerShell.
 
 ### Linux systemd
-
-Example service file:
 
 ```ini
 [Unit]
@@ -688,34 +1151,26 @@ WantedBy=multi-user.target
 
 ### Docker
 
-This repository does not yet include a Dockerfile. Recommended future images:
-
-- CPU image based on the .NET ASP.NET Runtime 10 image.
-- CUDA image based on an NVIDIA CUDA runtime image with the LLamaSharp CUDA backend.
-- Model files mounted through volumes instead of being copied into the image.
+No Dockerfile exists yet. Future images should keep model files mounted as volumes and use backend-specific base images for CPU, CUDA, or Vulkan.
 
 ## GPU Backends
 
-The project uses the CPU backend by default:
+LLamaSharp backend selection is controlled by NuGet package references, not by a runtime config switch. This checkout currently references:
 
 ```xml
-<PackageReference Include="LLamaSharp.Backend.Cpu" Version="0.27.0" />
+<PackageReference Include="LLamaSharp.Backend.Cuda12" Version="0.27.0" />
 ```
 
-Choose a LLamaSharp backend package for your target environment, for example:
-
-- `LLamaSharp.Backend.Cuda12`
-- `LLamaSharp.Backend.Vulkan`
-- macOS can use Metal support included in the CPU package, depending on LLamaSharp's official guidance.
+Use `GpuLayerCount` to control layer offload for a backend that supports it. For CPU-only, Vulkan, or another target, replace the backend package in `src/Zhengyan.LLamaStack.Api/Zhengyan.LLamaStack.Api.csproj`.
 
 Example:
 
 ```powershell
-dotnet remove src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LLamaSharp.Backend.Cpu
-dotnet add src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LLamaSharp.Backend.Cuda12 --version 0.27.0
+dotnet remove src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LLamaSharp.Backend.Cuda12
+dotnet add src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj package LLamaSharp.Backend.Vulkan --version 0.27.0
 ```
 
-Then configure:
+Then configure offload:
 
 ```json
 {
@@ -731,71 +1186,45 @@ Then configure:
 
 | Capability | Status |
 | --- | --- |
-| `GET /v1/models` | Multi-model list, load status, capability declarations, and embedding dimensions implemented. |
-| `POST /v1/chat/completions` | Basic non-streaming and streaming inference implemented. |
-| `POST /v1/responses` | Basic non-streaming and streaming inference implemented. |
-| `POST /v1/embeddings` | Implemented via LLamaEmbedder; independent embedding model registration and `Dimensions` truncation supported. |
-| `POST /v1/tokenize` / `POST /v1/detokenize` | Tokenization and detokenization implemented. |
-| `GET /v1/health` | Health check with model load status. |
-| `POST /v1/models/{model_id}/load` / `unload` | Runtime model hot load and unload implemented. |
-| `POST /v1/models/{model_id}/resize` | Runtime dynamic pool resize with VRAM budget check implemented. |
-| `GET /v1/queue/{entry_id}` | Queue status lookup implemented. |
-| OpenAI-style error payloads | Implemented for main service errors. |
-| Text message/content parsing | Implemented. |
-| Image and audio input parsing | Implemented at request level; requires `MmprojPath`. |
-| `tools` / `functions` request parsing | Implemented. |
-| Tool-call protocol | `tools` / legacy `functions` are parsed; model-emitted calls are returned as OpenAI-compatible `tool_calls` / `function_call` output for the client to execute. `tool_choice` and `parallel_tool_calls` are enforced during extraction. |
-| Strict JSON validation | Strict schema validation failures return an OpenAI-format error instead of silently accepting invalid model output. |
-| `response_format` / JSON mode | Fully implemented: JSON Schema 鈫?GBNF Grammar constrained decoding + strict mode (`ValidateJsonOutput`) recursive validation. |
-| usage token counts | Fully implemented: streaming includes real-time token counts, non-streaming provides exact counts. |
-| Multi-model registry and `model` routing | Implemented, with legacy single-model configuration compatibility. |
-| Model capability declarations | Implemented for `/v1/models` and request preflight validation. |
-| Chat protocol fields | Accepts `metadata`, `user`, `store`, `service_tier`, `parallel_tool_calls`, and `stream_options.include_usage`; unsupported `logprobs` / `logit_bias` return compatibility warnings. |
-| Chat management endpoints | Implemented (Memory/SQLite/PostgreSQL/Redis backends): list, retrieve, update metadata, delete, messages. |
-| Responses protocol fields | Accepts `previous_response_id`, `conversation`, `background`, `reasoning`, `metadata`, `truncation`, `include`, `store`, and `parallel_tool_calls`; `previous_response_id` continues context from store. |
-| Responses management endpoints | Implemented (Memory/SQLite/PostgreSQL/Redis backends): list, retrieve, update metadata, delete, cancel, input_items, input_tokens, count_tokens, compact (with TASK state machine), tasks query. |
-| Response background execution | Implemented via `background: true` + `Channel`-based background queue. |
-| Conversation management | `ConversationStore` implemented; `conversation` field auto-resolves `previous_response_id`. |
-| API key authentication | Optional Bearer token middleware implemented (`LLamaStack:Auth`). |
-| CORS | Optional cross-origin configuration implemented (`LLamaStack:Cors`). |
-| Embedding model registration | Via `LLamaStack:EmbeddingModels[]` config; supports `Dimensions`, `MaxConcurrency`, GPU layers, etc. |
-| Concurrent inference | Two-tier concurrency control: `ModelRequestQueue` (FIFO) 鈫?`ModelRuntime` (SemaphoreSlim pool). Dynamic pool resize, request queuing, real-time cancellation (`ResponseExecutionTracker`), and VRAM protection (`MaxVramBytes`). |
-| Storage backends | Supports Memory, SQLite, PostgreSQL, and Redis providers. |
+| Models | `/v1/models`, load state, capabilities, embedding dimensions, explicit load/unload. |
+| Chat Completions | Non-streaming, streaming, `n`, sampling fields, stop strings, store opt-in, management endpoints. |
+| Responses | Non-streaming, streaming, stored by default, management endpoints, `previous_response_id`, `conversation`, `background`, compact tasks. |
+| Embeddings | Dedicated embedding models plus chat-model fallback, `dimensions` truncation. |
+| Tokenization | `/v1/tokenize` and `/v1/detokenize`. |
+| Errors | OpenAI-style error envelopes for main protocol failures. |
+| Tool calls | `tools` and legacy `functions` parsing, prompt injection, tool-call JSON extraction, tool choice enforcement, parallel-call limiting. |
+| Structured outputs | JSON mode, JSON Schema to GBNF where possible, strict schema validation. |
+| Multimodal input | Request-level image/audio parsing with data URL, base64, guarded remote URL, and optional local path support. |
+| Concurrency | Per-model FIFO queue, pooled contexts, dynamic resize, cancellation tracker, estimated VRAM checks. |
+| Storage | Memory, SQLite, PostgreSQL, and Redis providers. |
+| Security | Optional API-key auth, configurable header, CORS, redacted logs, guarded media loading. |
+| Desktop client | Avalonia debug UI with streaming, model loading, image attachments, Chat/Responses mode. |
 
-### Missing for Full OpenAI Protocol Coverage
+### Missing or Partial
 
-| Area | Gap | Plan |
+| Area | Gap | Possible next step |
 | --- | --- | --- |
-| Chat Completions | `logprobs`, `top_logprobs`, and `logit_bias` do not have real sampler support (requires custom token loop). | Verify LLamaSharp logits/logprobs exposure; extend the sampling pipeline. |
-| Multimodal output | Only text output is supported. Image/audio output items are not supported. | Extend response output item models and integrate image/audio generation backends. |
-| Audio API | `/v1/audio/transcriptions`, `/v1/audio/translations`, and `/v1/audio/speech` are not implemented. | Integrate Whisper/Sherpa-ONNX/TTS backends and expose OpenAI-compatible payloads. |
-| Images API | `/v1/images/generations`, `/v1/images/edits`, and `/v1/images/variations` are not implemented. | Add local image generation adapters, such as Stable Diffusion or ComfyUI. |
-| Moderations API | `/v1/moderations` is not implemented. | Add a local safety classification model or rules engine. |
-| Files / Uploads | `/v1/files` and `/v1/uploads` resources are not implemented. | Add file storage, validation, lifecycle management, and access control. |
-| Vector Stores | vector stores, file batches, and search endpoints are not implemented. | Add a vector database abstraction for HNSW, SQLite vec, Qdrant, Milvus, or similar backends. |
-| Batch API | `/v1/batches` is not implemented. | Add an async job queue, batch request parser, status lookup, and output files. |
-| Fine-tuning | fine-tuning jobs, checkpoints, and events are not implemented. | Treat as a long-term goal; prioritize LoRA/QLoRA orchestration instead of direct large-model training. |
-| Realtime API | WebSocket/WebRTC realtime protocols are not implemented. | Plan a separate realtime host for bidirectional audio, incremental transcription, and low-latency output. |
-| Legacy Assistants API | assistants, threads, runs, and run steps are not implemented. | Implement only if compatibility demand is strong; prioritize Responses API first. |
-| Authentication and rate limits | Optional API key middleware implemented (`LLamaStack:Auth`); rate limits, organization/project not implemented. | Add rate limiting, request auditing, and tenant metadata. |
-| Model management | Multi-model registration, default model, `model` routing, capability declarations, runtime hot load/unload, and dynamic pool resize implemented. | Add runtime configuration refresh, model health checks, and automatic capability detection. |
-| Observability | Metrics, tracing, and structured audit logs are missing. | Add OpenTelemetry, Prometheus metrics, request IDs, token/s, and latency metrics. |
-| SDK compatibility tests | No automated OpenAI SDK compatibility matrix exists yet. | Build end-to-end tests with official OpenAI .NET, Python, and JavaScript SDKs. |
+| Chat log probabilities | `logprobs` and `top_logprobs` are accepted with compatibility warnings but no real logprob output is produced. | Extend generation around logits/logprob access. |
+| Multimodal output | Only text output and function-call items are returned. | Add image/audio output model types and generation backends. |
+| Audio API | `/v1/audio/transcriptions`, `/v1/audio/translations`, and `/v1/audio/speech` are not implemented. | Add Whisper/Sherpa-ONNX/TTS adapters. |
+| Images API | `/v1/images/generations`, edits, and variations are not implemented. | Add Stable Diffusion or ComfyUI adapters. |
+| Moderations API | `/v1/moderations` is not implemented. | Add local classifier or rules engine. |
+| Files and Uploads | `/v1/files` and `/v1/uploads` are not implemented. | Add file storage, validation, lifecycle, and access control. |
+| Vector Stores | Vector stores, file batches, and search endpoints are not implemented. | Add HNSW, SQLite vec, Qdrant, Milvus, or similar backend abstraction. |
+| Batch API | `/v1/batches` is not implemented. | Add async job queue, batch parser, status lookup, and output files. |
+| Fine-tuning | Fine-tuning jobs, checkpoints, and events are not implemented. | Treat as long-term LoRA/QLoRA orchestration. |
+| Realtime API | WebSocket/WebRTC realtime protocols are not implemented. | Build a separate realtime host for bidirectional audio and low-latency output. |
+| Legacy Assistants API | Assistants, threads, runs, and run steps are not implemented. | Implement only if compatibility demand is strong. |
+| Production controls | Rate limits, organization/project scoping, metrics, tracing, and audit logs are missing. | Add rate limiting and OpenTelemetry/Prometheus support. |
+| SDK compatibility | No automated OpenAI SDK compatibility matrix exists yet. | Add end-to-end tests for official .NET, Python, and JavaScript SDKs. |
 
 ### Suggested Iteration Order
 
-1. 鉁?Completed multi-model registration, `model` routing, and model capability declarations.
-2. 鉁?Completed Chat Completions and Responses protocol field parsing, degradation, and echoing.
-3. 鉁?Completed Chat/Response store and management endpoints (with durable backends).
-4. 鉁?Completed durable store, background task state machine, real cancellation, and model-driven compact.
-5. 鉁?Completed structured outputs (JSON Schema 鈫?GBNF Grammar + strict validation).
-6. 鉁?Completed Embedding API (independent registration, dimension declaration, vector extraction).
-7. 鉁?Completed concurrent inference enhancements (dynamic pool resize, queuing, cancellation, VRAM protection).
-8. 鉁?Completed tool-calling enhancements (registry, hot-load, timeout, permissions, output validation).
-9. Add Files / Uploads and Vector Stores.
-10. Add Audio, Images, Moderations, and other independent capabilities.
-11. Add rate limiting, metrics, and production deployment scaffolding.
-12. Build an OpenAI SDK compatibility test matrix, then evaluate Realtime API and fine-tuning orchestration.
+1. Add Files/Uploads and Vector Stores, because they unblock retrieval workflows.
+2. Add rate limiting, metrics, request IDs, token/s, and latency observability.
+3. Add SDK compatibility tests across official OpenAI SDKs.
+4. Add Audio, Images, and Moderations as independent adapters.
+5. Revisit Realtime API and fine-tuning orchestration after the core HTTP surface is stable.
 
 ## Development Commands
 
@@ -804,8 +1233,12 @@ dotnet restore Zhengyan.LLamaStack.slnx
 dotnet build Zhengyan.LLamaStack.slnx -v minimal
 dotnet test Zhengyan.LLamaStack.slnx -v minimal
 dotnet run --project src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj
+dotnet run --project src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj --urls http://0.0.0.0:5062
 dotnet run --project src\Zhengyan.ChatUI.Desktop\Zhengyan.ChatUI.Desktop.csproj
+dotnet publish src\Zhengyan.LLamaStack.Api\Zhengyan.LLamaStack.Api.csproj -c Release -o publish\Zhengyan.LLamaStack.Api
 ```
+
+There are no separate lint, format, code generation, CI, or Docker commands in this repository.
 
 ## References
 
