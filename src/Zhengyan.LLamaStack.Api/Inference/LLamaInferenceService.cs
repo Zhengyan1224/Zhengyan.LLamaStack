@@ -655,16 +655,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         long? created,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        if (request.Tools.Count > 0)
-        {
-            await foreach (var evt in StreamBufferedChatCompletionAsync(request, responseId, includeUsage, store, created, cancellationToken))
-            {
-                yield return evt;
-            }
-
-            yield break;
-        }
-
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
@@ -790,16 +780,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         long? created,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        if (request.Tools.Count > 0)
-        {
-            await foreach (var evt in StreamBufferedResponsesCompletionAsync(request, responseId, includeUsage, store, created, cancellationToken))
-            {
-                yield return evt;
-            }
-
-            yield break;
-        }
-
         var model = ResolveRuntime(request.RequestedModel);
         var loaded = await AcquireLoadedModelAsync(model, cancellationToken);
         try
