@@ -303,6 +303,7 @@ The main configuration section is `LLamaStack`. `Models[]` is the recommended sh
 | `AllowRemoteMedia` | Allows remote image/audio URLs with host guards, no redirects, and byte limits. |
 | `AllowLocalMediaPaths` | Allows local file paths in request bodies. Keep disabled unless needed. |
 | `MaxMediaBytes` | Maximum bytes per media input. |
+| `MaxImageDimension` | Image resize threshold in pixels. `-1` disables the threshold and defers to the request's `detail` field; `> 0` forces the image to fit within this value on its longest side. |
 | `Store.Provider` | `Memory`, `Sqlite`, `Postgres`, or `Redis`. |
 | `Store.SqlitePath` | SQLite database path. |
 | `Store.ConnectionString` | PostgreSQL or Redis connection string. |
@@ -1088,6 +1089,15 @@ curl -s http://localhost:5062/v1/chat/completions \
 ```
 
 Multimodal models need `Models[].MmprojPath` and declared `ImageInput` or `AudioInput` capability. Remote media URLs block localhost, private, link-local, and CGNAT targets; redirects are disabled; downloads are capped by `MaxMediaBytes`.
+
+Image input supports server-side resizing, controlled by `LLamaStack:MaxImageDimension` or the request's `detail` field:
+
+- `MaxImageDimension >= 0`: resizes proportionally when the longest side exceeds the threshold.
+- `MaxImageDimension = -1` (default): defers to the request's `detail` parameter:
+  - `"auto"` or absent: no resize.
+  - `"low"`: resized to fit within 512×512.
+  - `"high"`: shortest side scaled to 768px; if the longest side then exceeds 2048px, capped at 2048px.
+- Resizing uses SkiaSharp to decode and re-encode as JPEG (quality 85). Falls back to the original bytes on failure.
 
 ## Desktop Debug Client
 

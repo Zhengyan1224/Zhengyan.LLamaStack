@@ -303,6 +303,7 @@ curl -s http://localhost:5062/health
 | `AllowRemoteMedia` | 允许远程图片/音频 URL，并启用主机保护、禁用重定向和大小限制。 |
 | `AllowLocalMediaPaths` | 允许请求体引用本地文件路径。除非确有需要，否则应保持关闭。 |
 | `MaxMediaBytes` | 单个媒体输入的最大字节数。 |
+| `MaxImageDimension` | 图片缩放阈值（像素）。`-1` 时禁用缩放，改用请求中的 `detail` 参数；`> 0` 时强制缩放到该像素数以内。 |
 | `Store.Provider` | `Memory`、`Sqlite`、`Postgres` 或 `Redis`。 |
 | `Store.SqlitePath` | SQLite 数据库路径。 |
 | `Store.ConnectionString` | PostgreSQL 或 Redis 连接字符串。 |
@@ -1088,6 +1089,15 @@ curl -s http://localhost:5062/v1/chat/completions \
 ```
 
 多模态模型需要 `Models[].MmprojPath`，并声明 `ImageInput` 或 `AudioInput` 能力。远程媒体 URL 会阻止 localhost、私网、链路本地和 CGNAT 目标；重定向会被禁用；下载大小受 `MaxMediaBytes` 限制。
+
+图片输入支持服务端缩放，通过 `LLamaStack:MaxImageDimension` 或请求的 `detail` 字段控制：
+
+- `MaxImageDimension >= 0`：最长边超过阈值时将图片等比缩放。
+- `MaxImageDimension = -1`（默认）：使用请求的 `detail` 参数：
+  - `"auto"` 或未传：不缩放。
+  - `"low"`：缩放到 512×512 以内。
+  - `"high"`：最短边缩到 768px；如最长边超过 2048px 再缩到 2048px。
+- 缩放使用 SkiaSharp 解码并重编码为 JPEG（质量 85），失败时自动回退到原始 bytes。
 
 ## 桌面调试客户端
 
