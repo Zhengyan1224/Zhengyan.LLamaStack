@@ -507,7 +507,7 @@ public sealed class InfrastructureBehaviorTests
 
         var parameters = CreateInferenceParams(model, new InferenceRequest());
 
-        Assert.Equal(ContextOverflowStrategy.ThrowException, parameters.OverflowStrategy);
+        Assert.Equal(ContextOverflowStrategy.TruncateAndReprefill, parameters.OverflowStrategy);
         Assert.Equal(256, parameters.MaxTokens);
     }
 

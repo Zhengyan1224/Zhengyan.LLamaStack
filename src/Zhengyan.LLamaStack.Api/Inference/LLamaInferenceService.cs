@@ -1291,7 +1291,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             MaxTokens = ResolveMaxTokens(model, request, promptTokens),
             AntiPrompts = antiPrompts,
             SamplingPipeline = pipeline,
-            OverflowStrategy = ContextOverflowStrategy.ThrowException
+            OverflowStrategy = ContextOverflowStrategy.TruncateAndReprefill
         };
     }
 
@@ -1333,6 +1333,18 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
     private static readonly FieldInfo? _isPromptRunField = typeof(InteractiveExecutor)
         .GetField("_is_prompt_run", BindingFlags.NonPublic | BindingFlags.Instance);
+    private static readonly FieldInfo? _pastTokensCountField = typeof(StatefulExecutorBase)
+        .GetField("_pastTokensCount", BindingFlags.NonPublic | BindingFlags.Instance);
+    private static readonly FieldInfo? _consumedTokensCountField = typeof(StatefulExecutorBase)
+        .GetField("_consumedTokensCount", BindingFlags.NonPublic | BindingFlags.Instance);
+    private static readonly FieldInfo? _nSessionConsumedField = typeof(StatefulExecutorBase)
+        .GetField("_n_session_consumed", BindingFlags.NonPublic | BindingFlags.Instance);
+    private static readonly FieldInfo? _nMatchingSessionTokensField = typeof(StatefulExecutorBase)
+        .GetField("_n_matching_session_tokens", BindingFlags.NonPublic | BindingFlags.Instance);
+    private static readonly FieldInfo? _sessionTokensField = typeof(StatefulExecutorBase)
+        .GetField("_session_tokens", BindingFlags.NonPublic | BindingFlags.Instance);
+    private static readonly FieldInfo? _embedInpsField = typeof(StatefulExecutorBase)
+        .GetField("_embed_inps", BindingFlags.NonPublic | BindingFlags.Instance);
 
     private static void ResetExecutorState(LoadedModel loaded)
     {
@@ -1343,6 +1355,17 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         // If left false, PreprocessInputs subtracts the prompt length from
         // RemainedTokens, causing PostProcess to stop after 1 token.
         _isPromptRunField?.SetValue(loaded.Executor, true);
+        // Reset accumulated token counters. MemoryClear() wipes the KV cache
+        // but leaves _pastTokensCount intact, so the next inference sees a
+        // stale count that can trigger premature context-overflow after the
+        // first generated token. Other counters / token lists are also reset
+        // to avoid cross-request state leakage.
+        _pastTokensCountField?.SetValue(loaded.Executor, 0);
+        _consumedTokensCountField?.SetValue(loaded.Executor, 0);
+        _nSessionConsumedField?.SetValue(loaded.Executor, 0);
+        _nMatchingSessionTokensField?.SetValue(loaded.Executor, 0);
+        (_sessionTokensField?.GetValue(loaded.Executor) as System.Collections.IList)?.Clear();
+        (_embedInpsField?.GetValue(loaded.Executor) as System.Collections.IList)?.Clear();
     }
 
     private static void CleanupMedia(LoadedModel loaded)
