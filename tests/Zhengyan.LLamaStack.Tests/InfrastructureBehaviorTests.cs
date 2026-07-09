@@ -4,6 +4,7 @@ using System.Text.Json;
 using LLama.Common;
 using LLama.Sampling;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Zhengyan.LLamaStack.Api.Inference;
 using Zhengyan.LLamaStack.Api.Infrastructure;
@@ -152,7 +153,8 @@ public sealed class InfrastructureBehaviorTests
             """);
         var mapper = new OpenAiRequestMapper(
             new StubHttpClientFactory(),
-            Options.Create(new LLamaStackOptions { AllowRemoteMedia = true }));
+            Options.Create(new LLamaStackOptions { AllowRemoteMedia = true }),
+            NullLogger<OpenAiRequestMapper>.Instance);
         var request = new ChatCompletionRequest
         {
             Messages =
@@ -177,7 +179,8 @@ public sealed class InfrastructureBehaviorTests
         using var toolChoice = JsonDocument.Parse("""{"type":"function","function":{"name":"lookup_weather"}}""");
         var mapper = new OpenAiRequestMapper(
             new StubHttpClientFactory(),
-            Options.Create(new LLamaStackOptions()));
+            Options.Create(new LLamaStackOptions()),
+            NullLogger<OpenAiRequestMapper>.Instance);
         var request = new ChatCompletionRequest
         {
             Messages =

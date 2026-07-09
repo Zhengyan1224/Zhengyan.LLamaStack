@@ -4,6 +4,7 @@ using System.Net.Mime;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SkiaSharp;
 using Zhengyan.LLamaStack.Api.Inference;
@@ -38,11 +39,13 @@ public sealed class OpenAiRequestMapper
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly LLamaStackOptions _options;
+    private readonly ILogger<OpenAiRequestMapper> _logger;
 
-    public OpenAiRequestMapper(IHttpClientFactory httpClientFactory, IOptions<LLamaStackOptions> options)
+    public OpenAiRequestMapper(IHttpClientFactory httpClientFactory, IOptions<LLamaStackOptions> options, ILogger<OpenAiRequestMapper> logger)
     {
         _httpClientFactory = httpClientFactory;
         _options = options.Value;
+        _logger = logger;
     }
 
     public async Task<InferenceRequest> FromChatAsync(ChatCompletionRequest request, CancellationToken cancellationToken)
@@ -427,19 +430,24 @@ public sealed class OpenAiRequestMapper
     {
         if (!ImageMimeTypes.Contains(mimeType))
         {
+            _logger.LogDebug("Skipping resize: MIME type {MimeType} is not a supported image type.", mimeType);
             return imageBytes;
         }
 
         int? configMax = _options.MaxImageDimension;
+        _logger.LogDebug("MaybeResizeImage: MaxImageDimension={ConfigMax}, Detail={Detail}, ImageSize={Size} bytes",
+            configMax, detail, imageBytes.Length);
+
         if (configMax < 0 && string.IsNullOrWhiteSpace(detail))
         {
+            _logger.LogDebug("Skipping resize: configMax < 0 and detail is empty.");
             return imageBytes;
         }
 
         return ResizeImageWithSkia(imageBytes, configMax, detail);
     }
 
-    private static byte[] ResizeImageWithSkia(byte[] imageBytes, int? configMaxDimension, string? detail)
+    private byte[] ResizeImageWithSkia(byte[] imageBytes, int? configMaxDimension, string? detail)
     {
         try
         {
@@ -447,17 +455,22 @@ public sealed class OpenAiRequestMapper
             using var bitmap = SKBitmap.Decode(input);
             if (bitmap is null)
             {
+                _logger.LogDebug("SKBitmap.Decode returned null for {Size} byte image.", imageBytes.Length);
                 return imageBytes;
             }
 
             var width = bitmap.Width;
             var height = bitmap.Height;
 
+            _logger.LogDebug("ResizeImageWithSkia: input dimensions {W}x{H}, configMax={ConfigMax}, detail={Detail}",
+                width, height, configMaxDimension, detail);
+
             int targetWidth, targetHeight;
             if (configMaxDimension >= 0)
             {
                 if (width <= configMaxDimension && height <= configMaxDimension)
                 {
+                    _logger.LogDebug("Image already fits within {ConfigMax}px.", configMaxDimension);
                     return imageBytes;
                 }
 
@@ -524,18 +537,24 @@ public sealed class OpenAiRequestMapper
             targetWidth = Math.Max(1, targetWidth);
             targetHeight = Math.Max(1, targetHeight);
 
+            _logger.LogDebug("Resizing from {W}x{H} to {TW}x{TH}", width, height, targetWidth, targetHeight);
+
             using var resized = bitmap.Resize(new SKImageInfo(targetWidth, targetHeight), new SKSamplingOptions(SKFilterMode.Linear));
             if (resized is null)
             {
+                _logger.LogDebug("bitmap.Resize returned null.");
                 return imageBytes;
             }
 
             using var image = SKImage.FromBitmap(resized);
             using var data = image.Encode(SKEncodedImageFormat.Jpeg, 85);
-            return data.ToArray();
+            var result = data.ToArray();
+            _logger.LogDebug("Resize succeeded: {Original} bytes -> {Resized} bytes", imageBytes.Length, result.Length);
+            return result;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogWarning(ex, "Failed to resize image with SkiaSharp, returning original bytes.");
             return imageBytes;
         }
     }
