@@ -171,9 +171,9 @@ public static class OpenAiCompatibleEndpoints
         return body.Length <= 512 ? body : $"[redacted body length {body.Length}]";
     }
 
-    private static void WriteRedactedJson(Utf8JsonWriter writer, JsonElement element, string? propertyName = null)
+    private static void WriteRedactedJson(Utf8JsonWriter writer, JsonElement element, string? propertyName = null, string? parentPropertyName = null)
     {
-        if (ShouldRedactProperty(propertyName))
+        if (ShouldRedactProperty(propertyName, parentPropertyName))
         {
             writer.WriteStringValue(element.ValueKind switch
             {
@@ -192,7 +192,7 @@ public static class OpenAiCompatibleEndpoints
                 foreach (var property in element.EnumerateObject())
                 {
                     writer.WritePropertyName(property.Name);
-                    WriteRedactedJson(writer, property.Value, property.Name);
+                    WriteRedactedJson(writer, property.Value, property.Name, propertyName);
                 }
                 writer.WriteEndObject();
                 break;
@@ -200,7 +200,7 @@ public static class OpenAiCompatibleEndpoints
                 writer.WriteStartArray();
                 foreach (var item in element.EnumerateArray())
                 {
-                    WriteRedactedJson(writer, item);
+                    WriteRedactedJson(writer, item, parentPropertyName: parentPropertyName);
                 }
                 writer.WriteEndArray();
                 break;
@@ -224,8 +224,15 @@ public static class OpenAiCompatibleEndpoints
         }
     }
 
-    private static bool ShouldRedactProperty(string? propertyName)
+    private static bool ShouldRedactProperty(string? propertyName, string? parentPropertyName = null)
     {
+        // content inside delta is the SSE streaming output — keep it visible in logs
+        if (string.Equals(propertyName, "content", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(parentPropertyName, "delta", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         return propertyName is not null &&
             (string.Equals(propertyName, "messages", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "content", StringComparison.OrdinalIgnoreCase) ||
@@ -235,8 +242,6 @@ public static class OpenAiCompatibleEndpoints
              string.Equals(propertyName, "output", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "output_text", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "text", StringComparison.OrdinalIgnoreCase) ||
-             // "delta" is intentionally NOT redacted so SSE token-by-token
-             // streaming output is visible in debug logs.
              string.Equals(propertyName, "embedding", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "image_url", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "audio_url", StringComparison.OrdinalIgnoreCase) ||

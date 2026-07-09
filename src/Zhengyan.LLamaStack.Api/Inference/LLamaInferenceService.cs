@@ -2038,25 +2038,48 @@ ws ::= [ \t\n\r]*
         out string cleanText)
     {
         cleanText = generated.Trim();
-        if (request.Tools.Count == 0 || request.ToolChoiceMode == InferenceToolChoiceMode.None)
+        if (request.ToolChoiceMode == InferenceToolChoiceMode.None)
         {
             return [];
         }
 
-        var textProtocolCalls = TryExtractTaggedToolCalls(cleanText, request);
-        if (textProtocolCalls.Count > 0)
+        // When tools are registered via the API, use the full validation pipeline.
+        // Also fall through to text-protocol extraction below for clients like
+        // OpenCode that embed tool definitions in the prompt instead of the API.
+        if (request.Tools.Count > 0)
         {
-            cleanText = string.Empty;
-            return textProtocolCalls;
-        }
-
-        foreach (var json in ExtractJsonObjects(cleanText))
-        {
-            var valid = TryParseToolCallsFromJson(json, request);
-            if (valid.Count > 0)
+            var textProtocolCalls = TryExtractTaggedToolCalls(cleanText, request);
+            if (textProtocolCalls.Count > 0)
             {
                 cleanText = string.Empty;
-                return valid;
+                return textProtocolCalls;
+            }
+
+            foreach (var json in ExtractJsonObjects(cleanText))
+            {
+                var valid = TryParseToolCallsFromJson(json, request);
+                if (valid.Count > 0)
+                {
+                    cleanText = string.Empty;
+                    return valid;
+                }
+            }
+        }
+
+        // Even without registered tools, try text-protocol ({"name":...,"arguments":...})
+        foreach (var json in ExtractJsonObjects(cleanText))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                if (TryReadTextProtocolToolCall(doc.RootElement, out var call))
+                {
+                    cleanText = string.Empty;
+                    return [call];
+                }
+            }
+            catch (JsonException)
+            {
             }
         }
 

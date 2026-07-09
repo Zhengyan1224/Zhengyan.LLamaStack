@@ -62,7 +62,28 @@ public sealed class OpenAiRequestMapper
         }
 
         var tools = MergeChatTools(request.Tools, request.Functions);
+        // When no tools are sent via the API but system messages contain
+        // text-protocol tool definitions (e.g. OpenCode), register them
+        // so the server's grammar and tool-call extraction can work.
+        var textProtocolToolsDetected = false;
+        if (tools.Count == 0)
+        {
+            tools = TryExtractTextProtocolTools(messages);
+            textProtocolToolsDetected = tools.Count > 0;
+        }
+
         var toolChoice = ParseToolChoice(request.ToolChoice ?? request.FunctionCall);
+        // Enable grammar-based JSON output so the model reliably generates
+        // valid JSON tool calls. This applies both when tools come via the
+        // text protocol (embedded in system prompt, e.g. OpenCode) and when
+        // they come via the API tools parameter with tool_choice != none.
+        var forceToolCallJson = textProtocolToolsDetected || (tools.Count > 0 && toolChoice.Mode != InferenceToolChoiceMode.None);
+        var effectiveToolChoiceMode = toolChoice.Mode;
+        if (textProtocolToolsDetected && effectiveToolChoiceMode == InferenceToolChoiceMode.None)
+        {
+            effectiveToolChoiceMode = InferenceToolChoiceMode.Auto;
+        }
+
         var warnings = new List<string>();
         AddChatCompatibilityWarnings(request, warnings);
         return new InferenceRequest
@@ -71,7 +92,7 @@ public sealed class OpenAiRequestMapper
             Messages = messages,
             Tools = tools,
             ToolChoiceDescription = toolChoice.Description,
-            ToolChoiceMode = toolChoice.Mode,
+            ToolChoiceMode = effectiveToolChoiceMode,
             ToolChoiceName = toolChoice.Name,
             N = Math.Max(1, request.N ?? 1),
             MaxTokens = request.MaxCompletionTokens ?? request.MaxTokens,
@@ -84,7 +105,8 @@ public sealed class OpenAiRequestMapper
             Stop = ParseStop(request.Stop),
         JsonSchema = ParseJsonSchema(request.ResponseFormat),
         StrictJsonSchema = IsStrictJsonSchema(request.ResponseFormat),
-        ForceJson = IsJsonResponseFormat(request.ResponseFormat),
+        ForceJson = IsJsonResponseFormat(request.ResponseFormat) || forceToolCallJson,
+        ForceToolCallJson = forceToolCallJson,
         StreamIncludeUsage = request.StreamOptions?.IncludeUsage == true,
             Store = request.Store,
             User = request.User,
@@ -1219,5 +1241,109 @@ public sealed class OpenAiRequestMapper
                 };
             }
         }
+    }
+
+    private static List<OpenAiTool> TryExtractTextProtocolTools(List<InferenceMessage> messages)
+    {
+        var systemText = string.Join(Environment.NewLine, messages
+            .Where(m => string.Equals(m.Role, "system", StringComparison.OrdinalIgnoreCase))
+            .Select(m => m.Content ?? string.Empty));
+
+        // Try common prompt markers used by various AI coding assistants
+        var markers = new[]
+        {
+            "Available tools are provided as JSON:",
+            "You have the following tools available:",
+            "## Tool definitions",
+            "[Tool Definitions]",
+            "tools:"
+        };
+        foreach (var marker in markers)
+        {
+            var markerIndex = systemText.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (markerIndex >= 0)
+            {
+                var result = TryParseToolArray(systemText, markerIndex + marker.Length);
+                if (result.Count > 0) return result;
+            }
+        }
+
+        // Fallback: scan for any JSON array that looks like tool definitions
+        // ([{"type":"function","function":{...}},...])
+        var idx = 0;
+        while (idx < systemText.Length)
+        {
+            var bracket = systemText.IndexOf('[', idx);
+            if (bracket < 0) break;
+
+            var result = TryParseToolArray(systemText, bracket);
+            if (result.Count > 0) return result;
+
+            idx = bracket + 1;
+        }
+
+        return [];
+    }
+
+    private static List<OpenAiTool> TryParseToolArray(string text, int searchStart)
+    {
+        if (searchStart >= text.Length) return [];
+
+        var jsonStart = text.IndexOf('[', searchStart);
+        if (jsonStart < 0) return [];
+
+        var jsonEnd = FindMatchingBracket(text, jsonStart);
+        if (jsonEnd < 0) return [];
+
+        var json = text[jsonStart..(jsonEnd + 1)];
+        try
+        {
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var tools = JsonSerializer.Deserialize<List<OpenAiTool>>(json, options);
+            return tools?.Where(t => t.Function is not null && !string.IsNullOrWhiteSpace(t.Function.Name)).ToList() ?? [];
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static int FindMatchingBracket(string text, int start)
+    {
+        if (start >= text.Length || text[start] != '[')
+        {
+            return -1;
+        }
+
+        var depth = 0;
+        for (var i = start; i < text.Length; i++)
+        {
+            switch (text[i])
+            {
+                case '[':
+                    depth++;
+                    break;
+                case ']':
+                    depth--;
+                    if (depth == 0)
+                    {
+                        return i;
+                    }
+                    break;
+                case '"':
+                    i++;
+                    while (i < text.Length && text[i] != '"')
+                    {
+                        if (text[i] == '\\')
+                        {
+                            i++;
+                        }
+                        i++;
+                    }
+                    break;
+            }
+        }
+
+        return -1;
     }
 }
