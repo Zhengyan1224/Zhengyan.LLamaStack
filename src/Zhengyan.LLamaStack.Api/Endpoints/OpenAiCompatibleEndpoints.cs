@@ -235,7 +235,8 @@ public static class OpenAiCompatibleEndpoints
              string.Equals(propertyName, "output", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "output_text", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "text", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(propertyName, "delta", StringComparison.OrdinalIgnoreCase) ||
+             // "delta" is intentionally NOT redacted so SSE token-by-token
+             // streaming output is visible in debug logs.
              string.Equals(propertyName, "embedding", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "image_url", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(propertyName, "audio_url", StringComparison.OrdinalIgnoreCase) ||
