@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Zhengyan.LLamaStack.Api.OpenAi;
 
@@ -85,6 +86,18 @@ public sealed class OpenAiTool
     public string Type { get; set; } = "function";
 
     public OpenAiFunction? Function { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Name { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Description { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Parameters { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Strict { get; set; }
 }
 
 public sealed class OpenAiFunction

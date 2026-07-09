@@ -116,6 +116,7 @@ public sealed class OpenAiRequestMapper
             messages.Add(message);
         }
 
+        NormalizeOpenAiTools(request);
         ValidateUnsupportedResponsesFields(request);
         var toolChoice = ParseToolChoice(request.ToolChoice);
         var warnings = new List<string>();
@@ -1051,5 +1052,27 @@ public sealed class OpenAiRequestMapper
             ".opus" => "audio/opus",
             _ => expectedKind == "image" ? MediaTypeNames.Image.Png : "audio/wav"
         };
+    }
+
+    private static void NormalizeOpenAiTools(ResponsesRequest request)
+    {
+        if (request.Tools is null)
+        {
+            return;
+        }
+
+        foreach (var tool in request.Tools)
+        {
+            if (tool.Function is null && !string.IsNullOrWhiteSpace(tool.Name))
+            {
+                tool.Function = new OpenAiFunction
+                {
+                    Name = tool.Name,
+                    Description = tool.Description,
+                    Parameters = tool.Parameters,
+                    Strict = tool.Strict
+                };
+            }
+        }
     }
 }
