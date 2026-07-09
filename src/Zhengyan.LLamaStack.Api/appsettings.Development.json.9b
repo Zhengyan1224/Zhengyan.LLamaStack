@@ -2,23 +2,24 @@
   "Logging": {
     "LogLevel": {
       "Default": "Information",
-      "Microsoft.AspNetCore": "Warning"
+      "Microsoft.AspNetCore": "Warning",
+      "Zhengyan": "Debug"
     }
   },
   "LLamaStack": {
-    "DefaultModel": "local-gguf",
+    "DefaultModel": "qwen3.5-0.8b",
     "ModelId": "local-gguf",
     "ModelPath": "",
     "MmprojPath": "",
     "ContextSize": 4096,
-    "GpuLayerCount": 0,
-    "Threads": null,
-    "BatchThreads": null,
+    "GpuLayerCount": 1,
+    "Threads": 5,
+    "BatchThreads": 5,
     "BatchSize": 512,
     "UBatchSize": 512,
     "UseMemoryMap": true,
     "UseMemoryLock": false,
-    "FlashAttention": null,
+    "FlashAttention": true,
     "UseGpuForMtmd": false,
     "LoadModelOnStartup": false,
     "DefaultMaxTokens": 512,
@@ -29,7 +30,6 @@
     "AllowRemoteMedia": true,
     "AllowLocalMediaPaths": false,
     "MaxMediaBytes": 33554432,
-    "MaxImageDimension": 512,
     "Store": {
       "Provider": "Memory",
       "SqlitePath": "data/llamastack.db",
@@ -37,17 +37,18 @@
     },
     "Models": [
       {
-        "Id": "local-gguf",
-        "OwnedBy": "local",
-        "ModelPath": "",
-        "MmprojPath": "",
-        "ContextSize": 4096,
-        "GpuLayerCount": 0,
+        "Id": "qwen3.5-9b",
+        "OwnedBy": "qwen3.5-9b",
+        "ModelPath": "/home/zhengyan/models/Qwen3.5-9B/Qwen3.5-9B-Q8_0.gguf",
+        "MmprojPath": "/home/zhengyan/models/Qwen3.5-9B/mmproj-BF16.gguf",
+        "MaxConcurrency": 1,
+        "ContextSize": 40960,
+        "GpuLayerCount": 10,
         "Capabilities": {
           "ChatCompletions": true,
           "Responses": true,
           "TextInput": true,
-          "ImageInput": false,
+          "ImageInput": true,
           "AudioInput": false,
           "ToolCalling": true,
           "Streaming": true,
