@@ -87,6 +87,21 @@ if (corsOptions.Enabled)
 
 app.UseMiddleware<OpenApiKeyMiddleware>();
 
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/v1/responses", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Request.EnableBuffering();
+        using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
+        var body = await reader.ReadToEndAsync();
+        context.Request.Body.Position = 0;
+        var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+        logger.LogInformation("[RAW RESPONSES REQUEST] Body: {Body}", body);
+    }
+
+    await next();
+});
+
 OpenAiJson.Configure = ConfigureJson;
 app.MapOpenAiCompatibleEndpoints();
 
