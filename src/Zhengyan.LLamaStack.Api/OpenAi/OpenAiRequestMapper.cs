@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
+using SkiaSharp;
 using Zhengyan.LLamaStack.Api.Inference;
 using Zhengyan.LLamaStack.Api.Infrastructure;
 using Zhengyan.LLamaStack.Api.Options;
@@ -298,11 +299,14 @@ public sealed class OpenAiRequestMapper
                     AppendNonEmptyLine(textBuilder, GetString(part, "text"));
                     break;
                 case "image_url":
-                    media.Add(await ReadMediaAsync(ReadNestedUrl(part, "image_url") ?? GetString(part, "url"), expectedKind: "image", cancellationToken));
+                    var imageDetail = part.TryGetProperty("image_url", out var imgUrlEl) && imgUrlEl.ValueKind == JsonValueKind.Object
+                        ? GetString(imgUrlEl, "detail")
+                        : null;
+                    media.Add(await ReadMediaAsync(ReadNestedUrl(part, "image_url") ?? GetString(part, "url"), expectedKind: "image", cancellationToken, detail: imageDetail));
                     AppendNonEmptyLine(textBuilder, "[image]");
                     break;
                 case "input_image":
-                    media.Add(await ReadMediaAsync(GetString(part, "image_url") ?? GetString(part, "file_id"), expectedKind: "image", cancellationToken));
+                    media.Add(await ReadMediaAsync(GetString(part, "image_url") ?? GetString(part, "file_id"), expectedKind: "image", cancellationToken, detail: GetString(part, "detail")));
                     AppendNonEmptyLine(textBuilder, "[image]");
                     break;
                 case "input_audio":
@@ -325,7 +329,7 @@ public sealed class OpenAiRequestMapper
         return (textBuilder.ToString(), media);
     }
 
-    private async Task<InferenceMedia> ReadMediaAsync(string? source, string expectedKind, CancellationToken cancellationToken)
+    private async Task<InferenceMedia> ReadMediaAsync(string? source, string expectedKind, CancellationToken cancellationToken, string? detail = null)
     {
         if (string.IsNullOrWhiteSpace(source))
         {
@@ -334,14 +338,16 @@ public sealed class OpenAiRequestMapper
 
         if (source.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
         {
-            return ReadDataUrl(source, expectedKind);
+            return ReadDataUrl(source, expectedKind, detail);
         }
 
         if (IsLikelyBase64(source))
         {
             var bytes = Convert.FromBase64String(source);
             ValidateMediaSize(bytes.Length);
-            return new InferenceMedia { Source = "inline", MimeType = GuessMimeType(bytes, expectedKind), Bytes = bytes };
+            var mimeType = GuessMimeType(bytes, expectedKind);
+            bytes = MaybeResizeImage(bytes, mimeType, detail);
+            return new InferenceMedia { Source = "inline", MimeType = mimeType, Bytes = bytes };
         }
 
         if (Uri.TryCreate(source, UriKind.Absolute, out var uri) && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
@@ -365,6 +371,7 @@ public sealed class OpenAiRequestMapper
             ValidateMediaSize(bytes.Length);
             var mimeType = response.Content.Headers.ContentType?.MediaType ?? GuessMimeType(bytes, expectedKind);
             ValidateMediaKind(mimeType, expectedKind);
+            bytes = MaybeResizeImage(bytes, mimeType, detail);
             return new InferenceMedia
             {
                 Source = uri.ToString(),
@@ -386,6 +393,7 @@ public sealed class OpenAiRequestMapper
         var fileInfo = new FileInfo(source);
         ValidateMediaSize(fileInfo.Length);
         var fileBytes = await File.ReadAllBytesAsync(source, cancellationToken);
+        fileBytes = MaybeResizeImage(fileBytes, GuessMimeTypeFromExtension(fileInfo.Extension, expectedKind), detail);
         return new InferenceMedia
         {
             Source = fileInfo.FullName,
@@ -394,7 +402,7 @@ public sealed class OpenAiRequestMapper
         };
     }
 
-    private InferenceMedia ReadDataUrl(string dataUrl, string expectedKind)
+    private InferenceMedia ReadDataUrl(string dataUrl, string expectedKind, string? detail = null)
     {
         var commaIndex = dataUrl.IndexOf(',');
         if (commaIndex < 0)
@@ -411,7 +419,125 @@ public sealed class OpenAiRequestMapper
 
         ValidateMediaKind(mimeType, expectedKind);
         ValidateMediaSize(bytes.Length);
+        bytes = MaybeResizeImage(bytes, mimeType, detail);
         return new InferenceMedia { Source = "data-url", MimeType = mimeType, Bytes = bytes };
+    }
+
+    private byte[] MaybeResizeImage(byte[] imageBytes, string mimeType, string? detail)
+    {
+        if (!ImageMimeTypes.Contains(mimeType))
+        {
+            return imageBytes;
+        }
+
+        int? configMax = _options.MaxImageDimension;
+        if (configMax < 0 && string.IsNullOrWhiteSpace(detail))
+        {
+            return imageBytes;
+        }
+
+        return ResizeImageWithSkia(imageBytes, configMax, detail);
+    }
+
+    private static byte[] ResizeImageWithSkia(byte[] imageBytes, int? configMaxDimension, string? detail)
+    {
+        try
+        {
+            using var input = new SKMemoryStream(imageBytes);
+            using var bitmap = SKBitmap.Decode(input);
+            if (bitmap is null)
+            {
+                return imageBytes;
+            }
+
+            var width = bitmap.Width;
+            var height = bitmap.Height;
+
+            int targetWidth, targetHeight;
+            if (configMaxDimension >= 0)
+            {
+                if (width <= configMaxDimension && height <= configMaxDimension)
+                {
+                    return imageBytes;
+                }
+
+                var scale = Math.Min((double)configMaxDimension / width, (double)configMaxDimension / height);
+                if (scale >= 1.0)
+                {
+                    return imageBytes;
+                }
+
+                targetWidth = (int)(width * scale);
+                targetHeight = (int)(height * scale);
+            }
+            else
+            {
+                switch (detail?.ToLowerInvariant())
+                {
+                    case "low":
+                        if (width <= 512 && height <= 512)
+                        {
+                            return imageBytes;
+                        }
+
+                        var lowScale = Math.Min(512.0 / width, 512.0 / height);
+                        if (lowScale >= 1.0)
+                        {
+                            return imageBytes;
+                        }
+
+                        targetWidth = (int)(width * lowScale);
+                        targetHeight = (int)(height * lowScale);
+                        break;
+
+                    case "high":
+                    {
+                        var shortest = Math.Min(width, height);
+                        var longest = Math.Max(width, height);
+
+                        if (shortest <= 768 && longest <= 2048)
+                        {
+                            return imageBytes;
+                        }
+
+                        var highScale = 768.0 / shortest;
+                        if (longest * highScale > 2048)
+                        {
+                            highScale = 2048.0 / longest;
+                        }
+
+                        if (highScale >= 1.0)
+                        {
+                            return imageBytes;
+                        }
+
+                        targetWidth = (int)(width * highScale);
+                        targetHeight = (int)(height * highScale);
+                        break;
+                    }
+
+                    default:
+                        return imageBytes;
+                }
+            }
+
+            targetWidth = Math.Max(1, targetWidth);
+            targetHeight = Math.Max(1, targetHeight);
+
+            using var resized = bitmap.Resize(new SKImageInfo(targetWidth, targetHeight), new SKSamplingOptions(SKFilterMode.Linear));
+            if (resized is null)
+            {
+                return imageBytes;
+            }
+
+            using var image = SKImage.FromBitmap(resized);
+            using var data = image.Encode(SKEncodedImageFormat.Jpeg, 85);
+            return data.ToArray();
+        }
+        catch
+        {
+            return imageBytes;
+        }
     }
 
     private async Task<byte[]> ReadRemoteMediaBytesAsync(HttpContent content, CancellationToken cancellationToken)

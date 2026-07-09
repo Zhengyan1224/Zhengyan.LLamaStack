@@ -52,6 +52,8 @@ public sealed class LLamaStackOptions
 
     public long MaxMediaBytes { get; set; } = 32 * 1024 * 1024;
 
+    public int MaxImageDimension { get; set; } = -1;
+
     public LLamaModelCapabilitiesOptions? Capabilities { get; set; }
 
     public int? MaxConcurrency { get; set; }

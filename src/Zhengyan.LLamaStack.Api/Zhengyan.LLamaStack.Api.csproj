@@ -11,6 +11,7 @@
     <PackageReference Include="LLamaSharp.Backend.Cuda12" Version="0.27.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
     <PackageReference Include="Npgsql" Version="10.0.0" />
+    <PackageReference Include="SkiaSharp" Version="4.150.0" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
     <PackageReference Include="StackExchange.Redis" Version="2.8.31" />
   </ItemGroup>
