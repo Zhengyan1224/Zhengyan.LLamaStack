@@ -60,17 +60,9 @@ public sealed class InfrastructureBehaviorTests
         typeof(LLamaInferenceService).GetMethod("AddToolProtocolRepairNudge", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new InvalidOperationException("AddToolProtocolRepairNudge method was not found.");
 
-    private static readonly MethodInfo AddToolResultContinuationNudgeMethod =
-        typeof(LLamaInferenceService).GetMethod("AddToolResultContinuationNudge", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("AddToolResultContinuationNudge method was not found.");
-
-    private static readonly MethodInfo AddToolResultAnswerNudgeMethod =
-        typeof(LLamaInferenceService).GetMethod("AddToolResultAnswerNudge", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("AddToolResultAnswerNudge method was not found.");
-
-    private static readonly MethodInfo IsToolResultContinuationFailureMethod =
-        typeof(LLamaInferenceService).GetMethod("IsToolResultContinuationFailure", BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new InvalidOperationException("IsToolResultContinuationFailure method was not found.");
+    private static readonly MethodInfo CreateToolResultAnswerNudgeMethod =
+        typeof(LLamaInferenceService).GetMethod("CreateToolResultAnswerNudge", BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException("CreateToolResultAnswerNudge method was not found.");
 
     [Fact]
     public async Task MemoryStore_PersistsAndUpdatesResponseTasks()
@@ -506,68 +498,6 @@ public sealed class InfrastructureBehaviorTests
 
     }
     [Fact]
-    public void ToolResultContinuation_TreatsThinkAndPartialJsonAsFailure()
-    {
-        Assert.True(IsToolResultContinuationFailure("<think>"));
-        Assert.True(IsToolResultContinuationFailure("{"));
-        Assert.True(IsToolResultContinuationFailure("{\"name\""));
-        Assert.False(IsToolResultContinuationFailure("The weather is sunny."));
-    }
-
-    [Fact]
-    public void ToolResultContinuationNudge_UsesCompactContext()
-    {
-        var request = CreateToolInferenceRequest("run_command");
-        request.Messages =
-        [
-            new InferenceMessage { Role = "system", Content = "system prompt" },
-            new InferenceMessage { Role = "user", Content = "hello" },
-            new InferenceMessage { Role = "assistant", Content = "hello response" },
-            new InferenceMessage { Role = "user", Content = "inspect host status" },
-            new InferenceMessage
-            {
-                Role = "tool",
-                Content = """{"ok":false,"command":"bad","exitCode":1,"stdout":"","stderr":"failed"}""",
-                ToolCallId = "call_1"
-            }
-        ];
-
-        var retry = AddToolResultContinuationNudge(request);
-
-        Assert.Equal(4, retry.Messages.Count);
-        Assert.Equal("system prompt", retry.Messages[0].Content);
-        Assert.Equal("inspect host status", retry.Messages[1].Content);
-        Assert.Equal("tool", retry.Messages[2].Role);
-        Assert.StartsWith("Continue the original task from the tool result.", retry.Messages[3].Content);
-        Assert.Equal(0, retry.Temperature);
-        Assert.DoesNotContain(retry.Messages, message => message.Content == "hello response");
-    }
-
-    [Fact]
-    public void ToolResultAnswerNudge_DisablesToolsAndAsksForNaturalAnswer()
-    {
-        var request = CreateToolInferenceRequest("run_command");
-        request.Messages =
-        [
-            new InferenceMessage { Role = "user", Content = "inspect host status" },
-            new InferenceMessage
-            {
-                Role = "tool",
-                Content = """{"ok":false,"command":"curl","exitCode":3,"stdout":"","stderr":""}""",
-                ToolCallId = "call_1"
-            }
-        ];
-
-        var answer = AddToolResultAnswerNudge(request);
-
-        Assert.Empty(answer.Tools);
-        Assert.Equal(InferenceToolChoiceMode.None, answer.ToolChoiceMode);
-        Assert.False(answer.ForceToolCallJson);
-        Assert.False(answer.ForceJson);
-        Assert.Contains("explain that naturally", answer.Messages[^1].Content);
-    }
-
-    [Fact]
     public void InferenceParams_UsesManualOverflowManagement()
     {
         var model = new LLamaModelRuntimeOptions
@@ -805,22 +735,10 @@ public sealed class InfrastructureBehaviorTests
         return (InferenceRequest)AddToolProtocolRepairNudgeMethod.Invoke(null, parameters)!;
     }
 
-    private static InferenceRequest AddToolResultContinuationNudge(InferenceRequest request)
+    private static InferenceRequest CreateToolResultAnswerNudge(InferenceRequest request)
     {
         object?[] parameters = [request];
-        return (InferenceRequest)AddToolResultContinuationNudgeMethod.Invoke(null, parameters)!;
-    }
-
-    private static InferenceRequest AddToolResultAnswerNudge(InferenceRequest request)
-    {
-        object?[] parameters = [request];
-        return (InferenceRequest)AddToolResultAnswerNudgeMethod.Invoke(null, parameters)!;
-    }
-
-    private static bool IsToolResultContinuationFailure(string cleanText)
-    {
-        object?[] parameters = [cleanText];
-        return (bool)IsToolResultContinuationFailureMethod.Invoke(null, parameters)!;
+        return (InferenceRequest)CreateToolResultAnswerNudgeMethod.Invoke(null, parameters)!;
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory

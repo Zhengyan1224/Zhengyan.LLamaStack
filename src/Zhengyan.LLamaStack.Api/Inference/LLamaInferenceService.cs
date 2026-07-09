@@ -285,33 +285,18 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                 }
             }
 
-            if (toolCalls.Count == 0 && HasTerminalToolResultMessage(request) && IsToolResultContinuationFailure(cleanText))
+            if (toolCalls.Count == 0 && IsLastMessageToolResult(request) && IsNonAnswer(cleanText))
             {
-                var toolResultRequest = request;
-                var retryRequest = AddToolResultContinuationNudge(toolResultRequest);
+                var answerRequest = CreateToolResultAnswerNudge(request);
                 createdText.Clear();
-                await foreach (var token in StreamTextAsync(retryRequest, loaded, model, cancellationToken))
+                await foreach (var token in StreamTextAsync(answerRequest, loaded, model, cancellationToken))
                 {
                     createdText.Append(token);
                 }
 
-                request = retryRequest;
+                request = answerRequest;
                 text = createdText.ToString();
                 toolCalls = TryExtractToolCalls(text, request, out cleanText);
-
-                if (toolCalls.Count == 0 && IsToolResultContinuationFailure(cleanText))
-                {
-                    var answerRequest = AddToolResultAnswerNudge(toolResultRequest);
-                    createdText.Clear();
-                    await foreach (var token in StreamTextAsync(answerRequest, loaded, model, cancellationToken))
-                    {
-                        createdText.Append(token);
-                    }
-
-                    request = answerRequest;
-                    text = createdText.ToString();
-                    toolCalls = TryExtractToolCalls(text, request, out cleanText);
-                }
             }
 
             if (request.StrictJsonSchema && toolCalls.Count == 0 && !string.IsNullOrWhiteSpace(request.JsonSchema) && !string.IsNullOrWhiteSpace(cleanText))
@@ -1553,14 +1538,6 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             var content = requestMessage.Content ?? string.Empty;
 
             var normalizedRole = NormalizeTemplateRole(requestMessage.Role);
-            if (IsToolResultRole(requestMessage.Role))
-            {
-                messages.Add(("user", FormatToolResultForPrompt(
-                    requestMessage,
-                    content,
-                    IsTerminalToolResultMessage(request.Messages, messageIndex))));
-                continue;
-            }
 
             if (requestMessage.Media.Count > 0)
             {
@@ -1569,6 +1546,13 @@ public sealed class LLamaInferenceService : IAsyncDisposable
                     media.Add(item);
                     content = AppendMediaMarker(content, mediaMarker);
                 }
+            }
+
+            // Tool role messages are rendered by the chat template; skip text prefixes.
+            if (string.Equals(normalizedRole, "tool", StringComparison.OrdinalIgnoreCase))
+            {
+                messages.Add((normalizedRole, content));
+                continue;
             }
 
             if (!string.IsNullOrWhiteSpace(requestMessage.Name))
@@ -1606,154 +1590,32 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         return messages;
     }
 
-    private static string FormatToolResultForPrompt(InferenceMessage message, string content, bool includeContinuationInstruction)
-    {
-        var builder = new StringBuilder();
-        builder.AppendLine("Tool result received.");
-        if (!string.IsNullOrWhiteSpace(message.ToolCallId))
-        {
-            builder.AppendLine("tool_call_id: " + message.ToolCallId);
-        }
-
-        if (!string.IsNullOrWhiteSpace(message.Name))
-        {
-            builder.AppendLine("tool_name: " + message.Name);
-        }
-
-        builder.AppendLine("tool_output:");
-        builder.AppendLine(content);
-        if (includeContinuationInstruction)
-        {
-            builder.AppendLine();
-            builder.AppendLine("Continue the user's original task now. If this result is successful, answer the user. If it failed, call another appropriate tool with corrected arguments or explain the failure. Do not return an empty message.");
-        }
-
-        return builder.ToString().TrimEnd();
-    }
-
-    private static bool HasTerminalToolResultMessage(InferenceRequest request)
-    {
-        for (var i = request.Messages.Count - 1; i >= 0; i--)
-        {
-            if (string.Equals(request.Messages[i].Role, "system", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            return IsToolResultRole(request.Messages[i].Role);
-        }
-
-        return false;
-    }
-
-    private static InferenceMessage? GetLastToolResultMessage(InferenceRequest request)
-    {
-        return request.Messages.LastOrDefault(message => IsToolResultRole(message.Role));
-    }
-
-    private static bool IsTerminalToolResultMessage(IReadOnlyList<InferenceMessage> messages, int index)
-    {
-        for (var i = index + 1; i < messages.Count; i++)
-        {
-            if (string.Equals(messages[i].Role, "system", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            return false;
-        }
-
-        return IsToolResultRole(messages[index].Role);
-    }
-
-    private static bool IsToolResultRole(string role)
-    {
-        return string.Equals(role, "tool", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(role, "function", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static InferenceRequest AddToolResultContinuationNudge(InferenceRequest request)
-    {
-        var messages = BuildToolResultContinuationMessages(request, new InferenceMessage
-        {
-            Role = "user",
-            Content = "Continue the original task from the tool result. If the tool result succeeded, answer the user from it. If it failed, either call one corrected registered tool or give the user a brief natural-language explanation of the failure. Do not return an empty response."
-        });
-
-        var warnings = request.CompatibilityWarnings
-            .Concat(["Model returned a non-answer after a tool result; retried once with a compact continuation prompt."])
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-
-        var retryRequest = request.WithMessages(messages, warnings);
-        retryRequest.Temperature = 0;
-        retryRequest.MaxTokens = ResolveToolRetryMaxTokens(retryRequest.MaxTokens);
-        return retryRequest;
-    }
-
-    private static InferenceRequest AddToolResultAnswerNudge(InferenceRequest request)
-    {
-        var messages = BuildToolResultContinuationMessages(request, new InferenceMessage
-        {
-            Role = "user",
-            Content = "Write the final user-facing answer now using only the previous tool result. If the tool failed or returned no useful data, explain that naturally and briefly. Do not call another tool. Do not output JSON, Markdown code fences, or an empty message."
-        });
-
-        var warnings = request.CompatibilityWarnings
-            .Concat(["Model returned a non-answer after a tool result; retried once with a compact final-answer prompt."])
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-
-        var answerRequest = request.WithMessages(messages, warnings);
-        answerRequest.Tools = [];
-        answerRequest.ToolChoiceMode = InferenceToolChoiceMode.None;
-        answerRequest.ToolChoiceName = null;
-        answerRequest.ForceToolCallJson = false;
-        answerRequest.ForceJson = false;
-        answerRequest.Temperature = 0;
-        answerRequest.MaxTokens = Math.Clamp(answerRequest.MaxTokens ?? 256, 64, 512);
-        return answerRequest;
-    }
-
-    private static IReadOnlyList<InferenceMessage> BuildToolResultContinuationMessages(
-        InferenceRequest request,
-        InferenceMessage nudgeMessage)
+    private static InferenceRequest CreateToolResultAnswerNudge(InferenceRequest request)
     {
         var messages = new List<InferenceMessage>();
-        var systemMessage = request.Messages.FirstOrDefault(message => IsSystemRole(message.Role));
-        if (systemMessage is not null)
+        var systemMsg = request.Messages.FirstOrDefault(m => IsSystemRole(m.Role));
+        if (systemMsg is not null) messages.Add(systemMsg);
+
+        var lastUser = request.Messages.LastOrDefault(m => string.Equals(m.Role, "user", StringComparison.OrdinalIgnoreCase));
+        var lastAssistant = request.Messages.LastOrDefault(m => string.Equals(m.Role, "assistant", StringComparison.OrdinalIgnoreCase));
+        var lastTool = request.Messages.LastOrDefault(m => string.Equals(m.Role, "tool", StringComparison.OrdinalIgnoreCase));
+
+        if (lastUser is not null && lastUser != systemMsg) messages.Add(lastUser);
+        if (lastAssistant is not null) messages.Add(lastAssistant);
+        if (lastTool is not null) messages.Add(lastTool);
+
+        messages.Add(new InferenceMessage
         {
-            messages.Add(systemMessage);
-        }
+            Role = "user",
+            Content = "Based on the tool result above, provide a complete answer to the user's original request. If the tool failed, explain briefly."
+        });
 
-        var latestTask = FindLatestUserTaskMessage(request) ?? FindLatestTaskMessage(request);
-        if (latestTask is not null)
-        {
-            messages.Add(latestTask);
-        }
-
-        var toolResult = GetLastToolResultMessage(request);
-        if (toolResult is not null)
-        {
-            messages.Add(toolResult);
-        }
-
-        messages.Add(nudgeMessage);
-        return messages;
-    }
-
-    private static bool IsToolResultContinuationFailure(string text)
-    {
-        if (IsNonAnswer(text))
-        {
-            return true;
-        }
-
-        var trimmed = text.Trim();
-        return trimmed is "{" or "[" or "{\"" or "[{" ||
-            trimmed.StartsWith("{\"tool_calls\"", StringComparison.Ordinal) ||
-            trimmed.StartsWith("{\"function_call\"", StringComparison.Ordinal) ||
-            trimmed.StartsWith("{\"name\"", StringComparison.Ordinal);
+        var retry = request.WithMessages(messages);
+        retry.Temperature = 0;
+        retry.ToolChoiceMode = InferenceToolChoiceMode.None;
+        retry.Tools = [];
+        retry.MaxTokens = Math.Clamp(retry.MaxTokens ?? 256, 64, 512);
+        return retry;
     }
 
     private static bool IsNonAnswer(string text)
@@ -1766,7 +1628,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         if (request.Tools.Count == 0 ||
             request.ToolChoiceMode == InferenceToolChoiceMode.None ||
-            HasTerminalToolResultMessage(request))
+            IsLastMessageToolResult(request))
         {
             return false;
         }
@@ -1778,6 +1640,19 @@ public sealed class LLamaInferenceService : IAsyncDisposable
 
         var text = cleanText.Trim();
         return text.Length == 0 || ContainsOnlyMarkupTagsAndWhitespace(text);
+    }
+
+    private static bool IsLastMessageToolResult(InferenceRequest request)
+    {
+        for (var i = request.Messages.Count - 1; i >= 0; i--)
+        {
+            if (!string.Equals(request.Messages[i].Role, "system", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Equals(request.Messages[i].Role, "tool", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        return false;
     }
 
     private static bool IsInvalidToolProtocolRetryOutput(string cleanText)
@@ -1913,8 +1788,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
     {
         return content.StartsWith("Retry the same request by calling", StringComparison.Ordinal) ||
             content.StartsWith("The previous tool-call JSON was invalid.", StringComparison.Ordinal) ||
-            content.StartsWith("Continue the original task from the tool result.", StringComparison.Ordinal) ||
-            content.StartsWith("Write the final user-facing answer now", StringComparison.Ordinal) ||
+            content.StartsWith("Based on the tool result above", StringComparison.Ordinal) ||
             content.StartsWith("The previous assistant message was not a valid final answer", StringComparison.Ordinal);
     }
 
@@ -2069,7 +1943,6 @@ ws ::= [ \t\n\r]*
             builder.AppendLine("When calling a tool, do not output reasoning, Markdown, prose, or any text outside JSON. The first non-whitespace character must be `{`. Respond only with one complete JSON object in this simple shape:");
             builder.AppendLine("""{"name":"tool_name","arguments":{"arg":"value"}}""");
         }
-        builder.AppendLine("When a tool result is provided, continue the task. If the tool succeeded, answer the user from the tool result. If it failed, call another appropriate tool with corrected arguments or explain the failure. Never return an empty message after a tool result.");
         builder.AppendLine("If the request can be answered without any registered tool, answer normally.");
         if (request.ForceJson)
         {
