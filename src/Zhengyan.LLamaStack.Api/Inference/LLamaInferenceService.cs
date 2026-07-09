@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
@@ -1330,10 +1331,18 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             param: "messages");
     }
 
+    private static readonly FieldInfo? _isPromptRunField = typeof(InteractiveExecutor)
+        .GetField("_is_prompt_run", BindingFlags.NonPublic | BindingFlags.Instance);
+
     private static void ResetExecutorState(LoadedModel loaded)
     {
         loaded.Context.NativeHandle.MemoryClear();
         loaded.Executor.Embeds.Clear();
+        // Reset _is_prompt_run to true so the next InferAsync call treats the
+        // prompt as a first-run (fresh) inference rather than a continuation.
+        // If left false, PreprocessInputs subtracts the prompt length from
+        // RemainedTokens, causing PostProcess to stop after 1 token.
+        _isPromptRunField?.SetValue(loaded.Executor, true);
     }
 
     private static void CleanupMedia(LoadedModel loaded)
