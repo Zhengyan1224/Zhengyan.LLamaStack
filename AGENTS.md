@@ -45,4 +45,5 @@ dotnet run --project src/Zhengyan.LLamaStack.Api
 ## Testing quirks
 
 - Tests access private static methods of `LLamaInferenceService` via `BindingFlags.NonPublic | BindingFlags.Static` reflection.
-- No integration tests; no external service dependencies for tests.
+- No integration tests; no external service dependencies for tests
+.
