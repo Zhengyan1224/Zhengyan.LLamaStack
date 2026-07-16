@@ -304,6 +304,9 @@ curl -s http://localhost:5062/health
 | `AllowLocalMediaPaths` | 允许请求体引用本地文件路径。除非确有需要，否则应保持关闭。 |
 | `MaxMediaBytes` | 单个媒体输入的最大字节数。 |
 | `MaxImageDimension` | 图片缩放阈值（像素）。`-1` 时禁用缩放，改用请求中的 `detail` 参数；`> 0` 时强制缩放到该像素数以内。 |
+| `EnableThinking` | 是否启用思考/推理模式（默认 `true`）。开启后模型输出的 `<think>`...`</think>` 内容会被提取为 `reasoning_content`，不混入最终文本。 |
+| `ThinkingStartTag` | 思考内容起始标记（默认 `<think>`）。见下方"思考/推理模式"了解各模型常用值。 |
+| `ThinkingEndTag` | 思考内容结束标记（默认 `</think>`）。见下方"思考/推理模式"了解各模型常用值。 |
 | `Store.Provider` | `Memory`、`Sqlite`、`Postgres` 或 `Redis`。 |
 | `Store.SqlitePath` | SQLite 数据库路径。 |
 | `Store.ConnectionString` | PostgreSQL 或 Redis 连接字符串。 |
@@ -315,6 +318,9 @@ curl -s http://localhost:5062/health
 | `Models[].MmprojPath` | 该模型的 mmproj 路径。 |
 | `Models[].MaxConcurrency` | 该模型的 runtime context/executor 实例数量。 |
 | `Models[].Capabilities` | 用于 `/v1/models` 和请求校验的能力声明。 |
+| `Models[].EnableThinking` | 覆盖该模型的 thinking 开关。不设置则继承顶层 `EnableThinking`。 |
+| `Models[].ThinkingStartTag` | 覆盖该模型的思考起始标记。不设置则继承顶层 `ThinkingStartTag`。 |
+| `Models[].ThinkingEndTag` | 覆盖该模型的思考结束标记。不设置则继承顶层 `ThinkingEndTag`。 |
 | `EmbeddingModels[]` | 独立 Embedding 模型注册。Embedding 设置包含 `Dimensions`、GPU layers、线程、batch、内存选项和 `MaxConcurrency`。 |
 
 ## 模型准备
@@ -1098,6 +1104,87 @@ curl -s http://localhost:5062/v1/chat/completions \
   - `"low"`：缩放到 512×512 以内。
   - `"high"`：最短边缩到 768px；如最长边超过 2048px 再缩到 2048px。
 - 缩放使用 SkiaSharp 解码并重编码为 JPEG（质量 85），失败时自动回退到原始 bytes。
+
+### 思考/推理模式
+
+服务端支持从模型生成文本中提取思考（reasoning）内容。开启后（默认开启），模型输出中的 `ThinkingStartTag`...`ThinkingEndTag` 内容会被分离为 `reasoning_content`，不会混入最终输出文本。
+
+**Chat Completions 流式响应**中，思考部分以 `delta.reasoning_content` 字段发送：
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "delta": { "reasoning_content": "Let me think about this..." }
+  }]
+}
+```
+
+**Responses API 流式响应**中，思考部分以 `type: "response.reasoning_text.delta"` 事件发送：
+
+```json
+{
+  "type": "response.reasoning_text.delta",
+  "delta": "Let me think about this..."
+}
+```
+
+**非流式 Chat Completions** 中，思考内容以 `message.reasoning_content` 字段返回；**非流式 Responses** 中，思考内容以 `type: "reasoning"` 的输出项返回。
+
+可通过配置关闭思考提取：
+
+```json
+{
+  "LLamaStack": {
+    "EnableThinking": false
+  }
+}
+```
+
+或为单个模型关闭：
+
+```json
+{
+  "LLamaStack": {
+    "Models": [
+      {
+        "Id": "my-model",
+        "EnableThinking": false
+      }
+    ]
+  }
+}
+```
+
+#### 常见模型的思考标记
+
+不同的模型使用不同的标记来标识思考内容：
+
+| 模型 | ThinkingStartTag | ThinkingEndTag |
+|---|---|---|
+| DeepSeek R1 / DeepSeek V3 | `<think>` | `</think>` |
+| QwQ-32B (Qwen) | `<think>` | `</think>` |
+| Ministral 3 | `[THINK]` | `[/THINK]` |
+| Gemma 4 | `<\|channel>thought` | `<channel\|>` |
+| Cohere 2 (Command R) | `<\|START_THINKING\|>` | `<\|END_THINKING\|>` |
+
+对于非标准标记的模型，在 `Models[]` 中配置即可：
+
+```json
+{
+  "LLamaStack": {
+    "Models": [
+      {
+        "Id": "ministral",
+        "ThinkingStartTag": "[THINK]",
+        "ThinkingEndTag": "[/THINK]"
+      }
+    ]
+  }
+}
+```
+
+思考提取不会影响 token 计数 —— 思考 token 仍然会计入 `completion_tokens`。
 
 ## 桌面调试客户端
 

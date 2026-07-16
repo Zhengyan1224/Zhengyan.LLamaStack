@@ -181,6 +181,8 @@ public sealed class InferenceCompletion
 
     public string Text { get; init; } = string.Empty;
 
+    public string? ReasoningContent { get; init; }
+
     public IReadOnlyList<OpenAiToolCall> ToolCalls { get; init; } = [];
 
     public IReadOnlyList<InferenceChoice> Choices { get; init; } = [];

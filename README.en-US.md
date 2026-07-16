@@ -304,6 +304,9 @@ The main configuration section is `LLamaStack`. `Models[]` is the recommended sh
 | `AllowLocalMediaPaths` | Allows local file paths in request bodies. Keep disabled unless needed. |
 | `MaxMediaBytes` | Maximum bytes per media input. |
 | `MaxImageDimension` | Image resize threshold in pixels. `-1` disables the threshold and defers to the request's `detail` field; `> 0` forces the image to fit within this value on its longest side. |
+| `EnableThinking` | Whether to enable thinking/reasoning mode (default `true`). When enabled, content wrapped by `ThinkingStartTag`...`ThinkingEndTag` is extracted as `reasoning_content` and kept separate from the final output text. |
+| `ThinkingStartTag` | Thinking content start marker (default `<think>`). See "Thinking/Reasoning Mode" below for common model values. |
+| `ThinkingEndTag` | Thinking content end marker (default `</think>`). See "Thinking/Reasoning Mode" below for common model values. |
 | `Store.Provider` | `Memory`, `Sqlite`, `Postgres`, or `Redis`. |
 | `Store.SqlitePath` | SQLite database path. |
 | `Store.ConnectionString` | PostgreSQL or Redis connection string. |
@@ -315,6 +318,9 @@ The main configuration section is `LLamaStack`. `Models[]` is the recommended sh
 | `Models[].MmprojPath` | mmproj path for this model. |
 | `Models[].MaxConcurrency` | Number of runtime context/executor instances for this model. |
 | `Models[].Capabilities` | Capability declaration used for `/v1/models` and request validation. |
+| `Models[].EnableThinking` | Override thinking toggle for this model. Inherits from top-level `EnableThinking` when unset. |
+| `Models[].ThinkingStartTag` | Override thinking start marker for this model. Inherits from top-level `ThinkingStartTag` when unset. |
+| `Models[].ThinkingEndTag` | Override thinking end marker for this model. Inherits from top-level `ThinkingEndTag` when unset. |
 | `EmbeddingModels[]` | Dedicated embedding model registry. Embedding settings include `Dimensions`, GPU layers, threads, batch size, memory options, and `MaxConcurrency`. |
 
 ## Model Preparation
@@ -1098,6 +1104,87 @@ Image input supports server-side resizing, controlled by `LLamaStack:MaxImageDim
   - `"low"`: resized to fit within 512×512.
   - `"high"`: shortest side scaled to 768px; if the longest side then exceeds 2048px, capped at 2048px.
 - Resizing uses SkiaSharp to decode and re-encode as JPEG (quality 85). Falls back to the original bytes on failure.
+
+### Thinking / Reasoning Mode
+
+The server supports extracting thinking (reasoning) content from the model's generated text. When enabled (default), any content wrapped by `ThinkingStartTag`...`ThinkingEndTag` in the model output is separated into `reasoning_content` and not merged into the final text.
+
+**Streaming Chat Completions** deliver thinking content via the `delta.reasoning_content` field:
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "delta": { "reasoning_content": "Let me think about this..." }
+  }]
+}
+```
+
+**Streaming Responses API** deliver thinking content via `type: "response.reasoning_text.delta"` events:
+
+```json
+{
+  "type": "response.reasoning_text.delta",
+  "delta": "Let me think about this..."
+}
+```
+
+**Non-streaming Chat Completions** include thinking as `message.reasoning_content`; **non-streaming Responses** include it as a `type: "reasoning"` output item.
+
+Disable thinking extraction globally:
+
+```json
+{
+  "LLamaStack": {
+    "EnableThinking": false
+  }
+}
+```
+
+Or per-model:
+
+```json
+{
+  "LLamaStack": {
+    "Models": [
+      {
+        "Id": "my-model",
+        "EnableThinking": false
+      }
+    ]
+  }
+}
+```
+
+#### Common Model Thinking Markers
+
+Different models use different markers for thinking content:
+
+| Model | ThinkingStartTag | ThinkingEndTag |
+|---|---|---|
+| DeepSeek R1 / DeepSeek V3 | `<think>` | `</think>` |
+| QwQ-32B (Qwen) | `<think>` | `</think>` |
+| Ministral 3 | `[THINK]` | `[/THINK]` |
+| Gemma 4 | `<\|channel>thought` | `<channel\|>` |
+| Cohere 2 (Command R) | `<\|START_THINKING\|>` | `<\|END_THINKING\|>` |
+
+Configure custom markers per model:
+
+```json
+{
+  "LLamaStack": {
+    "Models": [
+      {
+        "Id": "ministral",
+        "ThinkingStartTag": "[THINK]",
+        "ThinkingEndTag": "[/THINK]"
+      }
+    ]
+  }
+}
+```
+
+Thinking extraction does not affect token counting — thinking tokens are still included in `completion_tokens`.
 
 ## Desktop Debug Client
 

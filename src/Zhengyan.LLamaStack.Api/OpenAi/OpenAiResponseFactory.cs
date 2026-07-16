@@ -33,8 +33,8 @@ public static class OpenAiResponseFactory
             return completion.Choices.Select(c =>
             {
                 var choiceMessage = c.ToolCalls.Count > 0
-                    ? new ChatChoiceMessage("assistant", null, c.ToolCalls)
-                    : new ChatChoiceMessage("assistant", c.Text, null);
+                    ? new ChatChoiceMessage("assistant", null, c.ToolCalls, null)
+                    : new ChatChoiceMessage("assistant", c.Text, null, null);
                 return (object)new
                 {
                     index = c.Index,
@@ -45,8 +45,8 @@ public static class OpenAiResponseFactory
         }
 
         var message = completion.ToolCalls.Count > 0
-            ? new ChatChoiceMessage("assistant", null, completion.ToolCalls)
-            : new ChatChoiceMessage("assistant", completion.Text, null);
+            ? new ChatChoiceMessage("assistant", null, completion.ToolCalls, null)
+            : new ChatChoiceMessage("assistant", completion.Text, null, completion.ReasoningContent);
 
         return
         [
@@ -62,8 +62,8 @@ public static class OpenAiResponseFactory
     public static object ToChatCompletionResponse(StoredChatCompletion completion)
     {
         var message = completion.ToolCalls.Count > 0
-            ? new ChatChoiceMessage("assistant", null, completion.ToolCalls)
-            : new ChatChoiceMessage("assistant", completion.OutputText, null);
+            ? new ChatChoiceMessage("assistant", null, completion.ToolCalls, null)
+            : new ChatChoiceMessage("assistant", completion.OutputText, null, null);
 
         return new
         {
@@ -106,7 +106,8 @@ public static class OpenAiResponseFactory
             completion.PromptTokens,
             completion.CompletionTokens,
             completion.CompatibilityWarnings,
-            include);
+            include,
+            completion.ReasoningContent);
     }
 
     public static object ToResponsesResponse(StoredResponse response, IReadOnlyList<string>? include = null)
@@ -230,13 +231,30 @@ public static class OpenAiResponseFactory
         int inputTokens,
         int outputTokens,
         IReadOnlyList<string> compatibilityWarnings,
-        IReadOnlyList<string>? include = null)
+        IReadOnlyList<string>? include = null,
+        string? reasoningContent = null)
     {
         var wants = include is null || include.Count == 0
             ? null
             : new HashSet<string>(include, StringComparer.OrdinalIgnoreCase);
 
         var output = new List<object>();
+
+        if (!string.IsNullOrEmpty(reasoningContent) && (wants is null || wants.Contains("reasoning")))
+        {
+            output.Add(new
+            {
+                id = "reasoning_" + responseId,
+                type = "reasoning",
+                status,
+                reasoning = new
+                {
+                    summary = Array.Empty<object>(),
+                    text = reasoningContent
+                }
+            });
+        }
+
         if (!string.IsNullOrEmpty(outputText) && (wants is null || wants.Contains("output_text")))
         {
             output.Add(new
@@ -365,5 +383,5 @@ public static class OpenAiResponseFactory
         return value.GetType().GetProperty("id")?.GetValue(value);
     }
 
-    private sealed record ChatChoiceMessage(string Role, string? Content, IReadOnlyList<OpenAiToolCall>? ToolCalls);
+    private sealed record ChatChoiceMessage(string Role, string? Content, IReadOnlyList<OpenAiToolCall>? ToolCalls, string? ReasoningContent);
 }

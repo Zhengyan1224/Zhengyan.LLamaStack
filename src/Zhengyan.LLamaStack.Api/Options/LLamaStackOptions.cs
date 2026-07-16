@@ -54,6 +54,12 @@ public sealed class LLamaStackOptions
 
     public int MaxImageDimension { get; set; } = -1;
 
+    public bool EnableThinking { get; set; } = true;
+
+    public string ThinkingStartTag { get; set; } = "<think>";
+
+    public string ThinkingEndTag { get; set; } = "</think>";
+
     public LLamaModelCapabilitiesOptions? Capabilities { get; set; }
 
     public int? MaxConcurrency { get; set; }
@@ -135,7 +141,10 @@ public sealed class LLamaStackOptions
                     DefaultTopP = DefaultTopP,
                     DefaultTopK = DefaultTopK,
                     AntiPrompts = AntiPrompts,
-                    Capabilities = Capabilities
+                    Capabilities = Capabilities,
+                    EnableThinking = EnableThinking,
+                    ThinkingStartTag = ThinkingStartTag,
+                    ThinkingEndTag = ThinkingEndTag
                 }));
             }
         }
@@ -177,7 +186,10 @@ public sealed class LLamaStackOptions
             DefaultTopK = model.DefaultTopK ?? DefaultTopK,
             AntiPrompts = model.AntiPrompts ?? AntiPrompts,
             Capabilities = capabilities,
-            MaxConcurrency = Math.Max(1, model.MaxConcurrency ?? MaxConcurrency ?? 1)
+            MaxConcurrency = Math.Max(1, model.MaxConcurrency ?? MaxConcurrency ?? 1),
+            EnableThinking = model.EnableThinking ?? EnableThinking,
+            ThinkingStartTag = model.ThinkingStartTag ?? ThinkingStartTag,
+            ThinkingEndTag = model.ThinkingEndTag ?? ThinkingEndTag
         };
     }
 
@@ -254,6 +266,12 @@ public sealed class LLamaModelOptions
     public LLamaModelCapabilitiesOptions? Capabilities { get; set; }
 
     public int? MaxConcurrency { get; set; }
+
+    public bool? EnableThinking { get; set; }
+
+    public string? ThinkingStartTag { get; set; }
+
+    public string? ThinkingEndTag { get; set; }
 }
 
 public sealed class LLamaModelCapabilitiesOptions
@@ -345,6 +363,12 @@ public sealed class LLamaModelRuntimeOptions
     public LLamaModelCapabilities Capabilities { get; init; } = new();
 
     public int MaxConcurrency { get; init; } = 1;
+
+    public bool EnableThinking { get; init; } = true;
+
+    public string ThinkingStartTag { get; init; } = "<think>";
+
+    public string ThinkingEndTag { get; init; } = "</think>";
 }
 
 public sealed class LLamaAuthOptions

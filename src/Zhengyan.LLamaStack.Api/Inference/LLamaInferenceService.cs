@@ -320,11 +320,21 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             var prompt = BuildPrompt(loaded.Weights, request, loaded.MediaMarker, out _, out _);
             var completionTokens = CountTokens(loaded, cleanText);
             var finishReason = DetermineFinishReason(toolCalls.Count > 0, completionTokens, request.MaxTokens, model.Options.DefaultMaxTokens);
+
+            string? reasoningContent = null;
+            if (model.Options.EnableThinking && toolCalls.Count == 0 && !string.IsNullOrEmpty(cleanText))
+            {
+                var (thinking, _) = ExtractThinking(cleanText, model.Options.ThinkingStartTag, model.Options.ThinkingEndTag);
+                if (thinking.Length > 0)
+                    reasoningContent = thinking;
+            }
+
             return new InferenceCompletion
             {
                 Id = CreateCompletionId("chatcmpl"),
                 Model = model.Options.Id,
                 Text = cleanText,
+                ReasoningContent = reasoningContent,
                 ToolCalls = toolCalls,
                 FinishReason = finishReason,
                 PromptTokens = CountTokens(loaded, prompt),
@@ -647,28 +657,65 @@ public sealed class LLamaInferenceService : IAsyncDisposable
         {
         var (prompt, promptTokens, media, mediaCount) = BuildPromptWithCount(request, loaded, model);
         var inferenceParams = CreateInferenceParams(model.Options, request, promptTokens);
+        var thinkingEnabled = model.Options.EnableThinking;
+        var thinkingTracker = thinkingEnabled
+            ? new ThinkingTracker(model.Options.ThinkingStartTag, model.Options.ThinkingEndTag)
+            : null;
         var completion = new StringBuilder();
+        var fullText = new StringBuilder();
         await foreach (var token in StreamTextAsync(prompt, inferenceParams, loaded, media, mediaCount, cancellationToken))
         {
-            completion.Append(token);
-            var chunk = new
+            fullText.Append(token);
+            if (thinkingTracker is not null)
             {
-                id = responseId,
-                @object = "chat.completion.chunk",
-                created = UnixNow(),
-                model = model.Options.Id,
-                choices = new[]
+                thinkingTracker.Append(token);
+                var delta = new Dictionary<string, object?>();
+                if (thinkingTracker.ThinkingDelta.Length > 0)
+                    delta["reasoning_content"] = thinkingTracker.ThinkingDelta;
+                if (thinkingTracker.ContentDelta.Length > 0)
+                    delta["content"] = thinkingTracker.ContentDelta;
+                if (delta.Count > 0)
                 {
-                    new
+                    yield return ToSse(new
                     {
-                        index = 0,
-                        delta = new { content = token },
-                        finish_reason = (string?)null
-                    }
+                        id = responseId,
+                        @object = "chat.completion.chunk",
+                        created = UnixNow(),
+                        model = model.Options.Id,
+                        choices = new[]
+                        {
+                            new
+                            {
+                                index = 0,
+                                delta,
+                                finish_reason = (string?)null
+                            }
+                        }
+                    });
                 }
-            };
-
-            yield return ToSse(chunk);
+                if (thinkingTracker.ContentDelta.Length > 0)
+                    completion.Append(thinkingTracker.ContentDelta);
+            }
+            else
+            {
+                completion.Append(token);
+                yield return ToSse(new
+                {
+                    id = responseId,
+                    @object = "chat.completion.chunk",
+                    created = UnixNow(),
+                    model = model.Options.Id,
+                    choices = new[]
+                    {
+                        new
+                        {
+                            index = 0,
+                            delta = new { content = token },
+                            finish_reason = (string?)null
+                        }
+                    }
+                });
+            }
         }
 
         var generatedText = completion.ToString();
@@ -712,7 +759,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             }
         });
 
-        var outputTokens = CountTokens(loaded, generatedText);
+        var outputTokens = CountTokens(loaded, thinkingEnabled ? fullText.ToString() : generatedText);
 
         if (includeUsage)
         {
@@ -786,18 +833,54 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             }
         });
 
+        var thinkingEnabled = model.Options.EnableThinking;
+        var thinkingTracker = thinkingEnabled
+            ? new ThinkingTracker(model.Options.ThinkingStartTag, model.Options.ThinkingEndTag)
+            : null;
         var completion = new StringBuilder();
+        var fullText = new StringBuilder();
         await foreach (var token in StreamTextAsync(prompt, inferenceParams, loaded, media, mediaCount, cancellationToken))
         {
-            completion.Append(token);
-            yield return ToSse(new
+            fullText.Append(token);
+            if (thinkingTracker is not null)
             {
-                type = "response.output_text.delta",
-                item_id = "msg_" + responseId,
-                output_index = 0,
-                content_index = 0,
-                delta = token
-            });
+                thinkingTracker.Append(token);
+                if (thinkingTracker.ThinkingDelta.Length > 0)
+                {
+                    yield return ToSse(new
+                    {
+                        type = "response.reasoning_text.delta",
+                        item_id = "msg_" + responseId,
+                        output_index = 0,
+                        content_index = 0,
+                        delta = thinkingTracker.ThinkingDelta
+                    });
+                }
+                if (thinkingTracker.ContentDelta.Length > 0)
+                {
+                    completion.Append(thinkingTracker.ContentDelta);
+                    yield return ToSse(new
+                    {
+                        type = "response.output_text.delta",
+                        item_id = "msg_" + responseId,
+                        output_index = 0,
+                        content_index = 0,
+                        delta = thinkingTracker.ContentDelta
+                    });
+                }
+            }
+            else
+            {
+                completion.Append(token);
+                yield return ToSse(new
+                {
+                    type = "response.output_text.delta",
+                    item_id = "msg_" + responseId,
+                    output_index = 0,
+                    content_index = 0,
+                    delta = token
+                });
+            }
         }
 
         var generatedText = completion.ToString();
@@ -829,7 +912,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             });
         }
 
-        var outputTokens = CountTokens(loaded, generatedText);
+        var outputTokens = CountTokens(loaded, thinkingEnabled ? fullText.ToString() : generatedText);
 
         if (includeUsage)
         {
@@ -865,6 +948,7 @@ public sealed class LLamaInferenceService : IAsyncDisposable
             await store.AddResponseAsync(responseId, now, request, new InferenceCompletion
             {
                 Id = responseId,
+
                 Model = model.Options.Id,
                 Text = toolCalls.Count > 0 ? string.Empty : cleanText,
                 ToolCalls = toolCalls,
@@ -2486,6 +2570,78 @@ ws ::= [ \t\n\r]*
         }
 
         return count;
+    }
+
+    private static (string Thinking, string Content) ExtractThinking(string text, string startTag, string endTag)
+    {
+        if (string.IsNullOrEmpty(startTag) || string.IsNullOrEmpty(endTag))
+            return (string.Empty, text);
+
+        var thinking = new StringBuilder();
+        var content = new StringBuilder();
+        var pos = 0;
+
+        while (pos < text.Length)
+        {
+            var startIdx = text.IndexOf(startTag, pos, StringComparison.Ordinal);
+            if (startIdx < 0)
+            {
+                content.Append(text.AsSpan(pos));
+                break;
+            }
+
+            if (startIdx > pos)
+                content.Append(text.AsSpan(pos, startIdx - pos));
+
+            var searchFrom = startIdx + startTag.Length;
+            var endIdx = text.IndexOf(endTag, searchFrom, StringComparison.Ordinal);
+
+            if (endIdx < 0)
+            {
+                thinking.Append(text.AsSpan(searchFrom));
+                break;
+            }
+
+            if (endIdx > searchFrom)
+                thinking.Append(text.AsSpan(searchFrom, endIdx - searchFrom));
+
+            pos = endIdx + endTag.Length;
+        }
+
+        return (thinking.ToString(), content.ToString());
+    }
+
+    private sealed class ThinkingTracker
+    {
+        private readonly string _startTag;
+        private readonly string _endTag;
+
+        public string AccumulatedText { get; private set; } = string.Empty;
+        public string PreviousThinking { get; private set; } = string.Empty;
+        public string PreviousContent { get; private set; } = string.Empty;
+
+        public string ThinkingDelta { get; private set; } = string.Empty;
+        public string ContentDelta { get; private set; } = string.Empty;
+
+        public ThinkingTracker(string startTag, string endTag)
+        {
+            _startTag = startTag;
+            _endTag = endTag;
+        }
+
+        public void Append(string token)
+        {
+            AccumulatedText += token;
+            var (newThinking, newContent) = ExtractThinking(AccumulatedText, _startTag, _endTag);
+            ThinkingDelta = newThinking.Length > PreviousThinking.Length
+                ? newThinking[PreviousThinking.Length..]
+                : string.Empty;
+            ContentDelta = newContent.Length > PreviousContent.Length
+                ? newContent[PreviousContent.Length..]
+                : string.Empty;
+            PreviousThinking = newThinking;
+            PreviousContent = newContent;
+        }
     }
 
     private static string CreateCompletionId(string prefix) => prefix + "_" + Guid.NewGuid().ToString("N");

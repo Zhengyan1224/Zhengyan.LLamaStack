@@ -30,6 +30,7 @@
     "AllowRemoteMedia": true,
     "AllowLocalMediaPaths": false,
     "MaxMediaBytes": 33554432,
+    "MaxImageDimension": 512,
     "Store": {
       "Provider": "Memory",
       "SqlitePath": "data/llamastack.db",
@@ -44,6 +45,9 @@
         "MaxConcurrency": 1,
         "ContextSize": 40960,
         "GpuLayerCount": 10,
+        "EnableThinking": true,
+        "ThinkingStartTag": "<think>",
+        "ThinkingEndTag": "</think>",
         "Capabilities": {
           "ChatCompletions": true,
           "Responses": true,
