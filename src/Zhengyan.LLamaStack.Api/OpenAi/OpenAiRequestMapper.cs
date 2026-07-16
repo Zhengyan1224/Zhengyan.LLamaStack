@@ -73,20 +73,18 @@ public sealed class OpenAiRequestMapper
         }
 
         var toolChoice = ParseToolChoice(request.ToolChoice ?? request.FunctionCall);
-        // Enable grammar-based JSON output so the model reliably generates
-        // valid JSON tool calls. This applies both when tools come via the
-        // text protocol (embedded in system prompt, e.g. OpenCode) and when
-        // they come via the API tools parameter with tool_choice != none.
         var lastMessageIsToolResult = messages.Count > 0 && messages[^1].Role == "tool";
-        // When the last message is a tool result, the grammar would force another
-        // tool call (no "exit" path), trapping the model in a loop. Allow free-text
-        // output so it can answer normally after the tool has executed.
-        var forceToolCallJson = !lastMessageIsToolResult && (textProtocolToolsDetected || (tools.Count > 0 && toolChoice.Mode != InferenceToolChoiceMode.None));
         var effectiveToolChoiceMode = toolChoice.Mode;
         if (textProtocolToolsDetected && effectiveToolChoiceMode == InferenceToolChoiceMode.None)
         {
             effectiveToolChoiceMode = InferenceToolChoiceMode.Auto;
         }
+
+        // Apply grammar constraint only when the model must call a tool
+        // (Required/Function). For Auto mode, let the model decide freely.
+        // When the last message is a tool result, grammar would trap the model
+        // in a loop, so always allow free-text output after tool execution.
+        var forceToolCallJson = !lastMessageIsToolResult && effectiveToolChoiceMode is InferenceToolChoiceMode.Required or InferenceToolChoiceMode.Function;
 
         var warnings = new List<string>();
         AddChatCompatibilityWarnings(request, warnings);
